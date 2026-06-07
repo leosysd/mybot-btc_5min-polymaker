@@ -20,6 +20,8 @@ pub struct MarketFrame {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteIntent {
+    #[serde(default)]
+    pub quote_id: String,
     pub ts_ms: u64,
     pub market: String,
     pub side: String,
@@ -32,7 +34,17 @@ pub struct QuoteIntent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderAccepted {
+    pub accepted_ts_ms: u64,
+    pub expires_ts_ms: u64,
+    pub quote: QuoteIntent,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FillEvent {
+    #[serde(default)]
+    pub quote_id: String,
     pub ts_ms: u64,
     pub market: String,
     pub side: String,
@@ -53,6 +65,10 @@ pub struct Inventory {
     pub down_shares: f64,
     pub up_cost: f64,
     pub down_cost: f64,
+    #[serde(default)]
+    pub pending_up: f64,
+    #[serde(default)]
+    pub pending_down: f64,
 }
 
 impl Default for Inventory {
@@ -64,6 +80,8 @@ impl Default for Inventory {
             down_shares: 0.0,
             up_cost: 0.0,
             down_cost: 0.0,
+            pending_up: 0.0,
+            pending_down: 0.0,
         }
     }
 }
@@ -92,6 +110,14 @@ impl Inventory {
     pub fn pnl_if_down(&self) -> f64 {
         (self.down_shares - self.down_cost) - self.up_cost
     }
+
+    pub fn effective_up(&self) -> f64 {
+        self.up_shares + self.pending_up
+    }
+
+    pub fn effective_down(&self) -> f64 {
+        self.down_shares + self.pending_down
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +133,7 @@ pub struct Heartbeat {
 pub enum WireMessage {
     MarketFrame(MarketFrame),
     QuoteIntent(QuoteIntent),
+    OrderAccepted(OrderAccepted),
     FillEvent(FillEvent),
     Inventory(Inventory),
 }

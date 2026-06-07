@@ -34,7 +34,13 @@ pub fn market_maker_bids(
     ModelQuote { up_bid, down_bid }
 }
 
-pub fn post_only_bid(model_bid: f64, best_ask: f64, tick_size: f64, min_bid: f64, max_bid: f64) -> Option<f64> {
+pub fn post_only_bid(
+    model_bid: f64,
+    best_ask: f64,
+    tick_size: f64,
+    min_bid: f64,
+    max_bid: f64,
+) -> Option<f64> {
     if !model_bid.is_finite() || !best_ask.is_finite() || best_ask <= tick_size {
         return None;
     }
@@ -52,11 +58,14 @@ pub fn normal_cdf(z: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.2316419 * z.abs());
     let poly = t
         * (0.319381530
-            + t * (-0.356563782
-                + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+            + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
     let pdf = (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt();
     let cdf = 1.0 - pdf * poly;
-    if z >= 0.0 { cdf } else { 1.0 - cdf }
+    if z >= 0.0 {
+        cdf
+    } else {
+        1.0 - cdf
+    }
 }
 
 pub fn floor_to_tick(px: f64, tick_size: f64) -> f64 {

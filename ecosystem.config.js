@@ -1,6 +1,11 @@
 const path = require("path");
+const fs = require("fs");
 
-const bin = path.join(__dirname, "target", "release", "polymaker");
+const releaseBin = path.join(__dirname, "polymaker");
+const sourceBin = path.join(__dirname, "target", "release", "polymaker");
+const bin = fs.existsSync(releaseBin) ? releaseBin : sourceBin;
+const runDir = path.join(__dirname, "run");
+fs.mkdirSync(runDir, { recursive: true });
 
 const app = (name, role) => ({
   name,
@@ -18,9 +23,10 @@ const app = (name, role) => ({
   kill_timeout: 2000,
   env: {
     RUST_BACKTRACE: "1",
+    POLYMAKER_HOME: __dirname,
   },
-  error_file: path.join(__dirname, "run", `${name}-error.log`),
-  out_file: path.join(__dirname, "run", `${name}-out.log`),
+  error_file: path.join(runDir, `${name}-error.log`),
+  out_file: path.join(runDir, `${name}-out.log`),
   merge_logs: true,
   time: true,
 });

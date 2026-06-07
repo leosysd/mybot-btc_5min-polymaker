@@ -27,18 +27,14 @@ fn main() -> AppResult<()> {
         "order-gateway" | "gateway" | "maker" => workers::run_maker(cfg),
         "risk-ledger" | "risk" => workers::run_risk(cfg),
         "stop" => workers::write_stop(&cfg),
-        "restart" => {
-            workers::write_stop(&cfg)?;
-            std::thread::sleep(std::time::Duration::from_millis(600));
-            workers::start_background(&cfg)
-        }
+        "restart" => workers::restart_background(&cfg),
         "status" => ui::print_status(&cfg),
         "dashboard" | "trade" => {
             let seconds = parse_seconds(args.collect())?;
             ui::run_dashboard(&cfg, seconds)
         }
         "menu" | "m" => ui::run_menu(&cfg),
-        "init" => ui::init_config(),
+        "init" => ui::init_config(&cfg),
         "clean" => workers::clean_run_dir(&cfg),
         "help" | "-h" | "--help" => {
             print_usage();

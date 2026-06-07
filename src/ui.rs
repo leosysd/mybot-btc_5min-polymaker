@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::ipc::{read_json, now_ms, FillEvent, Heartbeat, Inventory, MarketFrame, QuoteIntent};
+use crate::ipc::{now_ms, read_json, FillEvent, Heartbeat, Inventory, MarketFrame, QuoteIntent};
 use crate::workers;
 use crate::AppResult;
 use serde::de::DeserializeOwned;
@@ -19,13 +19,14 @@ const C_BLUE: &str = "\x1b[34m";
 const C_CYAN: &str = "\x1b[36m";
 const C_RED: &str = "\x1b[31m";
 
-pub fn init_config() -> AppResult<()> {
-    if Path::new(".env").exists() {
+pub fn init_config(cfg: &Config) -> AppResult<()> {
+    let env_path = cfg.env_file();
+    if env_path.exists() {
         println!(".env 已存在，不覆盖。需要重置时先手动备份/删除 .env。");
         return Ok(());
     }
-    fs::copy(".env.example", ".env")?;
-    println!("已创建 .env，请按需要修改参数。");
+    fs::copy(cfg.env_example_file(), &env_path)?;
+    println!("已创建 {}，请按需要修改参数。", env_path.display());
     Ok(())
 }
 
@@ -51,11 +52,11 @@ pub fn run_menu(cfg: &Config) -> AppResult<()> {
 
         match prompt("输入编号")?.trim() {
             "1" => {
-                init_config()?;
+                init_config(cfg)?;
                 pause()?;
             }
             "2" => {
-                edit_market_maker_params()?;
+                edit_market_maker_params(cfg)?;
                 pause()?;
             }
             "3" => {
@@ -80,9 +81,7 @@ pub fn run_menu(cfg: &Config) -> AppResult<()> {
                 pause()?;
             }
             "8" => {
-                workers::write_stop(cfg)?;
-                std::thread::sleep(Duration::from_millis(600));
-                workers::start_background(cfg)?;
+                workers::restart_background(cfg)?;
                 pause()?;
             }
             "9" => {
@@ -143,7 +142,10 @@ fn print_status_cards(cfg: &Config) -> AppResult<()> {
     let inv = read_json::<Inventory>(&cfg.inventory_path())?.unwrap_or_default();
     let hbs = read_heartbeats(cfg)?;
     let now = now_ms();
-    let running = hbs.iter().filter(|h| now.saturating_sub(h.ts_ms) <= 3_000).count();
+    let running = hbs
+        .iter()
+        .filter(|h| now.saturating_sub(h.ts_ms) <= 3_000)
+        .count();
     let mode = if cfg.dry_run {
         format!("{C_YELLOW}DRY_RUN{C_RESET}")
     } else {
@@ -152,19 +154,29 @@ fn print_status_cards(cfg: &Config) -> AppResult<()> {
 
     println!(
         "{}模式:{} {:<16} {}市场:{} {:<18} {}运行目录:{} {}",
-        C_BOLD, C_RESET, mode,
-        C_BOLD, C_RESET, cfg.market_slug,
-        C_BOLD, C_RESET, cfg.run_dir.display()
+        C_BOLD,
+        C_RESET,
+        mode,
+        C_BOLD,
+        C_RESET,
+        cfg.market_slug,
+        C_BOLD,
+        C_RESET,
+        cfg.run_dir.display()
     );
     println!(
-        "{}心跳:{} {}/5 活跃   {}库存:{} Up {:.0} / Down {:.0}   {}PnL情景:{} Up赢 {:+.2} / Down赢 {:+.2}",
+        "{}心跳:{} {}/{} 活跃   {}库存:{} Up {:.0}+{:.0} / Down {:.0}+{:.0}   {}PnL情景:{} Up赢 {:+.2} / Down赢 {:+.2}",
         C_BOLD, C_RESET, running,
-        C_BOLD, C_RESET, inv.up_shares, inv.down_shares,
+        expected_heartbeat_count(&hbs),
+        C_BOLD, C_RESET, inv.up_shares, inv.pending_up, inv.down_shares, inv.pending_down,
         C_BOLD, C_RESET, inv.pnl_if_up(), inv.pnl_if_down()
     );
 
     if hbs.is_empty() {
-        println!("{}暂无心跳。先运行 polymaker supervisor --seconds 15 或 polymaker start。{}", C_DIM, C_RESET);
+        println!(
+            "{}暂无心跳。先运行 polymaker supervisor --seconds 15 或 polymaker start。{}",
+            C_DIM, C_RESET
+        );
     } else {
         println!();
         println!("{:<18} {:<8} {:<8} {}", "进程", "PID", "延迟", "状态");
@@ -185,14 +197,29 @@ fn print_status_cards(cfg: &Config) -> AppResult<()> {
     Ok(())
 }
 
+fn expected_heartbeat_count(hbs: &[Heartbeat]) -> usize {
+    if hbs.iter().any(|h| h.role == "supervisor") {
+        5
+    } else {
+        4
+    }
+}
+
 fn print_latest_market(cfg: &Config) -> AppResult<()> {
     let rows = tail_jsonl::<MarketFrame>(&cfg.book_path(), 5)?;
     println!("{}最近行情{}", C_BOLD, C_RESET);
-    println!("{:<12} {:>10} {:>8} {:>8} {:>8}", "时间", "BTC", "UpAsk", "DnAsk", "来源");
+    println!(
+        "{:<12} {:>10} {:>8} {:>8} {:>8}",
+        "时间", "BTC", "UpAsk", "DnAsk", "来源"
+    );
     for r in rows {
         println!(
             "{:<12} {:>10.2} {:>8.3} {:>8.3} {:>8}",
-            fmt_ts(r.ts_ms), r.btc_price, r.up_ask, r.down_ask, r.source
+            fmt_ts(r.ts_ms),
+            r.btc_price,
+            r.up_ask,
+            r.down_ask,
+            r.source
         );
     }
     println!();
@@ -209,7 +236,13 @@ fn print_latest_quotes(cfg: &Config) -> AppResult<()> {
     for r in rows {
         println!(
             "{:<12} {:<5} {:>7.3} {:>6.0} {:>7.3} {:>8.0} {:>8.0}",
-            fmt_ts(r.ts_ms), r.side, r.price, r.size, r.fair, r.inventory_up, r.inventory_down
+            fmt_ts(r.ts_ms),
+            r.side,
+            r.price,
+            r.size,
+            r.fair,
+            r.inventory_up,
+            r.inventory_down
         );
     }
     println!();
@@ -239,13 +272,14 @@ fn print_latest_fills(cfg: &Config) -> AppResult<()> {
     Ok(())
 }
 
-fn edit_market_maker_params() -> AppResult<()> {
-    if !Path::new(".env").exists() {
-        init_config()?;
+fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
+    if !cfg.env_file().exists() {
+        init_config(cfg)?;
     }
     let keys = [
         ("QUOTE_SIZE", "每次单边挂单份数"),
         ("QUOTE_SPREAD", "做市毛价差"),
+        ("QUOTE_TTL_MS", "未成交报价pending保留毫秒"),
         ("INVENTORY_SKEW", "库存偏移强度"),
         ("INVENTORY_MULT", "单边最大库存倍数"),
         ("MIN_BID", "最低挂买价"),
@@ -255,10 +289,10 @@ fn edit_market_maker_params() -> AppResult<()> {
     ];
     println!("直接回车表示不修改。");
     for (key, desc) in keys {
-        let current = env_value(key).unwrap_or_else(|| "(未设置)".to_string());
+        let current = env_value(&cfg.env_file(), key).unwrap_or_else(|| "(未设置)".to_string());
         let input = prompt(&format!("{key} 当前={current}  {desc}"))?;
         if !input.trim().is_empty() {
-            upsert_env(key, input.trim())?;
+            upsert_env(&cfg.env_file(), key, input.trim())?;
         }
     }
     println!("参数已写入 .env。重启服务后生效。");
@@ -283,6 +317,7 @@ fn print_param_help() {
     println!("{}核心参数说明{}", C_BOLD, C_RESET);
     println!("  QUOTE_SIZE        每次单边报价份数");
     println!("  QUOTE_SPREAD      毛价差，约束 up_bid + down_bid <= 1 - spread");
+    println!("  QUOTE_TTL_MS      未成交报价 pending 保留多久，过期释放库存占用");
     println!("  INVENTORY_SKEW    库存偏移，多仓侧降价、少仓侧抬价");
     println!("  INVENTORY_MULT    单边最大库存 = QUOTE_SIZE * INVENTORY_MULT");
     println!("  MIN_BID/MAX_BID   最低/最高挂买价");
@@ -329,8 +364,8 @@ fn tail_jsonl<T: DeserializeOwned>(path: &Path, n: usize) -> AppResult<Vec<T>> {
     Ok(out)
 }
 
-fn env_value(key: &str) -> Option<String> {
-    let raw = fs::read_to_string(".env").ok()?;
+fn env_value(path: &Path, key: &str) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
     for line in raw.lines() {
         let line = line.trim();
         if line.starts_with('#') {
@@ -346,8 +381,8 @@ fn env_value(key: &str) -> Option<String> {
     None
 }
 
-fn upsert_env(key: &str, value: &str) -> AppResult<()> {
-    let raw = fs::read_to_string(".env").unwrap_or_default();
+fn upsert_env(path: &Path, key: &str, value: &str) -> AppResult<()> {
+    let raw = fs::read_to_string(path).unwrap_or_default();
     let mut found = false;
     let mut lines = Vec::new();
     for line in raw.lines() {
@@ -363,7 +398,7 @@ fn upsert_env(key: &str, value: &str) -> AppResult<()> {
     if !found {
         lines.push(format!("{key}={value}"));
     }
-    fs::write(".env", lines.join("\n") + "\n")?;
+    fs::write(path, lines.join("\n") + "\n")?;
     Ok(())
 }
 
@@ -386,13 +421,12 @@ fn clear_screen() {
 }
 
 fn print_banner(title: &str) {
+    println!("{C_BLUE}╔════════════════════════════════════════════════════════════╗{C_RESET}");
     println!(
-        "{C_BLUE}╔════════════════════════════════════════════════════════════╗{C_RESET}"
+        "{C_BLUE}║{C_RESET} {C_BOLD}{:<58}{C_RESET}{C_BLUE}║{C_RESET}",
+        title
     );
-    println!("{C_BLUE}║{C_RESET} {C_BOLD}{:<58}{C_RESET}{C_BLUE}║{C_RESET}", title);
-    println!(
-        "{C_BLUE}╚════════════════════════════════════════════════════════════╝{C_RESET}"
-    );
+    println!("{C_BLUE}╚════════════════════════════════════════════════════════════╝{C_RESET}");
 }
 
 fn fmt_ts(ts_ms: u64) -> String {

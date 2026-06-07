@@ -46,6 +46,12 @@ cd /opt/polymaker
 polymaker menu
 ```
 
+一键安装会把程序放到 `/opt/polymaker`，并创建 `/usr/local/bin/polymaker`。程序会自动把 `/opt/polymaker` 当作运行目录；如果你想换目录，可以设置：
+
+```bash
+export POLYMAKER_HOME=/你的/安装目录
+```
+
 如果你想从源码编译，再按下面步骤。
 
 先安装基础依赖：
@@ -276,6 +282,12 @@ up_bid + down_bid <= 1 - QUOTE_SPREAD
 例如 `QUOTE_SPREAD=0.04`，则两边买价总和不超过 `0.96`。
 
 ```text
+QUOTE_TTL_MS=1500
+```
+
+未成交报价在风控里保留多久。报价发给 `order-gateway` 后，会先算进 pending 库存；如果没有成交，超过 TTL 后释放。
+
+```text
 INVENTORY_SKEW=0.03
 ```
 
@@ -291,7 +303,7 @@ INVENTORY_MULT=2
 QUOTE_SIZE * INVENTORY_MULT
 ```
 
-例如 `QUOTE_SIZE=5`、`INVENTORY_MULT=2`，单边最多买 `10` 份。
+例如 `QUOTE_SIZE=5`、`INVENTORY_MULT=2`，单边最多买 `10` 份。这里会同时计算已成交库存和 pending 未成交报价，避免连续报价把真实仓位打穿。
 
 ```text
 MIN_BID=0.05

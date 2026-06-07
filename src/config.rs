@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub base_dir: PathBuf,
     pub run_dir: PathBuf,
     pub market_slug: String,
     pub tick_size: f64,
@@ -18,13 +19,22 @@ pub struct Config {
     pub market_interval_ms: u64,
     pub stale_after_ms: u64,
     pub btc_sigma_usd: f64,
+    pub quote_ttl_ms: u64,
 }
 
 impl Config {
     pub fn from_env() -> AppResult<Self> {
-        let file_env = load_dotenv_like(".env")?;
+        let base_dir = detect_base_dir()?;
+        let file_env = load_dotenv_like(&base_dir.join(".env"))?;
+        let run_dir_raw = PathBuf::from(get(&file_env, "BOT_RUN_DIR", "run"));
+        let run_dir = if run_dir_raw.is_absolute() {
+            run_dir_raw
+        } else {
+            base_dir.join(run_dir_raw)
+        };
         let cfg = Self {
-            run_dir: PathBuf::from(get(&file_env, "BOT_RUN_DIR", "run")),
+            base_dir,
+            run_dir,
             market_slug: get(&file_env, "MARKET_SLUG", "btc-updown-5m"),
             tick_size: get_f64(&file_env, "TICK_SIZE", 0.01),
             quote_size: get_f64(&file_env, "QUOTE_SIZE", 5.0),
@@ -38,6 +48,7 @@ impl Config {
             market_interval_ms: get_u64(&file_env, "MARKET_INTERVAL_MS", 600),
             stale_after_ms: get_u64(&file_env, "STALE_AFTER_MS", 5000),
             btc_sigma_usd: get_f64(&file_env, "BTC_SIGMA_USD", 35.0),
+            quote_ttl_ms: get_u64(&file_env, "QUOTE_TTL_MS", 1500),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -56,8 +67,12 @@ impl Config {
         if self.min_bid < 0.0 || self.max_bid > 1.0 || self.min_bid > self.max_bid {
             return Err("MIN_BID/MAX_BID are invalid".into());
         }
+        Ok(())
+    }
+
+    pub fn ensure_trading_supported(&self) -> AppResult<()> {
         if !self.dry_run {
-            return Err("live trading is intentionally not implemented yet; keep DRY_RUN=1".into());
+            return Err("真实下单接口尚未接入；当前必须保持 DRY_RUN=1".into());
         }
         Ok(())
     }
@@ -71,6 +86,18 @@ impl Config {
 
     pub fn stop_file(&self) -> PathBuf {
         self.run_dir.join("STOP")
+    }
+
+    pub fn pid_file(&self) -> PathBuf {
+        self.run_dir.join("supervisor.pid")
+    }
+
+    pub fn env_file(&self) -> PathBuf {
+        self.base_dir.join(".env")
+    }
+
+    pub fn env_example_file(&self) -> PathBuf {
+        self.base_dir.join(".env.example")
     }
 
     pub fn heartbeat_dir(&self) -> PathBuf {
@@ -114,7 +141,30 @@ impl Config {
     }
 }
 
-fn load_dotenv_like(path: &str) -> AppResult<HashMap<String, String>> {
+fn detect_base_dir() -> AppResult<PathBuf> {
+    if let Ok(home) = std::env::var("POLYMAKER_HOME") {
+        if !home.trim().is_empty() {
+            return Ok(PathBuf::from(home));
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            if parent.join(".env").exists() || parent.join(".env.example").exists() {
+                return Ok(parent.to_path_buf());
+            }
+        }
+    }
+
+    let cwd = std::env::current_dir()?;
+    if cwd.join(".env").exists() || cwd.join("Cargo.toml").exists() {
+        return Ok(cwd);
+    }
+
+    Ok(cwd)
+}
+
+fn load_dotenv_like(path: &std::path::Path) -> AppResult<HashMap<String, String>> {
     let mut values = HashMap::new();
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Ok(values);
