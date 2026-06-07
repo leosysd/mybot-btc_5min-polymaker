@@ -169,6 +169,47 @@ cat run/inventory.json
 - `fills.jsonl`：order-gateway 模拟成交
 - `inventory.json`：risk-ledger 当前库存
 
+## DRY_RUN 模拟怎么跑
+
+当前模拟不是在真实 Polymarket 下单，而是在本地构造一套“像 5 分钟 BTC 二元市场”的小环境：
+
+1. `collector` 生成一条假的 BTC 价格曲线，围绕 `price_to_beat` 上下波动。
+2. 程序用 `normal_cdf((btc_price - price_to_beat) / BTC_SIGMA_USD)` 估算 `Up` 的 fair value。
+3. `collector` 再生成模拟盘口 `UpAsk` / `DnAsk`，让盘口围绕 fair value 带一点价差和噪声。
+4. `quote-engine` 只挂买单，不主动吃单；它会按 fair value 减去做市价差，并保证报价低于当前 ask 一个 tick。
+5. `order-gateway` 按 `SIM_FILL_CHANCE` 随机把部分报价记为模拟成交。
+6. `risk-ledger` 记录库存和两种结算情景的 PnL：`Up赢PnL` / `Dn赢PnL`。
+
+所以监控页里的 PnL 是“如果现在这一轮最终结算为 Up/Down，会赚或亏多少”，不是已经真实赚到的钱。
+
+## 怎么判断能不能赚钱
+
+二元市场里，做市赚钱主要看两件事：
+
+```text
+买入 Up 的成本 + 买入 Down 的成本 < 1
+```
+
+如果两边都买到了，而且总成本低于 `1`，那么最终不管 Up 还是 Down，其中一边会兑付 `1`，差额就是锁住的毛利润。例如：
+
+```text
+Up 买 5 份，价格 0.45
+Down 买 5 份，价格 0.50
+总成本 = 5 * 0.45 + 5 * 0.50 = 4.75
+结算收入 = 5
+毛利润 = 0.25
+```
+
+如果只成交了一边，那就不是锁利，而是方向风险：买了 Up，最后 Up 才赚钱；买了 Down，最后 Down 才赚钱。机器人要靠 fair value 判断、价差、库存偏移和撤单速度，把成交尽量留在“买得便宜”的位置。
+
+当前模拟容易出现盈利，是因为模拟盘口和随机成交比较温和，主要用于验证架构、风控和 PnL 计算。它不能证明实盘一定赚钱。真正能不能赚钱，要接真实 Polymarket 盘口后重点看：
+
+- 你的报价是否排得进队列并实际成交。
+- 成交是不是经常发生在你被价格变化打穿的时候。
+- `up_bid + down_bid` 是否长期低于 `1`，并覆盖手续费、滑点和坏成交。
+- 单边库存是否会越积越大。
+- 5 分钟最后几十秒是否需要更激进地撤单或锁仓。
+
 停止所有进程：
 
 ```bash

@@ -179,18 +179,30 @@ fn print_status_cards(cfg: &Config) -> AppResult<()> {
         );
     } else {
         println!();
-        println!("{:<18} {:<8} {:<8} {}", "进程", "PID", "延迟", "状态");
+        println!(
+            "{}",
+            table_row(&[
+                ("进程".to_string(), 18, Align::Left),
+                ("PID".to_string(), 8, Align::Right),
+                ("延迟".to_string(), 8, Align::Right),
+                ("状态".to_string(), 24, Align::Left),
+            ])
+        );
         for hb in hbs {
             let age = now.saturating_sub(hb.ts_ms);
             let color = if age <= 3_000 { C_GREEN } else { C_RED };
             println!(
-                "{:<18} {:<8} {}{:<8}{} {}",
-                hb.role,
-                hb.pid,
-                color,
-                format_age(age),
-                C_RESET,
-                hb.status
+                "{}",
+                table_row(&[
+                    (hb.role, 18, Align::Left),
+                    (hb.pid.to_string(), 8, Align::Right),
+                    (
+                        format!("{color}{}{C_RESET}", format_age(age)),
+                        8,
+                        Align::Right
+                    ),
+                    (hb.status, 24, Align::Left),
+                ])
             );
         }
     }
@@ -209,17 +221,25 @@ fn print_latest_market(cfg: &Config) -> AppResult<()> {
     let rows = tail_jsonl::<MarketFrame>(&cfg.book_path(), 5)?;
     println!("{}最近行情{}", C_BOLD, C_RESET);
     println!(
-        "{:<12} {:>10} {:>8} {:>8} {:>8}",
-        "时间", "BTC", "UpAsk", "DnAsk", "来源"
+        "{}",
+        table_row(&[
+            ("时间".to_string(), 8, Align::Left),
+            ("BTC".to_string(), 10, Align::Right),
+            ("UpAsk".to_string(), 7, Align::Right),
+            ("DnAsk".to_string(), 7, Align::Right),
+            ("来源".to_string(), 20, Align::Left),
+        ])
     );
     for r in rows {
         println!(
-            "{:<12} {:>10.2} {:>8.3} {:>8.3} {:>8}",
-            fmt_ts(r.ts_ms),
-            r.btc_price,
-            r.up_ask,
-            r.down_ask,
-            r.source
+            "{}",
+            table_row(&[
+                (fmt_ts(r.ts_ms), 8, Align::Left),
+                (format!("{:.2}", r.btc_price), 10, Align::Right),
+                (format!("{:.3}", r.up_ask), 7, Align::Right),
+                (format!("{:.3}", r.down_ask), 7, Align::Right),
+                (r.source, 20, Align::Left),
+            ])
         );
     }
     println!();
@@ -230,19 +250,29 @@ fn print_latest_quotes(cfg: &Config) -> AppResult<()> {
     let rows = tail_jsonl::<QuoteIntent>(&cfg.quotes_path(), 8)?;
     println!("{}最近报价{}", C_BOLD, C_RESET);
     println!(
-        "{:<12} {:<5} {:>7} {:>6} {:>7} {:>8} {:>8}",
-        "时间", "方向", "价格", "份额", "fair", "Up仓", "Dn仓"
+        "{}",
+        table_row(&[
+            ("时间".to_string(), 8, Align::Left),
+            ("方向".to_string(), 6, Align::Left),
+            ("价格".to_string(), 7, Align::Right),
+            ("份额".to_string(), 6, Align::Right),
+            ("fair".to_string(), 7, Align::Right),
+            ("Up仓".to_string(), 8, Align::Right),
+            ("Dn仓".to_string(), 8, Align::Right),
+        ])
     );
     for r in rows {
         println!(
-            "{:<12} {:<5} {:>7.3} {:>6.0} {:>7.3} {:>8.0} {:>8.0}",
-            fmt_ts(r.ts_ms),
-            r.side,
-            r.price,
-            r.size,
-            r.fair,
-            r.inventory_up,
-            r.inventory_down
+            "{}",
+            table_row(&[
+                (fmt_ts(r.ts_ms), 8, Align::Left),
+                (r.side, 6, Align::Left),
+                (format!("{:.3}", r.price), 7, Align::Right),
+                (format!("{:.0}", r.size), 6, Align::Right),
+                (format!("{:.3}", r.fair), 7, Align::Right),
+                (format!("{:.0}", r.inventory_up), 8, Align::Right),
+                (format!("{:.0}", r.inventory_down), 8, Align::Right),
+            ])
         );
     }
     println!();
@@ -253,20 +283,31 @@ fn print_latest_fills(cfg: &Config) -> AppResult<()> {
     let rows = tail_jsonl::<FillEvent>(&cfg.fills_path(), 8)?;
     println!("{}最近成交{}", C_BOLD, C_RESET);
     println!(
-        "{:<12} {:<5} {:>7} {:>6} {:>8} {:>8} {:>9} {:>9}",
-        "时间", "方向", "价格", "份额", "Up仓", "Dn仓", "Up赢PnL", "Dn赢PnL"
+        "{}",
+        table_row(&[
+            ("时间".to_string(), 8, Align::Left),
+            ("方向".to_string(), 6, Align::Left),
+            ("价格".to_string(), 7, Align::Right),
+            ("份额".to_string(), 6, Align::Right),
+            ("Up仓".to_string(), 8, Align::Right),
+            ("Dn仓".to_string(), 8, Align::Right),
+            ("Up赢PnL".to_string(), 10, Align::Right),
+            ("Dn赢PnL".to_string(), 10, Align::Right),
+        ])
     );
     for r in rows {
         println!(
-            "{:<12} {:<5} {:>7.3} {:>6.0} {:>8.0} {:>8.0} {:>9.2} {:>9.2}",
-            fmt_ts(r.ts_ms),
-            r.side,
-            r.price,
-            r.size,
-            r.inventory_up,
-            r.inventory_down,
-            r.pnl_if_up,
-            r.pnl_if_down
+            "{}",
+            table_row(&[
+                (fmt_ts(r.ts_ms), 8, Align::Left),
+                (r.side, 6, Align::Left),
+                (format!("{:.3}", r.price), 7, Align::Right),
+                (format!("{:.0}", r.size), 6, Align::Right),
+                (format!("{:.0}", r.inventory_up), 8, Align::Right),
+                (format!("{:.0}", r.inventory_down), 8, Align::Right),
+                (format!("{:+.2}", r.pnl_if_up), 10, Align::Right),
+                (format!("{:+.2}", r.pnl_if_down), 10, Align::Right),
+            ])
         );
     }
     Ok(())
@@ -423,10 +464,57 @@ fn clear_screen() {
 fn print_banner(title: &str) {
     println!("{C_BLUE}╔════════════════════════════════════════════════════════════╗{C_RESET}");
     println!(
-        "{C_BLUE}║{C_RESET} {C_BOLD}{:<58}{C_RESET}{C_BLUE}║{C_RESET}",
-        title
+        "{C_BLUE}║{C_RESET} {C_BOLD}{}{C_RESET}{C_BLUE}║{C_RESET}",
+        pad_right_display(title, 58)
     );
     println!("{C_BLUE}╚════════════════════════════════════════════════════════════╝{C_RESET}");
+}
+
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Right,
+}
+
+fn table_row(cols: &[(String, usize, Align)]) -> String {
+    cols.iter()
+        .map(|(value, width, align)| match align {
+            Align::Left => pad_right_display(value, *width),
+            Align::Right => pad_left_display(value, *width),
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn pad_right_display(value: &str, width: usize) -> String {
+    let pad = width.saturating_sub(display_width(value));
+    format!("{value}{}", " ".repeat(pad))
+}
+
+fn pad_left_display(value: &str, width: usize) -> String {
+    let pad = width.saturating_sub(display_width(value));
+    format!("{}{value}", " ".repeat(pad))
+}
+
+fn display_width(value: &str) -> usize {
+    let mut width = 0;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            while let Some(next) = chars.next() {
+                if next == 'm' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch.is_ascii() {
+            width += 1;
+        } else {
+            width += 2;
+        }
+    }
+    width
 }
 
 fn fmt_ts(ts_ms: u64) -> String {
