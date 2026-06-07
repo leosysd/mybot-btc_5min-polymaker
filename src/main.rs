@@ -32,7 +32,7 @@ fn main() -> AppResult<()> {
             Ok(())
         }
         other => {
-            eprintln!("unknown command: {other}");
+            eprintln!("未知命令: {other}");
             print_usage();
             std::process::exit(2);
         }
@@ -45,11 +45,11 @@ fn parse_seconds(args: Vec<String>) -> AppResult<Option<u64>> {
     while i < args.len() {
         match args[i].as_str() {
             "--seconds" => {
-                let value = args.get(i + 1).ok_or("--seconds needs a value")?;
+                let value = args.get(i + 1).ok_or("--seconds 需要一个秒数")?;
                 seconds = Some(value.parse::<u64>()?);
                 i += 2;
             }
-            other => return Err(format!("unknown supervisor arg: {other}").into()),
+            other => return Err(format!("未知 supervisor 参数: {other}").into()),
         }
     }
     Ok(seconds)
@@ -57,15 +57,15 @@ fn parse_seconds(args: Vec<String>) -> AppResult<Option<u64>> {
 
 fn print_usage() {
     println!(
-        "polymaker - multi-process BTC 5m binary market maker\n\
+        "polymaker - 多进程 BTC 5 分钟二元市场做市机器人\n\
 \n\
-Usage:\n\
-  polymaker supervisor [--seconds N]  start all worker processes\n\
-  polymaker collector                 run simulated collector worker\n\
-  polymaker quote-engine              run fair-value/quote worker\n\
-  polymaker order-gateway             run dry-run order gateway\n\
-  polymaker risk-ledger               run inventory/risk worker\n\
-  polymaker stop                      ask all workers to stop\n\
-  polymaker clean                     remove run directory\n"
+用法:\n\
+  polymaker supervisor [--seconds N]  启动完整多进程；可选 N 秒后自动停止\n\
+  polymaker collector                 启动模拟行情采集进程\n\
+  polymaker quote-engine              启动 fair value/报价进程\n\
+  polymaker order-gateway             启动 dry-run 下单网关进程\n\
+  polymaker risk-ledger               启动库存/风控账本进程\n\
+  polymaker stop                      通知所有进程停止\n\
+  polymaker clean                     删除 run 运行目录\n"
     );
 }
