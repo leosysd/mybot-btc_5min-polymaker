@@ -153,10 +153,13 @@ fn print_status_cards(cfg: &Config) -> AppResult<()> {
     };
 
     println!(
-        "{}模式:{} {:<16} {}市场:{} {:<18} {}运行目录:{} {}",
+        "{}模式:{} {:<16} {}行情:{} {:<6} {}市场:{} {:<18} {}运行目录:{} {}",
         C_BOLD,
         C_RESET,
         mode,
+        C_BOLD,
+        C_RESET,
+        cfg.data_mode,
         C_BOLD,
         C_RESET,
         cfg.market_slug,
@@ -318,15 +321,23 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         init_config(cfg)?;
     }
     let keys = [
+        ("DATA_MODE", "行情来源 sim/live"),
+        ("POLYMARKET_UP_TOKEN_ID", "live Up token id"),
+        ("POLYMARKET_DOWN_TOKEN_ID", "live Down token id"),
+        ("PRICE_TO_BEAT", "当前5分钟BTC判定价"),
         ("QUOTE_SIZE", "每次单边挂单份数"),
         ("QUOTE_SPREAD", "做市毛价差"),
         ("QUOTE_TTL_MS", "未成交报价pending保留毫秒"),
+        ("REQUOTE_THRESHOLD_TICKS", "价差变化多少tick才撤旧换新"),
         ("INVENTORY_SKEW", "库存偏移强度"),
         ("INVENTORY_MULT", "单边最大库存倍数"),
         ("MIN_BID", "最低挂买价"),
         ("MAX_BID", "最高挂买价"),
+        ("MAX_LOSS", "最坏情景最大亏损"),
+        ("MAX_TOTAL_INVENTORY", "Up+Down最大总库存"),
         ("MARKET_INTERVAL_MS", "模拟行情间隔毫秒"),
         ("STALE_AFTER_MS", "行情过期毫秒"),
+        ("WS_STALE_AFTER_MS", "live WS断流停止毫秒"),
     ];
     println!("直接回车表示不修改。");
     for (key, desc) in keys {
@@ -356,13 +367,20 @@ fn run_smoke_test() -> AppResult<()> {
 
 fn print_param_help() {
     println!("{}核心参数说明{}", C_BOLD, C_RESET);
+    println!("  DATA_MODE         sim=本地模拟；live=真实Polymarket/BTC WS行情");
+    println!("  POLYMARKET_*      live模式当前市场Up/Down token id");
+    println!("  PRICE_TO_BEAT     当前5分钟BTC市场判定价/开盘价");
     println!("  QUOTE_SIZE        每次单边报价份数");
     println!("  QUOTE_SPREAD      毛价差，约束 up_bid + down_bid <= 1 - spread");
     println!("  QUOTE_TTL_MS      未成交报价 pending 保留多久，过期释放库存占用");
+    println!("  REQUOTE_*         旧报价和新报价差多少 tick 才撤旧换新");
     println!("  INVENTORY_SKEW    库存偏移，多仓侧降价、少仓侧抬价");
     println!("  INVENTORY_MULT    单边最大库存 = QUOTE_SIZE * INVENTORY_MULT");
+    println!("  MAX_LOSS          最坏结算情景亏损达到阈值就停止");
+    println!("  MAX_TOTAL_*       Up+Down 已成交+pending 达到阈值就停止");
     println!("  MIN_BID/MAX_BID   最低/最高挂买价");
     println!("  STALE_AFTER_MS    行情过期阈值，超过则停止用旧行情报价");
+    println!("  WS_STALE_AFTER_MS live WS断流阈值，超过则停止");
     println!("  DRY_RUN           当前必须为 1，本版本不会真实下单");
 }
 

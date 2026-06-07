@@ -42,6 +42,17 @@ pub struct OrderAccepted {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderCancelled {
+    pub ts_ms: u64,
+    pub quote_id: String,
+    pub market: String,
+    pub side: String,
+    pub size: f64,
+    pub reason: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FillEvent {
     #[serde(default)]
     pub quote_id: String,
@@ -134,6 +145,7 @@ pub enum WireMessage {
     MarketFrame(MarketFrame),
     QuoteIntent(QuoteIntent),
     OrderAccepted(OrderAccepted),
+    OrderCancelled(OrderCancelled),
     FillEvent(FillEvent),
     Inventory(Inventory),
 }

@@ -3,16 +3,20 @@ mod unix {
     use crate::config::Config;
     use crate::ipc::{
         append_jsonl, heartbeat, now_ms, read_json, should_stop, write_json, FillEvent, Inventory,
-        MarketFrame, OrderAccepted, QuoteIntent, WireMessage,
+        MarketFrame, OrderAccepted, OrderCancelled, QuoteIntent, WireMessage,
     };
     use crate::pricing::{market_maker_bids, normal_cdf, post_only_bid};
     use crate::AppResult;
+    use serde_json::Value;
+    use std::collections::HashMap;
     use std::io;
     use std::os::unix::net::UnixDatagram;
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
+    use tungstenite::{connect, Message};
 
     pub fn run_supervisor(cfg: Config, seconds: Option<u64>) -> AppResult<()> {
         cfg.ensure_trading_supported()?;
@@ -64,10 +68,20 @@ mod unix {
     pub fn run_market_data(cfg: Config) -> AppResult<()> {
         cfg.ensure_trading_supported()?;
         cfg.ensure_dirs()?;
+        if cfg.data_mode == "live" {
+            cfg.ensure_live_market_config()?;
+        }
         wait_for_socket(&cfg.engine_socket(), Duration::from_secs(5))?;
+        if cfg.data_mode == "live" {
+            return run_live_market_data(cfg);
+        }
+        run_sim_market_data(cfg)
+    }
+
+    fn run_sim_market_data(cfg: Config) -> AppResult<()> {
         let sock = UnixDatagram::unbound()?;
         let mut step = 0u64;
-        let price_to_beat = 68_000.0;
+        let price_to_beat = cfg.price_to_beat;
 
         while !should_stop(&cfg) {
             let phase = step as f64 / 9.0;
@@ -96,6 +110,57 @@ mod unix {
         Ok(())
     }
 
+    fn run_live_market_data(cfg: Config) -> AppResult<()> {
+        let sock = UnixDatagram::unbound()?;
+        let state = Arc::new(Mutex::new(LiveMarketState::new(&cfg)));
+
+        {
+            let cfg = cfg.clone();
+            let state = Arc::clone(&state);
+            thread::spawn(move || live_polymarket_loop(cfg, state));
+        }
+        {
+            let cfg = cfg.clone();
+            let state = Arc::clone(&state);
+            thread::spawn(move || live_btc_loop(cfg, state));
+        }
+
+        while !should_stop(&cfg) {
+            let frame = {
+                let state = state.lock().unwrap();
+                state.frame(&cfg)
+            };
+
+            if let Some(frame) = frame {
+                send_msg(
+                    &sock,
+                    &cfg.engine_socket(),
+                    &WireMessage::MarketFrame(frame.clone()),
+                )?;
+                append_jsonl(&cfg.book_path(), &frame)?;
+                heartbeat(&cfg, "collector", "live ws frame")?;
+            } else {
+                heartbeat(&cfg, "collector", "waiting live ws")?;
+            }
+
+            let now = now_ms();
+            let stale = {
+                let state = state.lock().unwrap();
+                state.started
+                    && (now.saturating_sub(state.last_polymarket_ts) > cfg.ws_stale_after_ms
+                        || now.saturating_sub(state.last_btc_ts) > cfg.ws_stale_after_ms)
+            };
+            if stale {
+                heartbeat(&cfg, "collector", "kill switch: live ws stale")?;
+                write_stop(&cfg)?;
+                break;
+            }
+
+            sleep_ms(cfg.market_interval_ms);
+        }
+        Ok(())
+    }
+
     pub fn run_fair_value(cfg: Config) -> AppResult<()> {
         cfg.ensure_trading_supported()?;
         cfg.ensure_dirs()?;
@@ -107,10 +172,12 @@ mod unix {
                 ..Default::default()
             });
         let mut buf = [0u8; 16 * 1024];
+        let mut last_market_ts = None::<u64>;
 
         while !should_stop(&cfg) {
             match recv_msg(&sock, &mut buf)? {
                 Some(WireMessage::MarketFrame(frame)) => {
+                    last_market_ts = Some(frame.ts_ms);
                     if now_ms().saturating_sub(frame.ts_ms) > cfg.stale_after_ms {
                         heartbeat(&cfg, "quote-engine", "skipped stale market frame")?;
                         continue;
@@ -123,7 +190,16 @@ mod unix {
                     heartbeat(&cfg, "quote-engine", "inventory updated")?;
                 }
                 Some(_) => {}
-                None => heartbeat(&cfg, "quote-engine", "waiting")?,
+                None => {
+                    if let Some(ts) = last_market_ts {
+                        if now_ms().saturating_sub(ts) > cfg.stale_after_ms {
+                            heartbeat(&cfg, "quote-engine", "kill switch: market stale")?;
+                            write_stop(&cfg)?;
+                            break;
+                        }
+                    }
+                    heartbeat(&cfg, "quote-engine", "waiting")?;
+                }
             }
         }
         Ok(())
@@ -136,21 +212,22 @@ mod unix {
         let sock = bind_socket(&cfg.gateway_socket())?;
         let mut buf = [0u8; 16 * 1024];
         let mut rng = FastRng::new(now_ms());
+        let mut resting: HashMap<String, RestingOrder> = HashMap::new();
 
         while !should_stop(&cfg) {
+            expire_resting_orders(&cfg, &sock, &mut resting)?;
             match recv_msg(&sock, &mut buf)? {
                 Some(WireMessage::QuoteIntent(quote)) => {
-                    let accepted = OrderAccepted {
-                        accepted_ts_ms: now_ms(),
-                        expires_ts_ms: now_ms() + cfg.quote_ttl_ms,
-                        quote: quote.clone(),
-                        source: "dry_run_gateway".to_string(),
-                    };
-                    send_msg(
-                        &sock,
-                        &cfg.risk_socket(),
-                        &WireMessage::OrderAccepted(accepted),
-                    )?;
+                    if should_keep_resting(&cfg, resting.get(&quote.side), &quote) {
+                        heartbeat(&cfg, "order-gateway", "kept resting quote")?;
+                        continue;
+                    }
+                    if let Some(old) = resting.remove(&quote.side) {
+                        send_cancel(&cfg, &sock, old, "requote")?;
+                    }
+                    if !accept_resting_order(&cfg, &sock, &mut resting, quote.clone())? {
+                        continue;
+                    }
                     if rng.next_unit() <= cfg.sim_fill_chance {
                         let fill = FillEvent {
                             quote_id: quote.quote_id.clone(),
@@ -167,6 +244,7 @@ mod unix {
                         };
                         let risk = WireMessage::FillEvent(fill);
                         send_msg(&sock, &cfg.risk_socket(), &risk)?;
+                        resting.remove(&quote.side);
                         heartbeat(&cfg, "order-gateway", "simulated fill")?;
                     } else {
                         heartbeat(&cfg, "order-gateway", "resting quote")?;
@@ -212,7 +290,21 @@ mod unix {
                         &cfg.engine_socket(),
                         &WireMessage::Inventory(inventory.clone()),
                     )?;
+                    check_kill_switch(&cfg, &inventory)?;
                     heartbeat(&cfg, "risk-ledger", "order accepted")?;
+                }
+                Some(WireMessage::OrderCancelled(cancel)) => {
+                    prune_pending(&mut pending, now_ms());
+                    cancel_pending(&mut pending, &cancel.quote_id, &cancel.side, cancel.size);
+                    recompute_pending(&mut inventory, &pending);
+                    write_json(&cfg.inventory_path(), &inventory)?;
+                    send_msg(
+                        &sock,
+                        &cfg.engine_socket(),
+                        &WireMessage::Inventory(inventory.clone()),
+                    )?;
+                    check_kill_switch(&cfg, &inventory)?;
+                    heartbeat(&cfg, "risk-ledger", format!("order {}", cancel.reason))?;
                 }
                 Some(WireMessage::FillEvent(fill)) => {
                     prune_pending(&mut pending, now_ms());
@@ -239,6 +331,7 @@ mod unix {
                         &cfg.engine_socket(),
                         &WireMessage::Inventory(inventory.clone()),
                     )?;
+                    check_kill_switch(&cfg, &inventory)?;
                     heartbeat(&cfg, "risk-ledger", "fill accounted")?;
                 }
                 Some(_) => {}
@@ -251,6 +344,7 @@ mod unix {
                             &cfg.engine_socket(),
                             &WireMessage::Inventory(inventory.clone()),
                         )?;
+                        check_kill_switch(&cfg, &inventory)?;
                     }
                     heartbeat(&cfg, "risk-ledger", "waiting")?;
                 }
@@ -490,13 +584,328 @@ mod unix {
         thread::sleep(Duration::from_millis(ms.max(1)));
     }
 
+    #[derive(Clone)]
+    struct LiveMarketState {
+        started: bool,
+        btc_price: f64,
+        price_to_beat: f64,
+        up_ask: f64,
+        down_ask: f64,
+        last_btc_ts: u64,
+        last_polymarket_ts: u64,
+    }
+
+    impl LiveMarketState {
+        fn new(cfg: &Config) -> Self {
+            Self {
+                started: false,
+                btc_price: cfg.price_to_beat,
+                price_to_beat: cfg.price_to_beat,
+                up_ask: 0.0,
+                down_ask: 0.0,
+                last_btc_ts: 0,
+                last_polymarket_ts: 0,
+            }
+        }
+
+        fn frame(&self, cfg: &Config) -> Option<MarketFrame> {
+            if self.up_ask <= 0.0 || self.down_ask <= 0.0 || self.btc_price <= 0.0 {
+                return None;
+            }
+            Some(MarketFrame {
+                ts_ms: now_ms(),
+                market: cfg.market_slug.clone(),
+                up_ask: self.up_ask,
+                down_ask: self.down_ask,
+                btc_price: self.btc_price,
+                price_to_beat: self.price_to_beat,
+                source: "live_polymarket_binance_ws".to_string(),
+            })
+        }
+    }
+
+    fn live_polymarket_loop(cfg: Config, state: Arc<Mutex<LiveMarketState>>) {
+        while !should_stop(&cfg) {
+            if let Err(err) = live_polymarket_once(&cfg, &state) {
+                let _ = heartbeat(&cfg, "collector", format!("polymarket ws reconnect: {err}"));
+                sleep_ms(1_000);
+            }
+        }
+    }
+
+    fn live_polymarket_once(cfg: &Config, state: &Arc<Mutex<LiveMarketState>>) -> AppResult<()> {
+        let (mut socket, _) = connect(cfg.polymarket_ws_url.as_str())?;
+        let sub = serde_json::json!({
+            "assets_ids": [
+                cfg.polymarket_up_token_id,
+                cfg.polymarket_down_token_id
+            ],
+            "type": "market",
+            "custom_feature_enabled": true
+        });
+        socket.send(Message::Text(sub.to_string()))?;
+        let mut last_ping = Instant::now();
+
+        while !should_stop(cfg) {
+            if last_ping.elapsed() >= Duration::from_secs(8) {
+                socket.send(Message::Text("PING".to_string()))?;
+                last_ping = Instant::now();
+            }
+            let msg = socket.read()?;
+            match msg {
+                Message::Text(raw) => {
+                    if raw == "PONG" {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                        apply_polymarket_message(cfg, state, &value);
+                    }
+                }
+                Message::Ping(payload) => {
+                    socket.send(Message::Pong(payload))?;
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn live_btc_loop(cfg: Config, state: Arc<Mutex<LiveMarketState>>) {
+        while !should_stop(&cfg) {
+            if let Err(err) = live_btc_once(&cfg, &state) {
+                let _ = heartbeat(&cfg, "collector", format!("btc ws reconnect: {err}"));
+                sleep_ms(1_000);
+            }
+        }
+    }
+
+    fn live_btc_once(cfg: &Config, state: &Arc<Mutex<LiveMarketState>>) -> AppResult<()> {
+        let (mut socket, _) = connect(cfg.binance_ws_url.as_str())?;
+        while !should_stop(cfg) {
+            let msg = socket.read()?;
+            match msg {
+                Message::Text(raw) => {
+                    if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                        if let Some(price) = parse_btc_price(&value) {
+                            let mut state = state.lock().unwrap();
+                            state.started = true;
+                            state.btc_price = price;
+                            state.last_btc_ts = now_ms();
+                        }
+                    }
+                }
+                Message::Ping(payload) => {
+                    socket.send(Message::Pong(payload))?;
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_polymarket_message(cfg: &Config, state: &Arc<Mutex<LiveMarketState>>, value: &Value) {
+        if let Some(items) = value.as_array() {
+            for item in items {
+                apply_polymarket_message(cfg, state, item);
+            }
+            return;
+        }
+
+        let event_type = value
+            .get("event_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match event_type {
+            "book" => {
+                let Some(asset_id) = value.get("asset_id").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(best_ask) = best_ask_from_levels(value.get("asks")) else {
+                    return;
+                };
+                update_polymarket_ask(cfg, state, asset_id, best_ask);
+            }
+            "best_bid_ask" => {
+                let Some(asset_id) = value.get("asset_id").and_then(Value::as_str) else {
+                    return;
+                };
+                let Some(best_ask) = parse_f64_value(value.get("best_ask")) else {
+                    return;
+                };
+                update_polymarket_ask(cfg, state, asset_id, best_ask);
+            }
+            "price_change" => {
+                let Some(changes) = value.get("price_changes").and_then(Value::as_array) else {
+                    return;
+                };
+                for change in changes {
+                    let Some(asset_id) = change.get("asset_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(best_ask) = parse_f64_value(change.get("best_ask")) else {
+                        continue;
+                    };
+                    update_polymarket_ask(cfg, state, asset_id, best_ask);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn update_polymarket_ask(
+        cfg: &Config,
+        state: &Arc<Mutex<LiveMarketState>>,
+        asset_id: &str,
+        best_ask: f64,
+    ) {
+        if !(0.0..=1.0).contains(&best_ask) || best_ask <= 0.0 {
+            return;
+        }
+        let mut state = state.lock().unwrap();
+        state.started = true;
+        state.last_polymarket_ts = now_ms();
+        if asset_id == cfg.polymarket_up_token_id {
+            state.up_ask = best_ask;
+        } else if asset_id == cfg.polymarket_down_token_id {
+            state.down_ask = best_ask;
+        }
+    }
+
+    fn best_ask_from_levels(levels: Option<&Value>) -> Option<f64> {
+        levels?
+            .as_array()?
+            .iter()
+            .filter_map(|level| {
+                let price = parse_f64_value(level.get("price"))?;
+                let size = parse_f64_value(level.get("size")).unwrap_or(0.0);
+                (size > 0.0).then_some(price)
+            })
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    fn parse_btc_price(value: &Value) -> Option<f64> {
+        parse_f64_value(value.get("p"))
+            .or_else(|| parse_f64_value(value.get("price")))
+            .or_else(|| parse_f64_value(value.get("c")))
+    }
+
+    fn parse_f64_value(value: Option<&Value>) -> Option<f64> {
+        match value? {
+            Value::String(s) => s.parse::<f64>().ok(),
+            Value::Number(n) => n.as_f64(),
+            _ => None,
+        }
+    }
+
     struct FastRng(u64);
+
+    struct RestingOrder {
+        quote_id: String,
+        market: String,
+        side: String,
+        price: f64,
+        size: f64,
+        expires_ts_ms: u64,
+    }
 
     struct PendingOrder {
         quote_id: String,
         side: String,
         size: f64,
         expires_ts_ms: u64,
+    }
+
+    fn should_keep_resting(cfg: &Config, old: Option<&RestingOrder>, quote: &QuoteIntent) -> bool {
+        let Some(old) = old else {
+            return false;
+        };
+        if old.expires_ts_ms <= now_ms() {
+            return false;
+        }
+        let threshold = cfg.tick_size * cfg.requote_threshold_ticks.max(0.0);
+        (old.price - quote.price).abs() < threshold && (old.size - quote.size).abs() < 0.001
+    }
+
+    fn accept_resting_order(
+        cfg: &Config,
+        sock: &UnixDatagram,
+        resting: &mut HashMap<String, RestingOrder>,
+        mut quote: QuoteIntent,
+    ) -> AppResult<bool> {
+        if cfg.live_order_notional_cap > 0.0 && quote.price > 0.0 {
+            let capped_size = (cfg.live_order_notional_cap / quote.price).floor();
+            if capped_size < 1.0 {
+                heartbeat(cfg, "order-gateway", "skipped live notional cap")?;
+                return Ok(false);
+            }
+            quote.size = quote.size.min(capped_size);
+        }
+        let expires_ts_ms = now_ms() + cfg.quote_ttl_ms;
+        let accepted = OrderAccepted {
+            accepted_ts_ms: now_ms(),
+            expires_ts_ms,
+            quote: quote.clone(),
+            source: "dry_run_gateway".to_string(),
+        };
+        resting.insert(
+            quote.side.clone(),
+            RestingOrder {
+                quote_id: quote.quote_id.clone(),
+                market: quote.market.clone(),
+                side: quote.side.clone(),
+                price: quote.price,
+                size: quote.size,
+                expires_ts_ms,
+            },
+        );
+        send_msg(
+            sock,
+            &cfg.risk_socket(),
+            &WireMessage::OrderAccepted(accepted),
+        )?;
+        Ok(true)
+    }
+
+    fn expire_resting_orders(
+        cfg: &Config,
+        sock: &UnixDatagram,
+        resting: &mut HashMap<String, RestingOrder>,
+    ) -> AppResult<()> {
+        let now = now_ms();
+        let expired = resting
+            .iter()
+            .filter_map(|(side, order)| (order.expires_ts_ms <= now).then_some(side.clone()))
+            .collect::<Vec<_>>();
+        for side in expired {
+            if let Some(order) = resting.remove(&side) {
+                send_cancel(cfg, sock, order, "expired")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn send_cancel(
+        cfg: &Config,
+        sock: &UnixDatagram,
+        order: RestingOrder,
+        reason: &str,
+    ) -> AppResult<()> {
+        let cancel = OrderCancelled {
+            ts_ms: now_ms(),
+            quote_id: order.quote_id,
+            market: order.market,
+            side: order.side,
+            size: order.size,
+            reason: reason.to_string(),
+            source: "dry_run_gateway".to_string(),
+        };
+        send_msg(
+            sock,
+            &cfg.risk_socket(),
+            &WireMessage::OrderCancelled(cancel),
+        )
     }
 
     fn prune_pending(pending: &mut Vec<PendingOrder>, now: u64) -> bool {
@@ -525,6 +934,10 @@ mod unix {
         pending.retain(|o| o.size > 0.001);
     }
 
+    fn cancel_pending(pending: &mut Vec<PendingOrder>, quote_id: &str, side: &str, size: f64) {
+        consume_pending(pending, quote_id, side, size);
+    }
+
     fn recompute_pending(inventory: &mut Inventory, pending: &[PendingOrder]) {
         inventory.pending_up = pending
             .iter()
@@ -543,6 +956,30 @@ mod unix {
             inventory.pending_down = 0.0;
         }
         inventory.ts_ms = now_ms();
+    }
+
+    fn check_kill_switch(cfg: &Config, inventory: &Inventory) -> AppResult<()> {
+        let worst_pnl = inventory.pnl_if_up().min(inventory.pnl_if_down());
+        if cfg.max_loss > 0.0 && worst_pnl <= -cfg.max_loss {
+            heartbeat(
+                cfg,
+                "risk-ledger",
+                format!("kill switch: max loss {worst_pnl:+.2}"),
+            )?;
+            write_stop(cfg)?;
+            return Ok(());
+        }
+
+        let total_inventory = inventory.effective_up() + inventory.effective_down();
+        if cfg.max_total_inventory > 0.0 && total_inventory >= cfg.max_total_inventory {
+            heartbeat(
+                cfg,
+                "risk-ledger",
+                format!("kill switch: inventory {total_inventory:.0}"),
+            )?;
+            write_stop(cfg)?;
+        }
+        Ok(())
     }
 
     impl FastRng {

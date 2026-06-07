@@ -2,7 +2,7 @@
 
 这是一个 **Rust 多进程 BTC 5 分钟二元市场做市机器人骨架**。
 
-当前版本是低延迟架构骨架，默认 **DRY_RUN 模拟模式**，不会真实下单。真实 Polymarket 下单接口还没有接入，后面应该接在 `order-gateway` 进程里。
+当前版本是低延迟架构骨架，默认 **DRY_RUN 模拟模式**，不会真实下单。已经支持 `DATA_MODE=live` 读取真实 Polymarket market WebSocket + Binance BTC WebSocket 行情；真实下单仍被安全闸门拦住，不能误下真钱。
 
 ## 架构
 
@@ -15,10 +15,10 @@ collector      -> quote-engine -> order-gateway -> risk-ledger
 
 各进程职责：
 
-- `collector`：采集行情。当前是模拟 BTC/盘口数据，后面换成 Polymarket WS + Binance/Chainlink。
+- `collector`：采集行情。`DATA_MODE=sim` 用本地模拟数据；`DATA_MODE=live` 用 Polymarket market WS + Binance BTC WS。
 - `quote-engine`：计算 fair value、Up/Down 双边报价、库存偏移。
-- `order-gateway`：下单热路径。以后私钥、签名、下单、撤单、HTTP 保活都放这里。
-- `risk-ledger`：记录成交、库存、两种结算情景下的 PnL，并把库存反馈给报价引擎。
+- `order-gateway`：下单热路径。当前是 DRY_RUN 网关，带撤单/改单状态机；以后真实 SDK 下单、签名、撤单、HTTP 保活都放这里。
+- `risk-ledger`：记录成交、库存、两种结算情景下的 PnL，并把库存反馈给报价引擎；同时执行 kill switch。
 - `supervisor`：启动并守护上面 4 个进程。
 
 热路径通信使用 Unix datagram socket：
@@ -305,6 +305,25 @@ DRY_RUN=1
 必须保持 `1`。当前版本没有真实下单实现，不能实盘。
 
 ```text
+DATA_MODE=sim
+```
+
+行情来源：
+
+- `sim`：本地模拟行情，适合测试架构和风控。
+- `live`：连接真实 Polymarket market WebSocket 和 Binance BTC WebSocket。
+
+live 模式还需要填：
+
+```text
+POLYMARKET_UP_TOKEN_ID=
+POLYMARKET_DOWN_TOKEN_ID=
+PRICE_TO_BEAT=68000
+```
+
+`POLYMARKET_UP_TOKEN_ID` / `POLYMARKET_DOWN_TOKEN_ID` 是当前 5 分钟市场的两个 CLOB token id。`PRICE_TO_BEAT` 是这个 5 分钟市场的判定价/开盘价，必须按当前市场问题填写。
+
+```text
 QUOTE_SIZE=5
 ```
 
@@ -327,6 +346,12 @@ QUOTE_TTL_MS=1500
 ```
 
 未成交报价在风控里保留多久。报价发给 `order-gateway` 后，会先算进 pending 库存；如果没有成交，超过 TTL 后释放。
+
+```text
+REQUOTE_THRESHOLD_TICKS=1
+```
+
+撤单/改单阈值。新报价和旧报价差距达到这个 tick 数时，`order-gateway` 会撤旧换新；没达到则保留旧挂单，减少无意义撤单。
 
 ```text
 INVENTORY_SKEW=0.03
@@ -365,6 +390,20 @@ STALE_AFTER_MS=800
 
 行情超过这个时间没更新，quote-engine 会跳过，避免用旧行情报价。
 
+```text
+WS_STALE_AFTER_MS=10000
+MAX_LOSS=25
+MAX_TOTAL_INVENTORY=50
+LIVE_ORDER_NOTIONAL_CAP=5
+```
+
+安全阈值：
+
+- `WS_STALE_AFTER_MS`：live WS 断流超过阈值，写入停止信号。
+- `MAX_LOSS`：最坏结算情景亏损达到阈值，停止服务。
+- `MAX_TOTAL_INVENTORY`：Up+Down 已成交+pending 总库存达到阈值，停止服务。
+- `LIVE_ORDER_NOTIONAL_CAP`：未来打开真实下单时的单笔名义金额上限；当前 DRY_RUN 也会按它截断模拟挂单。
+
 ## 做市逻辑
 
 当前报价逻辑是：
@@ -382,23 +421,29 @@ STALE_AFTER_MS=800
 
 当前版本还没有接入：
 
-- 真实 Polymarket CLOB SDK
+- 真实 Polymarket CLOB SDK 下单
 - 真实私钥签名
-- 真实下单/撤单
-- 真实 Polymarket 盘口 WS
-- 真实 Binance/Chainlink 数据
-- dashboard 页面
+- 真实订单回报 user channel
+- 真实下单/撤单 HTTP 状态同步
+- 自动发现当前 5 分钟 BTC 市场 token id
+- Web dashboard 页面
 
-这些功能后面都应该围绕现有多进程结构继续接。
+已经接入/优化：
+
+- `DATA_MODE=live` 真实 Polymarket market WS + Binance BTC WS 行情。
+- DRY_RUN 网关撤单/改单状态机。
+- pending 库存风控。
+- kill switch：最大亏损、最大库存、行情过期、WS 断流。
+- CLI dashboard 对齐显示。
 
 ## 下一步建议
 
 优先顺序：
 
-1. 把 `collector` 从模拟行情换成真实 Polymarket WS + BTC 数据。
-2. 把 `order-gateway` 接入 Polymarket SDK，但先保持小额 DRY_RUN 对照。
-3. 加撤单/改单状态机：旧报价过期、盘口移动、库存变化时撤旧挂新。
-4. 加 kill switch：最大亏损、最大库存、行情过期、WS 断连时停止报价。
-5. 再做 dashboard。
+1. 自动发现当前 5 分钟 BTC 市场，并自动填充 Up/Down token id 与 `PRICE_TO_BEAT`。
+2. 接 Polymarket user channel，拿真实订单成交/取消回报做 DRY_RUN 对照。
+3. 把 `order-gateway` 接官方 Rust CLOB SDK，但先只允许小额、手动确认、DRY_RUN shadow。
+4. 做 Web dashboard 页面。
+5. 最后才考虑关闭 `DRY_RUN`，并且必须有私钥隔离、限额和 kill switch。
 
 不要把私钥写进仓库。真实私钥只放 VPS 的 `.env` 或系统 secret。
