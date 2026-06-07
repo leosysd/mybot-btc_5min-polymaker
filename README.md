@@ -33,6 +33,21 @@ JSONL 文件只做审计日志，不做热路径通信。
 
 ## VPS 安装
 
+推荐用一键安装。GitHub Actions 会在 GitHub 云端编译 Linux 二进制，并发布到 `latest` Release；VPS 只下载成品，不需要在 VPS 上编译。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leosysd/mybot-btc_5min-polymaker/main/install.sh | bash
+```
+
+安装完成后进入目录：
+
+```bash
+cd /opt/polymaker
+polymaker menu
+```
+
+如果你想从源码编译，再按下面步骤。
+
 先安装基础依赖：
 
 ```bash
@@ -67,18 +82,68 @@ cp .env.example .env
 cargo build --release
 ```
 
+## 交互菜单
+
+启动中文菜单：
+
+```bash
+polymaker
+```
+
+或者：
+
+```bash
+polymaker menu
+```
+
+菜单里可以做这些事：
+
+- 初始化 `.env` 配置
+- 调整做市参数
+- 查看当前状态
+- 打开交易监控页
+- 试跑 15 秒模拟做市
+- 后台启动服务
+- 停止服务
+- 重启服务
+- 清空运行数据
+- 查看参数说明
+
+## 交易监控页
+
+打开交易页面：
+
+```bash
+polymaker dashboard
+```
+
+只看 10 秒：
+
+```bash
+polymaker dashboard --seconds 10
+```
+
+交易页会显示：
+
+- 进程心跳
+- 当前库存
+- Up 赢 / Down 赢两种情景 PnL
+- 最近行情
+- 最近报价
+- 最近模拟成交
+
 ## 快速试跑
 
 先清理旧运行目录：
 
 ```bash
-./target/release/polymaker clean
+polymaker clean
 ```
 
 运行 15 秒模拟做市：
 
 ```bash
-./target/release/polymaker supervisor --seconds 15
+polymaker supervisor --seconds 15
 ```
 
 查看输出：
@@ -101,7 +166,7 @@ cat run/inventory.json
 停止所有进程：
 
 ```bash
-./target/release/polymaker stop
+polymaker stop
 ```
 
 ## 常用命令
@@ -109,37 +174,49 @@ cat run/inventory.json
 查看帮助：
 
 ```bash
-./target/release/polymaker help
+polymaker help
 ```
 
 单独启动报价引擎：
 
 ```bash
-./target/release/polymaker quote-engine
+polymaker quote-engine
 ```
 
 单独启动下单网关：
 
 ```bash
-./target/release/polymaker order-gateway
+polymaker order-gateway
 ```
 
 单独启动风控账本：
 
 ```bash
-./target/release/polymaker risk-ledger
+polymaker risk-ledger
 ```
 
 单独启动行情采集：
 
 ```bash
-./target/release/polymaker collector
+polymaker collector
 ```
 
 启动完整多进程：
 
 ```bash
-./target/release/polymaker supervisor
+polymaker supervisor
+```
+
+后台启动完整服务：
+
+```bash
+polymaker start
+```
+
+重启后台服务：
+
+```bash
+polymaker restart
 ```
 
 ## PM2 常驻运行
@@ -165,7 +242,7 @@ pm2 logs polymaker-order-gateway
 
 ```bash
 pm2 stop ecosystem.config.js
-./target/release/polymaker stop
+polymaker stop
 ```
 
 ## 配置说明

@@ -1,0 +1,62 @@
+name: build-release
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          mkdir -p dist/package
+          cp target/release/polymaker dist/package/
+          cp README.md .env.example ecosystem.config.js install.sh dist/package/
+          tar -C dist/package -czf dist/polymaker-linux-x86_64.tar.gz .
+          sha256sum dist/polymaker-linux-x86_64.tar.gz > dist/polymaker-linux-x86_64.tar.gz.sha256
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: polymaker-linux-x86_64
+          path: |
+            dist/polymaker-linux-x86_64.tar.gz
+            dist/polymaker-linux-x86_64.tar.gz.sha256
+
+      - name: Update latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f latest "$GITHUB_SHA"
+          git push -f origin latest
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest \
+              --title "Latest Polymaker Linux build" \
+              --notes "自动构建自 main 分支：$GITHUB_SHA"
+          else
+            gh release create latest \
+              --title "Latest Polymaker Linux build" \
+              --notes "自动构建自 main 分支：$GITHUB_SHA"
+          fi
+          gh release upload latest dist/polymaker-linux-x86_64.tar.gz dist/polymaker-linux-x86_64.tar.gz.sha256 --clobber

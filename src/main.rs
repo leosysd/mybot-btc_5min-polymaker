@@ -1,6 +1,7 @@
 mod config;
 mod ipc;
 mod pricing;
+mod ui;
 mod workers;
 
 use config::Config;
@@ -12,8 +13,7 @@ fn main() -> AppResult<()> {
     let cfg = Config::from_env()?;
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {
-        print_usage();
-        return Ok(());
+        return ui::run_menu(&cfg);
     };
 
     match cmd.as_str() {
@@ -21,11 +21,24 @@ fn main() -> AppResult<()> {
             let seconds = parse_seconds(args.collect())?;
             workers::run_supervisor(cfg, seconds)
         }
+        "start" => workers::start_background(&cfg),
         "collector" | "market-data" => workers::run_market_data(cfg),
         "quote-engine" | "engine" | "fair-value" => workers::run_fair_value(cfg),
         "order-gateway" | "gateway" | "maker" => workers::run_maker(cfg),
         "risk-ledger" | "risk" => workers::run_risk(cfg),
         "stop" => workers::write_stop(&cfg),
+        "restart" => {
+            workers::write_stop(&cfg)?;
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            workers::start_background(&cfg)
+        }
+        "status" => ui::print_status(&cfg),
+        "dashboard" | "trade" => {
+            let seconds = parse_seconds(args.collect())?;
+            ui::run_dashboard(&cfg, seconds)
+        }
+        "menu" | "m" => ui::run_menu(&cfg),
+        "init" => ui::init_config(),
         "clean" => workers::clean_run_dir(&cfg),
         "help" | "-h" | "--help" => {
             print_usage();
@@ -61,11 +74,17 @@ fn print_usage() {
 \n\
 用法:\n\
   polymaker supervisor [--seconds N]  启动完整多进程；可选 N 秒后自动停止\n\
+  polymaker start                     后台启动完整多进程\n\
   polymaker collector                 启动模拟行情采集进程\n\
   polymaker quote-engine              启动 fair value/报价进程\n\
   polymaker order-gateway             启动 dry-run 下单网关进程\n\
   polymaker risk-ledger               启动库存/风控账本进程\n\
+  polymaker dashboard [--seconds N]   打开交易监控页\n\
+  polymaker menu                      打开中文交互菜单\n\
+  polymaker status                    查看进程心跳/库存状态\n\
   polymaker stop                      通知所有进程停止\n\
+  polymaker restart                   重启后台服务\n\
+  polymaker init                      初始化 .env 配置\n\
   polymaker clean                     删除 run 运行目录\n"
     );
 }

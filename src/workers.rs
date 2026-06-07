@@ -10,7 +10,7 @@ mod unix {
     use std::io;
     use std::os::unix::net::UnixDatagram;
     use std::path::Path;
-    use std::process::{Child, Command};
+    use std::process::{Child, Command, Stdio};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -194,6 +194,23 @@ mod unix {
         Ok(())
     }
 
+    pub fn start_background(cfg: &Config) -> AppResult<()> {
+        cfg.ensure_dirs()?;
+        let _ = std::fs::remove_file(cfg.stop_file());
+        let exe = std::env::current_exe()?;
+        let log_path = cfg.run_dir.join("supervisor.log");
+        let out = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)?;
+        let err = out.try_clone()?;
+        let child = Command::new(exe)
+            .arg("supervisor")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out))
+            .stderr(Stdio::from(err))
+            .spawn()?;
+        println!("后台服务已启动 pid={} 日志={}", child.id(), log_path.display());
+        Ok(())
+    }
+
     pub fn clean_run_dir(cfg: &Config) -> AppResult<()> {
         if cfg.run_dir.exists() {
             std::fs::remove_dir_all(&cfg.run_dir)?;
@@ -334,6 +351,7 @@ mod non_unix {
     pub fn run_maker(_cfg: Config) -> AppResult<()> { run_supervisor(_cfg, None) }
     pub fn run_risk(_cfg: Config) -> AppResult<()> { run_supervisor(_cfg, None) }
     pub fn write_stop(_cfg: &Config) -> AppResult<()> { run_supervisor(_cfg.clone(), None) }
+    pub fn start_background(_cfg: &Config) -> AppResult<()> { run_supervisor(_cfg.clone(), None) }
     pub fn clean_run_dir(_cfg: &Config) -> AppResult<()> { run_supervisor(_cfg.clone(), None) }
 }
 
