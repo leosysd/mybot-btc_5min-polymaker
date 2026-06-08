@@ -843,9 +843,13 @@ mod unix {
             model.down_bid
         };
 
-        // ── 5. Endgame protocol: which sides may be quoted at all right now.
+        // ── 5. Endgame protocol + min-probability gate: a side is only quoted
+        // if its win probability >= MIN_FAIR_TO_QUOTE (skip deep longshots).
         let phase = phase_for(tau, cfg.endgame_reduce_secs, cfg.endgame_pull_secs);
-        let up_px = if side_allowed(true, phase, up_eff, down_eff) {
+        let up_ok = side_allowed(true, phase, up_eff, down_eff) && p_up >= cfg.min_fair_to_quote;
+        let down_ok =
+            side_allowed(false, phase, up_eff, down_eff) && (1.0 - p_up) >= cfg.min_fair_to_quote;
+        let up_px = if up_ok {
             post_only_bid(
                 up_capped,
                 frame.up_ask,
@@ -857,7 +861,7 @@ mod unix {
         } else {
             None
         };
-        let down_px = if side_allowed(false, phase, up_eff, down_eff) {
+        let down_px = if down_ok {
             post_only_bid(
                 down_capped,
                 frame.down_ask,
