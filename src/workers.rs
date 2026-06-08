@@ -932,26 +932,37 @@ mod unix {
 
     fn send_msg(sock: &UnixDatagram, path: &Path, msg: &WireMessage) -> AppResult<()> {
         let bytes = serde_json::to_vec(msg)?;
-        let mut last_err = None;
         for attempt in 0..5 {
             match sock.send_to(&bytes, path) {
                 Ok(_) => return Ok(()),
+                // Peer socket momentarily absent/refused (a sibling worker is
+                // restarting). Retry briefly, then DROP the datagram and keep
+                // running — a missed IPC frame self-heals (next tick re-sends;
+                // inventory is corrected by position reconciliation). Crashing
+                // the worker here just causes a restart storm.
                 Err(err)
-                    if attempt < 4
-                        && matches!(
-                            err.kind(),
-                            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-                        ) =>
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::NotFound
+                            | io::ErrorKind::WouldBlock
+                    ) =>
                 {
-                    last_err = Some(err);
-                    sleep_ms(20);
+                    if attempt < 4 {
+                        sleep_ms(20);
+                        continue;
+                    }
+                    eprintln!(
+                        "[IPC_DROP] send to {} failed ({:?}); dropped frame",
+                        path.display(),
+                        err.kind()
+                    );
+                    return Ok(());
                 }
                 Err(err) => return Err(err.into()),
             }
         }
-        Err(last_err
-            .map(|err| err.into())
-            .unwrap_or_else(|| "send_msg failed".into()))
+        Ok(())
     }
 
     fn recv_msg(sock: &UnixDatagram, buf: &mut [u8]) -> AppResult<Option<WireMessage>> {
