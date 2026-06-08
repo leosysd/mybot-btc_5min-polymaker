@@ -181,6 +181,13 @@ ensure_env_defaults() {
     append_env_line HEDGE_VENUE "" "HEDGE_VENUE=binance_perp"
   fi
 
+  if section_has_missing RECONCILE_INTERVAL_MS ENABLE_PREWARM PREWARM_INTERVAL_MS; then
+    append_section_header "# ── 实盘对账 / 连接保活（install.sh 自动补齐）──────────────────"
+    append_env_line RECONCILE_INTERVAL_MS "# 周期拉交易所真实挂单、撤孤儿单(毫秒)。0=关。" "RECONCILE_INTERVAL_MS=30000"
+    append_env_line ENABLE_PREWARM "# 开新盘预热 token 缓存 + 周期 ping CLOB 保活热连接。" "ENABLE_PREWARM=1"
+    append_env_line PREWARM_INTERVAL_MS "" "PREWARM_INTERVAL_MS=60000"
+  fi
+
   if [ "$ENV_BACKUP_DONE" -eq 1 ]; then
     echo "已保留原 .env，并补齐缺失字段。备份: $ENV_BACKUP_PATH"
   fi

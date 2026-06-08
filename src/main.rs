@@ -32,6 +32,7 @@ fn main() -> AppResult<()> {
         "stop" => workers::write_stop(&cfg),
         "restart" => workers::restart_background(&cfg),
         "status" => ui::print_status(&cfg),
+        "stats" | "stat" => ui::print_trade_stats(&cfg),
         "dashboard" | "trade" => {
             let seconds = parse_seconds(args.collect())?;
             ui::run_dashboard(&cfg, seconds)
@@ -85,6 +86,7 @@ fn print_usage() {
   polymaker dashboard [--seconds N]   打开交易监控页\n\
   polymaker menu                      打开中文交互菜单\n\
   polymaker status                    查看进程心跳/库存状态\n\
+  polymaker stats                     查看交易统计表(按盘口聚合)\n\
   polymaker stop                      通知所有进程停止\n\
   polymaker restart                   重启后台服务\n\
   polymaker init                      初始化 .env 配置\n\
