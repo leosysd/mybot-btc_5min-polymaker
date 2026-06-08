@@ -38,6 +38,27 @@ pub struct Config {
     pub max_loss: f64,
     pub max_total_inventory: f64,
     pub live_order_notional_cap: f64,
+    // ── strategy brain v3 ──────────────────────────────────────────────
+    pub vol_seed_per_sqrt_sec: f64,
+    pub vol_halflife_sec: f64,
+    pub vol_min_per_sqrt_sec: f64,
+    pub vol_max_per_sqrt_sec: f64,
+    pub width_floor_usd: f64,
+    pub base_half_spread: f64,
+    pub min_lock_edge: f64,
+    pub latency_sec: f64,
+    pub k_adverse: f64,
+    pub min_half_spread: f64,
+    pub max_half_spread: f64,
+    pub endgame_reduce_secs: f64,
+    pub endgame_pull_secs: f64,
+    pub inventory_skew_time_boost: f64,
+    pub tox_horizon_ms: u64,
+    pub tox_decay: f64,
+    pub tox_k_widen: f64,
+    pub tox_max_widen: f64,
+    pub enable_delta_hedge: bool,
+    pub hedge_venue: String,
     pub enable_real_orders: String,
     pub polymarket_clob_host: String,
     pub poly_private_key: String,
@@ -110,6 +131,26 @@ impl Config {
             max_loss: get_f64(&file_env, "MAX_LOSS", 25.0),
             max_total_inventory: get_f64(&file_env, "MAX_TOTAL_INVENTORY", 50.0),
             live_order_notional_cap: get_f64(&file_env, "LIVE_ORDER_NOTIONAL_CAP", 5.0),
+            vol_seed_per_sqrt_sec: get_f64(&file_env, "VOL_SEED_PER_SQRT_SEC", 6.0),
+            vol_halflife_sec: get_f64(&file_env, "VOL_HALFLIFE_SEC", 20.0),
+            vol_min_per_sqrt_sec: get_f64(&file_env, "VOL_MIN_PER_SQRT_SEC", 1.5),
+            vol_max_per_sqrt_sec: get_f64(&file_env, "VOL_MAX_PER_SQRT_SEC", 60.0),
+            width_floor_usd: get_f64(&file_env, "WIDTH_FLOOR_USD", 3.0),
+            base_half_spread: get_f64(&file_env, "BASE_HALF_SPREAD", 0.012),
+            min_lock_edge: get_f64(&file_env, "MIN_LOCK_EDGE", 0.02),
+            latency_sec: get_f64(&file_env, "LATENCY_SEC", 0.4),
+            k_adverse: get_f64(&file_env, "K_ADVERSE", 1.0),
+            min_half_spread: get_f64(&file_env, "MIN_HALF_SPREAD", 0.005),
+            max_half_spread: get_f64(&file_env, "MAX_HALF_SPREAD", 0.25),
+            endgame_reduce_secs: get_f64(&file_env, "ENDGAME_REDUCE_SECS", 60.0),
+            endgame_pull_secs: get_f64(&file_env, "ENDGAME_PULL_SECS", 12.0),
+            inventory_skew_time_boost: get_f64(&file_env, "INVENTORY_SKEW_TIME_BOOST", 2.0),
+            tox_horizon_ms: get_u64(&file_env, "TOX_HORIZON_MS", 2500),
+            tox_decay: get_f64(&file_env, "TOX_DECAY", 0.5),
+            tox_k_widen: get_f64(&file_env, "TOX_K_WIDEN", 1.5),
+            tox_max_widen: get_f64(&file_env, "TOX_MAX_WIDEN", 0.08),
+            enable_delta_hedge: get_bool(&file_env, "ENABLE_DELTA_HEDGE", false),
+            hedge_venue: get(&file_env, "HEDGE_VENUE", "binance_perp"),
             enable_real_orders: get(&file_env, "ENABLE_REAL_ORDERS", ""),
             polymarket_clob_host: get(
                 &file_env,
@@ -168,6 +209,35 @@ impl Config {
         if self.live_order_notional_cap < 0.0 || !self.live_order_notional_cap.is_finite() {
             return Err("LIVE_ORDER_NOTIONAL_CAP must be finite and non-negative".into());
         }
+        // ── strategy brain v3 sanity ───────────────────────────────────
+        if !(self.vol_seed_per_sqrt_sec.is_finite() && self.vol_seed_per_sqrt_sec > 0.0) {
+            return Err("VOL_SEED_PER_SQRT_SEC must be positive".into());
+        }
+        if self.vol_halflife_sec < 1.0 || !self.vol_halflife_sec.is_finite() {
+            return Err("VOL_HALFLIFE_SEC must be at least 1".into());
+        }
+        if self.vol_min_per_sqrt_sec <= 0.0 || self.vol_max_per_sqrt_sec < self.vol_min_per_sqrt_sec
+        {
+            return Err("VOL_MIN/MAX_PER_SQRT_SEC are invalid".into());
+        }
+        if self.width_floor_usd <= 0.0 || !self.width_floor_usd.is_finite() {
+            return Err("WIDTH_FLOOR_USD must be positive".into());
+        }
+        if !(0.0..=0.5).contains(&self.base_half_spread) {
+            return Err("BASE_HALF_SPREAD must be in [0, 0.5]".into());
+        }
+        if !(0.0..0.95).contains(&self.min_lock_edge) {
+            return Err("MIN_LOCK_EDGE must be in [0, 0.95)".into());
+        }
+        if self.min_half_spread < 0.0 || self.max_half_spread < self.min_half_spread {
+            return Err("MIN/MAX_HALF_SPREAD are invalid".into());
+        }
+        if self.latency_sec < 0.0 || !self.latency_sec.is_finite() {
+            return Err("LATENCY_SEC must be finite and non-negative".into());
+        }
+        if self.endgame_pull_secs < 0.0 || self.endgame_reduce_secs < self.endgame_pull_secs {
+            return Err("ENDGAME_REDUCE_SECS must be >= ENDGAME_PULL_SECS >= 0".into());
+        }
         Ok(())
     }
 
@@ -219,6 +289,13 @@ impl Config {
         }
         if self.poly_chain_id != 137 {
             return Err("当前只支持 Polygon 主网 POLY_CHAIN_ID=137".into());
+        }
+        if self.enable_delta_hedge {
+            return Err(
+                "ENABLE_DELTA_HEDGE 当前只是占位骨架，未接真实对冲交易所，禁止在实单模式开启。\
+                 先用模拟验证策略大脑，等对冲模块真正实现后再启用。"
+                    .into(),
+            );
         }
         Ok(())
     }

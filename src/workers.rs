@@ -5,7 +5,11 @@ mod unix {
         heartbeat, now_ms, read_json, should_stop, write_json, FillEvent, Inventory, MarketFrame,
         OrderAccepted, OrderCancelled, QuoteIntent, WireMessage,
     };
-    use crate::pricing::{market_maker_bids, normal_cdf, post_only_bid};
+    use crate::pricing::{
+        digital_p_up, half_spread, market_maker_bids, phase_for, post_only_bid, price_sensitivity,
+        side_allowed, time_boosted_skew, uncertainty_width, MmParams, Phase, SpreadInputs,
+        ToxicityMonitor, VolEstimator,
+    };
     use crate::real_orders::{RealOrderClient, UserWsCredentials};
     use crate::AppResult;
     use serde::{Deserialize, Serialize};
@@ -112,12 +116,39 @@ mod unix {
         let sock = UnixDatagram::unbound()?;
         let logger = spawn_jsonl_writer();
         let mut step = 0u64;
-        let price_to_beat = cfg.price_to_beat;
+        let center = cfg.price_to_beat;
+        let window = cfg.market_window_secs.max(1);
+        let dt_sec = (cfg.market_interval_ms.max(1) as f64) / 1000.0;
+        let mut vol = VolEstimator::new(
+            cfg.vol_seed_per_sqrt_sec,
+            cfg.vol_halflife_sec,
+            cfg.vol_min_per_sqrt_sec,
+            cfg.vol_max_per_sqrt_sec,
+        );
+        // Each window mimics a real 5-min market: price_to_beat is locked at the
+        // BTC price when the window opens, then tau counts down to settlement.
+        let mut window_start = (now_ms() / 1000) / window * window;
+        let mut price_to_beat = center;
+        let mut window_initialized = false;
 
         while !should_stop(&cfg) {
             let phase = step as f64 / 9.0;
-            let btc_price = price_to_beat + 42.0 * phase.sin() + 15.0 * (phase * 0.37).cos();
-            let fair_up = normal_cdf((btc_price - price_to_beat) / cfg.btc_sigma_usd);
+            let btc_price = center + 42.0 * phase.sin() + 15.0 * (phase * 0.37).cos();
+            let vol_now = vol.update(btc_price, dt_sec);
+
+            let now_s = now_ms() / 1000;
+            let this_window = now_s / window * window;
+            if !window_initialized || this_window != window_start {
+                window_start = this_window;
+                price_to_beat = btc_price; // lock the beat at the open
+                window_initialized = true;
+            }
+            let window_end_ms = (window_start + window) * 1000;
+            let tau_seconds = ((window_end_ms.saturating_sub(now_ms())) as f64 / 1000.0).max(0.0);
+
+            // Bracket the time-aware fair value so the simulated book is sensible.
+            let w = uncertainty_width(vol_now, tau_seconds, cfg.width_floor_usd);
+            let fair_up = digital_p_up(btc_price, price_to_beat, w);
             let micro_noise = 0.012 * (phase * 1.7).sin();
             let frame = MarketFrame {
                 ts_ms: now_ms(),
@@ -129,6 +160,8 @@ mod unix {
                 down_ask: (1.0 - fair_up + 0.035 - micro_noise).clamp(0.03, 0.97),
                 btc_price,
                 price_to_beat,
+                tau_seconds,
+                vol_per_sqrt_sec: vol_now,
                 source: "simulated_collector".to_string(),
             };
             match send_msg(
@@ -213,6 +246,17 @@ mod unix {
             });
         let mut buf = [0u8; 16 * 1024];
         let mut last_market_ts = None::<u64>;
+        // Adverse-selection monitor: watches whether fair value drifts against
+        // us right after each fill, and asks for wider spreads when it does.
+        let mut tox = ToxicityMonitor::new(
+            cfg.tox_horizon_ms,
+            cfg.tox_decay,
+            cfg.tox_k_widen,
+            cfg.tox_max_widen,
+        );
+        let mut last_p_up = 0.5_f64;
+        let mut prev_up = inventory.up_shares;
+        let mut prev_down = inventory.down_shares;
 
         while !should_stop(&cfg) {
             match recv_msg(&sock, &mut buf)? {
@@ -222,10 +266,21 @@ mod unix {
                         heartbeat(&cfg, "quote-engine", "skipped stale market frame")?;
                         continue;
                     }
-                    handle_market_frame(&cfg, &sock, &frame, &inventory)?;
+                    last_p_up = handle_market_frame(&cfg, &sock, &frame, &inventory, &mut tox)?;
                     heartbeat(&cfg, "quote-engine", "quoted")?;
                 }
                 Some(WireMessage::Inventory(next)) => {
+                    // A rise in filled shares is a fill: feed the toxicity monitor
+                    // with the fair value that was live when we got hit.
+                    let now = now_ms();
+                    if next.up_shares > prev_up + 1e-9 {
+                        tox.on_fill(true, last_p_up, now);
+                    }
+                    if next.down_shares > prev_down + 1e-9 {
+                        tox.on_fill(false, last_p_up, now);
+                    }
+                    prev_up = next.up_shares;
+                    prev_down = next.down_shares;
                     inventory = next;
                     heartbeat(&cfg, "quote-engine", "inventory updated")?;
                 }
@@ -552,12 +607,15 @@ mod unix {
         Ok(())
     }
 
+    /// Compute the time-aware quotes for one market frame and emit them.
+    /// Returns the fair `p_up` used, so the caller can feed the toxicity monitor.
     fn handle_market_frame(
         cfg: &Config,
         sock: &UnixDatagram,
         frame: &MarketFrame,
         inventory: &Inventory,
-    ) -> AppResult<()> {
+        tox: &mut ToxicityMonitor,
+    ) -> AppResult<f64> {
         let current_inventory;
         let inventory = if inventory.market == frame.market {
             inventory
@@ -568,42 +626,90 @@ mod unix {
             };
             &current_inventory
         };
-        let z = (frame.btc_price - frame.price_to_beat) / cfg.btc_sigma_usd;
-        let p_up = normal_cdf(z);
-        let model = market_maker_bids(
-            p_up,
-            cfg.quote_spread,
-            cfg.inventory_skew,
-            inventory.effective_up(),
-            inventory.effective_down(),
-            cfg.max_side_inventory(),
-            cfg.min_bid,
-            cfg.max_bid,
-        );
 
-        let up_px = post_only_bid(
-            model.up_bid,
-            frame.up_ask,
-            cfg.tick_size,
-            cfg.min_bid,
-            cfg.max_bid,
-        );
-        let down_px = post_only_bid(
-            model.down_bid,
-            frame.down_ask,
-            cfg.tick_size,
-            cfg.min_bid,
-            cfg.max_bid,
-        );
+        // ── 1. Time-aware fair value: p_up = Phi((S - P) / W), W = sigma*sqrt(tau).
+        let window = cfg.market_window_secs as f64;
+        let tau = if frame.tau_seconds > 0.0 {
+            frame.tau_seconds
+        } else {
+            window
+        };
+        let vol = if frame.vol_per_sqrt_sec > 0.0 {
+            frame.vol_per_sqrt_sec
+        } else {
+            cfg.vol_seed_per_sqrt_sec
+        };
+        let width = uncertainty_width(vol, tau, cfg.width_floor_usd);
+        let p_up = digital_p_up(frame.btc_price, frame.price_to_beat, width);
+
+        // ── 2. Toxicity feedback: settle matured fills, get any extra widening.
+        tox.on_fair(p_up, now_ms());
+
+        // ── 3. Spread: base + adverse-selection (sensitivity-driven) + toxicity.
+        let sensitivity = price_sensitivity(frame.btc_price, frame.price_to_beat, width);
+        let half = half_spread(&SpreadInputs {
+            base_half_spread: cfg.base_half_spread,
+            sensitivity,
+            vol_per_sqrt_sec: vol,
+            latency_sec: cfg.latency_sec,
+            k_adverse: cfg.k_adverse,
+            toxicity_widen: tox.widen(),
+            min_half_spread: cfg.min_half_spread,
+            max_half_spread: cfg.max_half_spread,
+        });
+
+        // ── 4. Inventory skew, ramped up as the window closes.
+        let skew = time_boosted_skew(cfg.inventory_skew, tau, window, cfg.inventory_skew_time_boost);
+        let up_eff = inventory.effective_up();
+        let down_eff = inventory.effective_down();
+        let model = market_maker_bids(&MmParams {
+            p_up,
+            half_spread: half,
+            inventory_skew: skew,
+            up_inventory: up_eff,
+            down_inventory: down_eff,
+            max_side_inventory: cfg.max_side_inventory(),
+            min_bid: cfg.min_bid,
+            max_bid: cfg.max_bid,
+            min_lock_edge: cfg.min_lock_edge,
+        });
+
+        // ── 5. Endgame protocol: which sides may be quoted at all right now.
+        let phase = phase_for(tau, cfg.endgame_reduce_secs, cfg.endgame_pull_secs);
+        let up_px = if side_allowed(true, phase, up_eff, down_eff) {
+            post_only_bid(model.up_bid, frame.up_ask, cfg.tick_size, cfg.min_bid, cfg.max_bid)
+        } else {
+            None
+        };
+        let down_px = if side_allowed(false, phase, up_eff, down_eff) {
+            post_only_bid(
+                model.down_bid,
+                frame.down_ask,
+                cfg.tick_size,
+                cfg.min_bid,
+                cfg.max_bid,
+            )
+        } else {
+            None
+        };
+
+        let reason = match phase {
+            Phase::Normal => "tov3_normal",
+            Phase::ReduceOnly => "tov3_reduce_only",
+            Phase::Pull => "tov3_pull",
+        };
         if let Some(px) = up_px {
-            send_quote(cfg, sock, frame, "Up", px, p_up, inventory)?;
+            send_quote(cfg, sock, frame, "Up", px, p_up, inventory, reason)?;
         }
         if let Some(px) = down_px {
-            send_quote(cfg, sock, frame, "Down", px, 1.0 - p_up, inventory)?;
+            send_quote(cfg, sock, frame, "Down", px, 1.0 - p_up, inventory, reason)?;
         }
-        Ok(())
+        // In Pull/ReduceOnly the pulled side simply isn't re-quoted; the gateway
+        // expires its resting order by TTL (QUOTE_TTL_MS), flattening it.
+        Ok(p_up)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn send_quote(
         cfg: &Config,
         sock: &UnixDatagram,
@@ -612,6 +718,7 @@ mod unix {
         price: f64,
         fair: f64,
         inventory: &Inventory,
+        reason: &str,
     ) -> AppResult<()> {
         let side_inventory = if side == "Up" {
             inventory.effective_up()
@@ -638,7 +745,7 @@ mod unix {
             fair,
             inventory_up: inventory.effective_up(),
             inventory_down: inventory.effective_down(),
-            reason: "binary_mm_fair_value_inventory_skew".to_string(),
+            reason: reason.to_string(),
         };
         send_msg(
             sock,
@@ -879,9 +986,25 @@ mod unix {
         down_ask: f64,
         last_btc_ts: u64,
         last_polymarket_ts: u64,
+        vol: VolEstimator,
     }
 
     impl LiveMarketState {
+        /// Record a fresh BTC price and update the volatility estimate using the
+        /// real elapsed time since the previous tick.
+        fn record_btc(&mut self, price: f64) {
+            let now = now_ms();
+            let dt_sec = if self.last_btc_ts == 0 {
+                1.0
+            } else {
+                (now.saturating_sub(self.last_btc_ts) as f64 / 1000.0).clamp(0.05, 30.0)
+            };
+            self.vol.update(price, dt_sec);
+            self.btc_price = price;
+            self.last_btc_ts = now;
+            self.started = true;
+        }
+
         fn new(cfg: &Config) -> Self {
             let market = (!cfg.polymarket_up_token_id.trim().is_empty()
                 && !cfg.polymarket_down_token_id.trim().is_empty())
@@ -903,12 +1026,19 @@ mod unix {
                 down_ask: 0.0,
                 last_btc_ts: 0,
                 last_polymarket_ts,
+                vol: VolEstimator::new(
+                    cfg.vol_seed_per_sqrt_sec,
+                    cfg.vol_halflife_sec,
+                    cfg.vol_min_per_sqrt_sec,
+                    cfg.vol_max_per_sqrt_sec,
+                ),
             }
         }
 
         fn frame(&self, cfg: &Config) -> Option<MarketFrame> {
             let market = self.market.as_ref()?;
-            if now_ms() / 1000 >= market.window_end_s {
+            let now = now_ms();
+            if now / 1000 >= market.window_end_s {
                 return None;
             }
             if self.last_btc_ts == 0
@@ -918,8 +1048,10 @@ mod unix {
             {
                 return None;
             }
+            let window_end_ms = market.window_end_s.saturating_mul(1000);
+            let tau_seconds = (window_end_ms.saturating_sub(now) as f64 / 1000.0).max(0.0);
             Some(MarketFrame {
-                ts_ms: now_ms(),
+                ts_ms: now,
                 market: market.slug.clone(),
                 condition_id: market.condition_id.clone(),
                 up_token_id: market.up_token_id.clone(),
@@ -928,6 +1060,8 @@ mod unix {
                 down_ask: self.down_ask,
                 btc_price: self.btc_price,
                 price_to_beat: market.price_to_beat,
+                tau_seconds,
+                vol_per_sqrt_sec: self.vol.current(),
                 source: if cfg.auto_discover_market {
                     "auto_gamma_polymarket_binance_ws".to_string()
                 } else {
@@ -1252,9 +1386,7 @@ mod unix {
         if let Some(price) = fetch_btc_rest_price(&cfg) {
             {
                 let mut state = state.lock().unwrap();
-                state.started = true;
-                state.btc_price = price;
-                state.last_btc_ts = now_ms();
+                state.record_btc(price);
             }
             let _ = push_live_frame(&cfg, &state, &sink, "btc rest seed");
             let _ = heartbeat(&cfg, "collector", format!("btc rest seed {price:.2}"));
@@ -1284,9 +1416,7 @@ mod unix {
             if let Some(price) = fetch_btc_rest_price(&cfg) {
                 {
                     let mut state = state.lock().unwrap();
-                    state.started = true;
-                    state.btc_price = price;
-                    state.last_btc_ts = now_ms();
+                    state.record_btc(price);
                 }
                 let _ = push_live_frame(&cfg, &state, &sink, "btc rest fallback");
                 let _ = heartbeat(&cfg, "collector", format!("btc rest fallback {price:.2}"));
@@ -1326,9 +1456,7 @@ mod unix {
                             last_event = Instant::now();
                             {
                                 let mut state = state.lock().unwrap();
-                                state.started = true;
-                                state.btc_price = price;
-                                state.last_btc_ts = now_ms();
+                                state.record_btc(price);
                             }
                             if let Err(err) = push_live_frame(cfg, state, sink, "live btc event") {
                                 let _ = heartbeat(

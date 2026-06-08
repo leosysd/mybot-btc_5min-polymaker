@@ -753,6 +753,21 @@ fn print_param_help() {
     println!("  STALE_AFTER_MS    行情过期阈值，超过则停止用旧行情报价");
     println!("  WS_STALE_AFTER_MS live WS断流阈值，超过则停止");
     println!("  DRY_RUN           1=模拟；0=实单，还必须设置 ENABLE_REAL_ORDERS 确认串");
+    println!();
+    println!("{}策略大脑 v3 参数{}", C_BOLD, C_RESET);
+    println!("  VOL_SEED_PER_SQRT_SEC  BTC波动率初值(σ_$/√秒)，未热身时用；之后自适应");
+    println!("  VOL_HALFLIFE_SEC       波动率EWMA半衰期，越小越灵敏");
+    println!("  WIDTH_FLOOR_USD        收盘前不确定性W的下限，防止gamma爆炸");
+    println!("  BASE_HALF_SPREAD       基础半价差(价格单位)");
+    println!("  MIN_LOCK_EDGE          双边成交锁利下限 up_bid+down_bid<=1-该值");
+    println!("  LATENCY_SEC            你的撤改单延迟，越大逆选择溢价越高");
+    println!("  K_ADVERSE              逆选择价差强度;ATM临近收盘会自动拉宽");
+    println!("  MIN/MAX_HALF_SPREAD    半价差上下限钳制");
+    println!("  ENDGAME_REDUCE_SECS    剩余秒数<该值只挂减仓单");
+    println!("  ENDGAME_PULL_SECS      剩余秒数<该值撤掉所有单(纯抛硬币区)");
+    println!("  INVENTORY_SKEW_TIME_BOOST 库存偏移随临近收盘加码倍数");
+    println!("  TOX_*                  逆选择监控:被割就自动加宽价差");
+    println!("  ENABLE_DELTA_HEDGE     0=关。对冲为占位骨架，实单模式禁止开启");
 }
 
 fn read_heartbeats(cfg: &Config) -> AppResult<Vec<Heartbeat>> {
@@ -904,6 +919,27 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "MARKET_INTERVAL_MS", "120")?;
     upsert_env_if_missing(path, "STALE_AFTER_MS", "800")?;
     upsert_env_if_missing(path, "WS_STALE_AFTER_MS", "10000")?;
+    // ── strategy brain v3 ──────────────────────────────────────────────
+    upsert_env_if_missing(path, "VOL_SEED_PER_SQRT_SEC", "6")?;
+    upsert_env_if_missing(path, "VOL_HALFLIFE_SEC", "20")?;
+    upsert_env_if_missing(path, "VOL_MIN_PER_SQRT_SEC", "1.5")?;
+    upsert_env_if_missing(path, "VOL_MAX_PER_SQRT_SEC", "60")?;
+    upsert_env_if_missing(path, "WIDTH_FLOOR_USD", "3")?;
+    upsert_env_if_missing(path, "BASE_HALF_SPREAD", "0.012")?;
+    upsert_env_if_missing(path, "MIN_LOCK_EDGE", "0.02")?;
+    upsert_env_if_missing(path, "LATENCY_SEC", "0.4")?;
+    upsert_env_if_missing(path, "K_ADVERSE", "1")?;
+    upsert_env_if_missing(path, "MIN_HALF_SPREAD", "0.005")?;
+    upsert_env_if_missing(path, "MAX_HALF_SPREAD", "0.25")?;
+    upsert_env_if_missing(path, "ENDGAME_REDUCE_SECS", "60")?;
+    upsert_env_if_missing(path, "ENDGAME_PULL_SECS", "12")?;
+    upsert_env_if_missing(path, "INVENTORY_SKEW_TIME_BOOST", "2")?;
+    upsert_env_if_missing(path, "TOX_HORIZON_MS", "2500")?;
+    upsert_env_if_missing(path, "TOX_DECAY", "0.5")?;
+    upsert_env_if_missing(path, "TOX_K_WIDEN", "1.5")?;
+    upsert_env_if_missing(path, "TOX_MAX_WIDEN", "0.08")?;
+    upsert_env_if_missing(path, "ENABLE_DELTA_HEDGE", "0")?;
+    upsert_env_if_missing(path, "HEDGE_VENUE", "binance_perp")?;
     Ok(())
 }
 
