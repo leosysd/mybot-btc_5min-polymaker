@@ -1248,14 +1248,15 @@ mod unix {
         url: &str,
     ) -> AppResult<()> {
         let (mut socket, _) = connect(url)?;
-        tune_ws_socket(&mut socket, Duration::from_millis(1_000))?;
+        let quiet_timeout = Duration::from_millis((cfg.stale_after_ms / 2).clamp(250, 2_000));
+        tune_ws_socket(&mut socket, quiet_timeout)?;
         heartbeat(cfg, "collector", format!("btc ws subscribed {url}"))?;
         let mut last_event = Instant::now();
         while !should_stop(cfg) {
             let msg = match socket.read() {
                 Ok(msg) => msg,
                 Err(err) if is_ws_timeout(&err) => {
-                    if last_event.elapsed() >= Duration::from_secs(2) {
+                    if last_event.elapsed() >= quiet_timeout {
                         return Err(format!("btc ws quiet for {:?}", last_event.elapsed()).into());
                     }
                     continue;
