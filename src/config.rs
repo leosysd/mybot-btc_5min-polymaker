@@ -8,10 +8,16 @@ pub struct Config {
     pub run_dir: PathBuf,
     pub market_slug: String,
     pub data_mode: String,
+    pub auto_discover_market: bool,
+    pub gamma_api_url: String,
+    pub market_window_secs: u64,
+    pub market_discovery_ms: u64,
+    pub market_switch_grace_ms: u64,
     pub polymarket_ws_url: String,
     pub polymarket_up_token_id: String,
     pub polymarket_down_token_id: String,
     pub binance_ws_url: String,
+    pub binance_rest_url: String,
     pub price_to_beat: f64,
     pub tick_size: f64,
     pub quote_size: f64,
@@ -57,6 +63,15 @@ impl Config {
             run_dir,
             market_slug: get(&file_env, "MARKET_SLUG", "btc-updown-5m"),
             data_mode: get(&file_env, "DATA_MODE", "sim"),
+            auto_discover_market: get_bool(&file_env, "AUTO_DISCOVER_MARKET", true),
+            gamma_api_url: get(
+                &file_env,
+                "POLYMARKET_GAMMA_API_URL",
+                "https://gamma-api.polymarket.com",
+            ),
+            market_window_secs: get_u64(&file_env, "MARKET_WINDOW_SECS", 300),
+            market_discovery_ms: get_u64(&file_env, "MARKET_DISCOVERY_MS", 15_000),
+            market_switch_grace_ms: get_u64(&file_env, "MARKET_SWITCH_GRACE_MS", 90_000),
             polymarket_ws_url: get(
                 &file_env,
                 "POLYMARKET_WS_URL",
@@ -69,6 +84,7 @@ impl Config {
                 "BINANCE_WS_URL",
                 "wss://stream.binance.com:9443/ws/btcusdt@trade",
             ),
+            binance_rest_url: get(&file_env, "BINANCE_REST_URL", "https://api.binance.com"),
             price_to_beat: get_f64(&file_env, "PRICE_TO_BEAT", 68_000.0),
             tick_size: get_f64(&file_env, "TICK_SIZE", 0.01),
             quote_size: get_f64(&file_env, "QUOTE_SIZE", 5.0),
@@ -122,6 +138,12 @@ impl Config {
         if !matches!(self.data_mode.as_str(), "sim" | "live") {
             return Err("DATA_MODE must be sim or live".into());
         }
+        if self.market_window_secs < 60 {
+            return Err("MARKET_WINDOW_SECS must be at least 60".into());
+        }
+        if self.market_discovery_ms < 1_000 {
+            return Err("MARKET_DISCOVERY_MS must be at least 1000".into());
+        }
         if self.price_to_beat <= 0.0 || !self.price_to_beat.is_finite() {
             return Err("PRICE_TO_BEAT must be positive".into());
         }
@@ -145,6 +167,9 @@ impl Config {
 
     pub fn ensure_live_market_config(&self) -> AppResult<()> {
         if self.data_mode != "live" {
+            return Ok(());
+        }
+        if self.auto_discover_market {
             return Ok(());
         }
         if self.polymarket_up_token_id.trim().is_empty()
@@ -177,7 +202,9 @@ impl Config {
         if self.data_mode != "live" {
             return Err("实单必须使用 DATA_MODE=live 真实行情".into());
         }
-        self.ensure_live_market_config()?;
+        if !self.auto_discover_market {
+            self.ensure_live_market_config()?;
+        }
         if self.poly_private_key.trim().is_empty() {
             return Err("实单需要 POLY_PRIVATE_KEY，且只能放在 VPS 的 .env 里".into());
         }

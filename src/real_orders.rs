@@ -23,8 +23,6 @@ struct RealOrderClientInner {
             polymarket_client_sdk_v2::auth::Normal,
         >,
     >,
-    up_token_id: U256,
-    down_token_id: U256,
 }
 
 #[derive(Debug, Clone)]
@@ -71,20 +69,14 @@ impl RealOrderClientInner {
         }
 
         let client = auth.authenticate().await?;
-        Ok(Self {
-            signer,
-            client,
-            up_token_id: U256::from_str(cfg.polymarket_up_token_id.trim())?,
-            down_token_id: U256::from_str(cfg.polymarket_down_token_id.trim())?,
-        })
+        Ok(Self { signer, client })
     }
 
     async fn place_buy_limit(&self, quote: &QuoteIntent) -> AppResult<RealOrderAck> {
-        let token_id = match quote.side.as_str() {
-            "Up" => self.up_token_id,
-            "Down" => self.down_token_id,
-            other => return Err(format!("unknown quote side for real order: {other}").into()),
-        };
+        if quote.token_id.trim().is_empty() {
+            return Err(format!("quote {} missing token_id", quote.quote_id).into());
+        }
+        let token_id = U256::from_str(quote.token_id.trim())?;
         let price = Decimal::from_str(&format!("{:.4}", quote.price))?;
         let size = Decimal::from_str(&format!("{:.2}", quote.size))?;
         let response = self

@@ -11,6 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct MarketFrame {
     pub ts_ms: u64,
     pub market: String,
+    #[serde(default)]
+    pub condition_id: String,
+    #[serde(default)]
+    pub up_token_id: String,
+    #[serde(default)]
+    pub down_token_id: String,
     pub up_ask: f64,
     pub down_ask: f64,
     pub btc_price: f64,
@@ -24,6 +30,8 @@ pub struct QuoteIntent {
     pub quote_id: String,
     pub ts_ms: u64,
     pub market: String,
+    #[serde(default)]
+    pub token_id: String,
     pub side: String,
     pub price: f64,
     pub size: f64,

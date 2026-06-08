@@ -11,6 +11,7 @@ use std::error::Error;
 pub type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 fn main() -> AppResult<()> {
+    install_tls_crypto_provider();
     let cfg = Config::from_env()?;
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {
@@ -47,6 +48,10 @@ fn main() -> AppResult<()> {
             std::process::exit(2);
         }
     }
+}
+
+fn install_tls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 fn parse_seconds(args: Vec<String>) -> AppResult<Option<u64>> {

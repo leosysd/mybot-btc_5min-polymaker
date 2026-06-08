@@ -2,7 +2,7 @@
 
 这是一个 **Rust 多进程 BTC 5 分钟二元市场做市机器人骨架**。
 
-当前版本是低延迟架构骨架，默认 **DRY_RUN 模拟模式**，不会真实下单。已经支持 `DATA_MODE=live` 读取真实 Polymarket market WebSocket + Binance BTC WebSocket 行情，也接入了官方 Rust CLOB SDK 的 post-only 买单/撤单路径。实单需要双重确认开关和小额限额。
+当前版本默认 **DRY_RUN 模拟模式**，不会真实下单。已经支持 `DATA_MODE=live` 自动发现当前 BTC 5 分钟 Polymarket Up/Down 市场、自动切换 CLOB token、读取真实盘口与 BTC 价格，也接入了官方 Rust CLOB SDK 的 post-only 买单/撤单路径。实单需要双重确认开关和小额限额。
 
 ## 架构
 
@@ -15,7 +15,7 @@ collector      -> quote-engine -> order-gateway -> risk-ledger
 
 各进程职责：
 
-- `collector`：采集行情。`DATA_MODE=sim` 用本地模拟数据；`DATA_MODE=live` 用 Polymarket market WS + Binance BTC WS。
+- `collector`：采集行情。`DATA_MODE=sim` 用本地模拟数据；`DATA_MODE=live` 自动发现当前 5 分钟市场，用 Polymarket market WS + BTC 价格源。
 - `quote-engine`：计算 fair value、Up/Down 双边报价、库存偏移。
 - `order-gateway`：下单热路径。DRY_RUN 时走模拟撮合；实单时走官方 Rust CLOB SDK，发 post-only BUY limit，并按状态机撤旧换新。
 - `risk-ledger`：记录成交、库存、两种结算情景下的 PnL，并把库存反馈给报价引擎；同时执行 kill switch。
@@ -325,17 +325,26 @@ DATA_MODE=sim
 行情来源：
 
 - `sim`：本地模拟行情，适合测试架构和风控。
-- `live`：连接真实 Polymarket market WebSocket 和 Binance BTC WebSocket。
+- `live`：自动发现当前 5 分钟 Polymarket 市场，连接真实 Polymarket market WebSocket 和 BTC 价格源。
 
-live 模式还需要填：
+live 模式默认自动发现，不需要手填当前市场 token：
 
 ```text
+AUTO_DISCOVER_MARKET=1
+POLYMARKET_GAMMA_API_URL=https://gamma-api.polymarket.com
+MARKET_WINDOW_SECS=300
+```
+
+`collector` 会按 `btc-updown-5m-{窗口开始unix秒}` 查询 Gamma API，解析当前市场的 `clobTokenIds`，并把 token id 放进每条 quote。开盘价优先取交易所窗口开始附近成交价；如果 Binance 主站不可用，会 fallback 到 Binance.US、Coinbase、Kraken 的 BTC/USD 最新价。注意 Polymarket 结算源仍是 Chainlink BTC/USD Data Stream，外部交易所价格只是模型输入和兜底。
+
+如果你一定要手动覆盖，才设置：
+
+```text
+AUTO_DISCOVER_MARKET=0
 POLYMARKET_UP_TOKEN_ID=
 POLYMARKET_DOWN_TOKEN_ID=
 PRICE_TO_BEAT=68000
 ```
-
-`POLYMARKET_UP_TOKEN_ID` / `POLYMARKET_DOWN_TOKEN_ID` 是当前 5 分钟市场的两个 CLOB token id。`PRICE_TO_BEAT` 是这个 5 分钟市场的判定价/开盘价，必须按当前市场问题填写。
 
 实单还需要填 Polymarket 账户信息。可以直接在 `polymaker menu` 的 `2. 切换模拟/实单 + 填 Polymarket 账户` 里输入，不需要手动翻 `.env`：
 
@@ -358,8 +367,8 @@ POLY_PASSPHRASE=
 菜单 2 的三个常用切换：
 
 - 本地模拟：`DATA_MODE=sim`、`DRY_RUN=1`，完全不下单。
-- 真实行情模拟：`DATA_MODE=live`、`DRY_RUN=1`，读取真实行情但不下单。
-- 实单模式：`DATA_MODE=live`、`DRY_RUN=0`、`ENABLE_REAL_ORDERS=I_UNDERSTAND_REAL_MONEY`，走 Polymarket CLOB SDK 下单。
+- 真实行情模拟：`DATA_MODE=live`、`AUTO_DISCOVER_MARKET=1`、`DRY_RUN=1`，自动切市场但不下单。
+- 实单模式：`DATA_MODE=live`、`AUTO_DISCOVER_MARKET=1`、`DRY_RUN=0`、`ENABLE_REAL_ORDERS=I_UNDERSTAND_REAL_MONEY`，自动切市场并走 Polymarket CLOB SDK 下单。
 
 ```text
 QUOTE_SIZE=5
@@ -461,11 +470,11 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 - 真实订单回报 user channel
 - 真实成交自动入账同步
-- 自动发现当前 5 分钟 BTC 市场 token id
 - Web dashboard 页面
 
 已经接入/优化：
 
+- 自动发现当前 5 分钟 BTC Up/Down 市场，并自动切换 CLOB token。
 - `DATA_MODE=live` 真实 Polymarket market WS + Binance BTC WS 行情。
 - 官方 Rust CLOB SDK post-only 下单/撤单。
 - DRY_RUN/实单共用撤单/改单状态机。
@@ -477,9 +486,9 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 优先顺序：
 
-1. 自动发现当前 5 分钟 BTC 市场，并自动填充 Up/Down token id 与 `PRICE_TO_BEAT`。
-2. 接 Polymarket user channel，拿真实订单成交/取消回报做自动入账。
-3. 把实单成交同步接入 `risk-ledger`，替换当前“pending + 撤单释放”的保守账本。
+1. 接 Polymarket user channel，拿真实订单成交/取消回报做自动入账。
+2. 把实单成交同步接入 `risk-ledger`，替换当前“pending + 撤单释放”的保守账本。
+3. 用 Chainlink Data Streams 或更贴近结算源的数据替换当前交易所 BTC 价格兜底。
 4. 做 Web dashboard 页面。
 5. 长时间小额验证后再考虑提高 `LIVE_ORDER_NOTIONAL_CAP`。
 

@@ -109,14 +109,20 @@ ensure_env_defaults() {
     return
   fi
 
-  if section_has_missing ENABLE_REAL_ORDERS DATA_MODE POLYMARKET_UP_TOKEN_ID POLYMARKET_DOWN_TOKEN_ID POLYMARKET_WS_URL BINANCE_WS_URL POLYMARKET_CLOB_HOST POLY_CHAIN_ID POLY_PRIVATE_KEY POLY_API_KEY POLY_SECRET POLY_PASSPHRASE POLY_SIGNATURE_TYPE POLY_FUNDER_ADDRESS PRICE_TO_BEAT; then
+  if section_has_missing ENABLE_REAL_ORDERS DATA_MODE AUTO_DISCOVER_MARKET POLYMARKET_GAMMA_API_URL MARKET_WINDOW_SECS MARKET_DISCOVERY_MS MARKET_SWITCH_GRACE_MS POLYMARKET_UP_TOKEN_ID POLYMARKET_DOWN_TOKEN_ID POLYMARKET_WS_URL BINANCE_WS_URL BINANCE_REST_URL POLYMARKET_CLOB_HOST POLY_CHAIN_ID POLY_PRIVATE_KEY POLY_API_KEY POLY_SECRET POLY_PASSPHRASE POLY_SIGNATURE_TYPE POLY_FUNDER_ADDRESS PRICE_TO_BEAT; then
     append_section_header "# ── 运行模式 / 真实行情 / 实单密钥（install.sh 自动补齐）──────────────"
     append_env_line ENABLE_REAL_ORDERS "# 默认模拟。实单必须同时设置 DRY_RUN=0 和 ENABLE_REAL_ORDERS=I_UNDERSTAND_REAL_MONEY。" "ENABLE_REAL_ORDERS="
     append_env_line DATA_MODE "# 行情来源：sim=本地模拟；live=Polymarket market WS + Binance BTC WS。" "DATA_MODE=sim"
-    append_env_line POLYMARKET_UP_TOKEN_ID "# DATA_MODE=live 时填写当前 5 分钟市场的 Up/Down CLOB token id。" "POLYMARKET_UP_TOKEN_ID="
+    append_env_line AUTO_DISCOVER_MARKET "# 自动发现当前 5 分钟 BTC Up/Down 市场。开启后不需要手填 token，每轮自动切换。" "AUTO_DISCOVER_MARKET=1"
+    append_env_line POLYMARKET_GAMMA_API_URL "" "POLYMARKET_GAMMA_API_URL=https://gamma-api.polymarket.com"
+    append_env_line MARKET_WINDOW_SECS "" "MARKET_WINDOW_SECS=300"
+    append_env_line MARKET_DISCOVERY_MS "" "MARKET_DISCOVERY_MS=2000"
+    append_env_line MARKET_SWITCH_GRACE_MS "" "MARKET_SWITCH_GRACE_MS=90000"
+    append_env_line POLYMARKET_UP_TOKEN_ID "# AUTO_DISCOVER_MARKET=0 时才手动填写当前 5 分钟市场的 Up/Down CLOB token id。" "POLYMARKET_UP_TOKEN_ID="
     append_env_line POLYMARKET_DOWN_TOKEN_ID "" "POLYMARKET_DOWN_TOKEN_ID="
     append_env_line POLYMARKET_WS_URL "" "POLYMARKET_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws/market"
     append_env_line BINANCE_WS_URL "" "BINANCE_WS_URL=wss://stream.binance.com:9443/ws/btcusdt@trade"
+    append_env_line BINANCE_REST_URL "" "BINANCE_REST_URL=https://api.binance.com"
     append_env_line POLYMARKET_CLOB_HOST "# 真实 CLOB 下单配置。不要把私钥提交到 GitHub。" "POLYMARKET_CLOB_HOST=https://clob-v2.polymarket.com"
     append_env_line POLY_CHAIN_ID "" "POLY_CHAIN_ID=137"
     append_env_line POLY_PRIVATE_KEY "" "POLY_PRIVATE_KEY="
@@ -125,7 +131,7 @@ ensure_env_defaults() {
     append_env_line POLY_PASSPHRASE "" "POLY_PASSPHRASE="
     append_env_line POLY_SIGNATURE_TYPE "# eoa / proxy / gnosis_safe / poly1271。多数 Polymarket 账户/代理钱包用 proxy。" "POLY_SIGNATURE_TYPE=proxy"
     append_env_line POLY_FUNDER_ADDRESS "" "POLY_FUNDER_ADDRESS="
-    append_env_line PRICE_TO_BEAT "# 当前 5 分钟 BTC 市场的判定价/开盘价。live 模式要按市场问题填写。" "PRICE_TO_BEAT=68000"
+    append_env_line PRICE_TO_BEAT "# AUTO_DISCOVER_MARKET=0 时手动填写判定价/开盘价；自动发现会用 Binance 开盘成交价兜底。" "PRICE_TO_BEAT=68000"
   fi
 
   if section_has_missing REQUOTE_THRESHOLD_TICKS; then

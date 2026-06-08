@@ -399,10 +399,7 @@ fn configure_trading_profile(cfg: &Config) -> AppResult<()> {
             "  {}4.{} 填 Polymarket 私钥 / 钱包地址 / L2 API",
             C_GREEN, C_RESET
         );
-        println!(
-            "  {}5.{} 填当前 5 分钟市场 token 和判定价",
-            C_GREEN, C_RESET
-        );
+        println!("  {}5.{} 手动覆盖当前市场 token 和判定价", C_GREEN, C_RESET);
         println!("  {}0.{} 返回上级菜单", C_GREEN, C_RESET);
         println!();
 
@@ -414,13 +411,11 @@ fn configure_trading_profile(cfg: &Config) -> AppResult<()> {
             }
             "2" => {
                 switch_to_live_dry_run(cfg)?;
-                configure_live_market(cfg)?;
                 maybe_restart_background(cfg)?;
                 return Ok(());
             }
             "3" => {
                 configure_real_account(cfg)?;
-                configure_live_market(cfg)?;
                 if let Err(err) = switch_to_real_mode(cfg) {
                     println!("{C_RED}未切到实单：{err}{C_RESET}");
                     println!("已保留当前模式。补齐后再选择 3 切到实单。");
@@ -451,6 +446,7 @@ fn print_env_profile(cfg: &Config) -> AppResult<()> {
     let path = cfg.env_file();
     let dry_run = env_value(&path, "DRY_RUN").unwrap_or_else(|| "1".to_string());
     let data_mode = env_value(&path, "DATA_MODE").unwrap_or_else(|| "sim".to_string());
+    let auto_discover = env_value(&path, "AUTO_DISCOVER_MARKET").unwrap_or_else(|| "1".to_string());
     let enable_real = env_value(&path, "ENABLE_REAL_ORDERS").unwrap_or_default();
     let real_ready = enable_real == REAL_ORDER_CONFIRMATION;
     let private_key = secret_state(&path, "POLY_PRIVATE_KEY");
@@ -508,8 +504,8 @@ fn print_env_profile(cfg: &Config) -> AppResult<()> {
         price
     );
     println!(
-        "{}提醒:{} 实单必须填当前 5 分钟市场 token；当前版本还不会自动每 5 分钟换市场。",
-        C_DIM, C_RESET
+        "{}自动发现:{} AUTO_DISCOVER_MARKET={}，开启后会按当前 5 分钟市场自动切 token。",
+        C_BOLD, C_RESET, auto_discover
     );
     Ok(())
 }
@@ -519,6 +515,7 @@ fn switch_to_sim_mode(cfg: &Config) -> AppResult<()> {
     upsert_env(&cfg.env_file(), "DRY_RUN", "1")?;
     upsert_env(&cfg.env_file(), "ENABLE_REAL_ORDERS", "")?;
     upsert_env(&cfg.env_file(), "DATA_MODE", "sim")?;
+    upsert_env(&cfg.env_file(), "AUTO_DISCOVER_MARKET", "1")?;
     println!("已切到本地模拟：sim 行情 + DRY_RUN，不会真实下单。");
     Ok(())
 }
@@ -528,6 +525,7 @@ fn switch_to_live_dry_run(cfg: &Config) -> AppResult<()> {
     upsert_env(&cfg.env_file(), "DRY_RUN", "1")?;
     upsert_env(&cfg.env_file(), "ENABLE_REAL_ORDERS", "")?;
     upsert_env(&cfg.env_file(), "DATA_MODE", "live")?;
+    upsert_env(&cfg.env_file(), "AUTO_DISCOVER_MARKET", "1")?;
     println!("已切到真实行情模拟：live 行情 + DRY_RUN，不会真实下单。");
     Ok(())
 }
@@ -543,6 +541,7 @@ fn switch_to_real_mode(cfg: &Config) -> AppResult<()> {
         REAL_ORDER_CONFIRMATION,
     )?;
     upsert_env(&cfg.env_file(), "DATA_MODE", "live")?;
+    upsert_env(&cfg.env_file(), "AUTO_DISCOVER_MARKET", "1")?;
     println!("已切到实单模式：live 行情 + Polymarket 真下单。");
     println!("请确认 `LIVE_ORDER_NOTIONAL_CAP`、`MAX_LOSS`、`MAX_TOTAL_INVENTORY` 仍是小额。");
     Ok(())
@@ -551,14 +550,22 @@ fn switch_to_real_mode(cfg: &Config) -> AppResult<()> {
 fn ensure_real_inputs_present(cfg: &Config) -> AppResult<()> {
     let path = cfg.env_file();
     let mut missing = Vec::new();
-    for (key, label) in [
-        ("POLY_PRIVATE_KEY", "私钥"),
-        ("POLYMARKET_UP_TOKEN_ID", "Up token id"),
-        ("POLYMARKET_DOWN_TOKEN_ID", "Down token id"),
-        ("PRICE_TO_BEAT", "BTC 判定价/开盘价"),
-    ] {
+    for (key, label) in [("POLY_PRIVATE_KEY", "私钥")] {
         if env_value(&path, key).is_none_or(|v| v.trim().is_empty()) {
             missing.push(format!("{key}({label})"));
+        }
+    }
+    let auto_discover =
+        env_value(&path, "AUTO_DISCOVER_MARKET").unwrap_or_else(|| "1".to_string()) != "0";
+    if !auto_discover {
+        for (key, label) in [
+            ("POLYMARKET_UP_TOKEN_ID", "Up token id"),
+            ("POLYMARKET_DOWN_TOKEN_ID", "Down token id"),
+            ("PRICE_TO_BEAT", "BTC 判定价/开盘价"),
+        ] {
+            if env_value(&path, key).is_none_or(|v| v.trim().is_empty()) {
+                missing.push(format!("{key}({label})"));
+            }
         }
     }
 
@@ -636,7 +643,12 @@ fn configure_real_account(cfg: &Config) -> AppResult<()> {
 
 fn configure_live_market(cfg: &Config) -> AppResult<()> {
     ensure_cli_defaults(&cfg.env_file())?;
-    println!("直接回车表示保留原值。当前版本需要手动填当前 5 分钟市场。");
+    println!("直接回车表示保留原值。通常保持 AUTO_DISCOVER_MARKET=1，不需要手填。");
+    let auto = prompt(&format!(
+        "AUTO_DISCOVER_MARKET 当前={}  1=自动发现，0=手动覆盖",
+        public_state(&cfg.env_file(), "AUTO_DISCOVER_MARKET")
+    ))?;
+    apply_optional_env(&cfg.env_file(), "AUTO_DISCOVER_MARKET", &auto)?;
     let up = prompt(&format!(
         "POLYMARKET_UP_TOKEN_ID 当前={}  当前市场 Up CLOB token id",
         public_state(&cfg.env_file(), "POLYMARKET_UP_TOKEN_ID")
@@ -718,8 +730,9 @@ fn run_smoke_test() -> AppResult<()> {
 fn print_param_help() {
     println!("{}核心参数说明{}", C_BOLD, C_RESET);
     println!("  DATA_MODE         sim=本地模拟；live=真实Polymarket/BTC WS行情");
-    println!("  POLYMARKET_*      live模式当前市场Up/Down token id");
-    println!("  PRICE_TO_BEAT     当前5分钟BTC市场判定价/开盘价");
+    println!("  AUTO_DISCOVER_*   1=自动发现当前5分钟市场并自动切换token");
+    println!("  POLYMARKET_*      手动覆盖时的当前市场Up/Down token id");
+    println!("  PRICE_TO_BEAT     手动覆盖时的判定价；自动模式会用开盘价/最新价兜底");
     println!("  QUOTE_SIZE        每次单边报价份数");
     println!("  QUOTE_SPREAD      毛价差，约束 up_bid + down_bid <= 1 - spread");
     println!("  QUOTE_TTL_MS      未成交报价 pending 保留多久，过期释放库存占用");
@@ -828,6 +841,15 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "BOT_RUN_DIR", "run")?;
     upsert_env_if_missing(path, "MARKET_SLUG", "btc-updown-5m")?;
     upsert_env_if_missing(path, "DATA_MODE", "sim")?;
+    upsert_env_if_missing(path, "AUTO_DISCOVER_MARKET", "1")?;
+    upsert_env_if_missing(
+        path,
+        "POLYMARKET_GAMMA_API_URL",
+        "https://gamma-api.polymarket.com",
+    )?;
+    upsert_env_if_missing(path, "MARKET_WINDOW_SECS", "300")?;
+    upsert_env_if_missing(path, "MARKET_DISCOVERY_MS", "2000")?;
+    upsert_env_if_missing(path, "MARKET_SWITCH_GRACE_MS", "90000")?;
     upsert_env_if_blank(
         path,
         "POLYMARKET_WS_URL",
@@ -838,6 +860,7 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
         "BINANCE_WS_URL",
         "wss://stream.binance.com:9443/ws/btcusdt@trade",
     )?;
+    upsert_env_if_blank(path, "BINANCE_REST_URL", "https://api.binance.com")?;
     upsert_env_if_missing(path, "POLYMARKET_UP_TOKEN_ID", "")?;
     upsert_env_if_missing(path, "POLYMARKET_DOWN_TOKEN_ID", "")?;
     upsert_env_if_blank(
