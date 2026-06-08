@@ -1074,6 +1074,55 @@ mod unix {
         }
     }
 
+    /// Fail-closed send for trade-state messages that MUST be recorded (e.g.
+    /// OrderAccepted: the order is already live on the exchange, so risk has to
+    /// know about it). Unlike `send_msg`, this NEVER silently drops — it retries
+    /// hard and returns Err if it genuinely can't deliver, so the caller can take
+    /// corrective action (cancel the live order) instead of leaving it
+    /// unaccounted by the risk ledger / kill switch.
+    fn send_msg_required(sock: &UnixDatagram, path: &Path, msg: &WireMessage) -> AppResult<()> {
+        let bytes = serde_json::to_vec(msg)?;
+        let mut waited_ms: u64 = 0;
+        let max_wait_ms: u64 = 3_000;
+        let mut gone_attempts = 0u32;
+        loop {
+            match sock.send_to(&bytes, path) {
+                Ok(_) => return Ok(()),
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    if waited_ms >= max_wait_ms {
+                        return Err(format!(
+                            "risk socket {} congested >{}ms; undeliverable",
+                            path.display(),
+                            max_wait_ms
+                        )
+                        .into());
+                    }
+                    sleep_ms(5);
+                    waited_ms += 5;
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    if gone_attempts < 10 {
+                        gone_attempts += 1;
+                        sleep_ms(20);
+                        continue;
+                    }
+                    return Err(format!(
+                        "risk peer {} gone ({:?}); undeliverable",
+                        path.display(),
+                        err.kind()
+                    )
+                    .into());
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
     fn recv_msg(sock: &UnixDatagram, buf: &mut [u8]) -> AppResult<Option<WireMessage>> {
         match sock.recv(buf) {
             Ok(n) => Ok(Some(serde_json::from_slice(&buf[..n])?)),
@@ -2057,7 +2106,12 @@ mod unix {
         };
         resting.insert(quote.side.clone(), order);
         persist_active_orders_if_real(cfg, real_orders, resting)?;
-        if let Err(err) = send_msg(
+        // FAIL-CLOSED: the order is LIVE on the exchange now. risk MUST record it
+        // (for pending inventory + kill switch). Use the reliable sender; if risk
+        // genuinely can't be reached, CANCEL the live order rather than leave it
+        // unaccounted, and report "not placed". Never silently leave a live order
+        // that risk doesn't know about.
+        if let Err(err) = send_msg_required(
             sock,
             &cfg.risk_socket(),
             &WireMessage::OrderAccepted(accepted),
@@ -2065,7 +2119,7 @@ mod unix {
             let _ = heartbeat(
                 cfg,
                 "order-gateway",
-                format!("risk accept ipc failed: {err}"),
+                format!("risk did not ack order; cancelling to stay fail-closed: {err}"),
             );
             let _ = cancel_resting_side(
                 cfg,
@@ -2074,9 +2128,9 @@ mod unix {
                 order_map,
                 resting,
                 &quote.side,
-                "risk_ipc_failed",
+                "risk_unacked",
             );
-            return Err(err);
+            return Ok(false);
         }
         Ok(true)
     }
@@ -2358,8 +2412,14 @@ mod unix {
         order_map: SharedOrderMap,
         filled: SharedFilled,
     ) {
+        // Trade dedup MUST persist across reconnects: when the user WS drops and
+        // reconnects, the exchange can replay recent (partial) fills. A per-
+        // connection set would forget them and double-book. Keep it here.
+        let mut seen_trades: HashSet<String> = HashSet::new();
         while !should_stop(&cfg) {
-            if let Err(err) = user_channel_once(&cfg, &credentials, &order_map, &filled) {
+            if let Err(err) =
+                user_channel_once(&cfg, &credentials, &order_map, &filled, &mut seen_trades)
+            {
                 let _ = heartbeat(&cfg, "order-gateway", format!("user ws reconnect: {err}"));
                 sleep_ms(1_000);
             }
@@ -2371,6 +2431,7 @@ mod unix {
         credentials: &UserWsCredentials,
         order_map: &SharedOrderMap,
         filled: &SharedFilled,
+        seen_trades: &mut HashSet<String>,
     ) -> AppResult<()> {
         let sock = UnixDatagram::unbound()?;
         let (mut socket, _) = connect(cfg.polymarket_user_ws_url.as_str())?;
@@ -2393,7 +2454,11 @@ mod unix {
         socket.send(Message::Text(sub.to_string()))?;
         heartbeat(cfg, "order-gateway", "user ws subscribed")?;
 
-        let mut seen_trades = HashSet::new();
+        // Bound memory: trade ids accumulate forever otherwise. Replays only
+        // concern RECENT trades, so dropping very old ids is safe.
+        if seen_trades.len() > 100_000 {
+            seen_trades.clear();
+        }
         let mut subscribed = known_condition_ids(order_map)
             .into_iter()
             .collect::<HashSet<_>>();
@@ -2438,7 +2503,7 @@ mod unix {
                             &sock,
                             order_map,
                             filled,
-                            &mut seen_trades,
+                            seen_trades,
                             &value,
                         )?;
                     }
