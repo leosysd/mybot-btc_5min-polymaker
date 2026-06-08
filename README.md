@@ -39,6 +39,8 @@ JSONL 文件只做审计日志，不做热路径通信。
 curl -fsSL https://raw.githubusercontent.com/leosysd/mybot-btc_5min-polymaker/main/install.sh | bash
 ```
 
+如果 `/opt/polymaker/.env` 已经存在，一键安装不会覆盖你的配置；它只会追加缺失的新字段，并生成类似 `.env.bak.20260608123000` 的备份。私钥、API key 仍然只在 VPS 的 `.env` 里手动填写，不要提交到 GitHub。
+
 安装完成后进入目录：
 
 ```bash
