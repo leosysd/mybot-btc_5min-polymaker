@@ -1207,6 +1207,8 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "RECONCILE_INTERVAL_MS", "30000")?;
     upsert_env_if_missing(path, "ENABLE_PREWARM", "1")?;
     upsert_env_if_missing(path, "PREWARM_INTERVAL_MS", "60000")?;
+    upsert_env_if_missing(path, "POST_ONLY_MARGIN_TICKS", "2")?;
+    upsert_env_if_missing(path, "REJECT_BACKOFF_MS", "500")?;
     Ok(())
 }
 

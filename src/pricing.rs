@@ -210,19 +210,23 @@ pub fn market_maker_bids(p: &MmParams) -> ModelQuote {
     ModelQuote { up_bid, down_bid }
 }
 
-/// Post-only buy: never cross the spread. Floors to tick and stays strictly
-/// below best ask. Returns None if there is no valid passive price.
+/// Post-only buy: never cross the spread. Sits at least `margin_ticks` below
+/// the best ask so a small ask move between quoting and order arrival doesn't
+/// turn it into a crossing (rejected) order. Floors to tick. Returns None if
+/// there is no valid passive price.
 pub fn post_only_bid(
     model_bid: f64,
     best_ask: f64,
     tick_size: f64,
     min_bid: f64,
     max_bid: f64,
+    margin_ticks: f64,
 ) -> Option<f64> {
     if !model_bid.is_finite() || !best_ask.is_finite() || best_ask <= tick_size {
         return None;
     }
-    let post_only_cap = best_ask - tick_size;
+    let margin = margin_ticks.max(1.0);
+    let post_only_cap = best_ask - margin * tick_size;
     let raw = model_bid.min(post_only_cap).min(max_bid).clamp(0.01, 0.99);
     let px = floor_to_tick(raw, tick_size);
     if px + 1e-12 < min_bid || px >= best_ask - 1e-12 {
@@ -483,9 +487,12 @@ mod tests {
 
     #[test]
     fn post_only_bid_stays_below_ask() {
-        let px = post_only_bid(0.55, 0.53, 0.01, 0.05, 0.62).unwrap();
-        assert!((px - 0.52).abs() < 1e-9);
-        assert!(px < 0.53);
+        // margin 1 tick -> 0.52; margin 3 ticks -> 0.50; both strictly below ask.
+        let px1 = post_only_bid(0.55, 0.53, 0.01, 0.05, 0.62, 1.0).unwrap();
+        assert!((px1 - 0.52).abs() < 1e-9);
+        let px3 = post_only_bid(0.55, 0.53, 0.01, 0.05, 0.62, 3.0).unwrap();
+        assert!((px3 - 0.50).abs() < 1e-9);
+        assert!(px3 < px1 && px3 < 0.53);
     }
 
     #[test]

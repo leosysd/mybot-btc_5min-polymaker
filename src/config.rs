@@ -62,6 +62,8 @@ pub struct Config {
     pub reconcile_interval_ms: u64,
     pub enable_prewarm: bool,
     pub prewarm_interval_ms: u64,
+    pub post_only_margin_ticks: f64,
+    pub reject_backoff_ms: u64,
     pub enable_real_orders: String,
     pub polymarket_clob_host: String,
     pub poly_private_key: String,
@@ -157,6 +159,8 @@ impl Config {
             reconcile_interval_ms: get_u64(&file_env, "RECONCILE_INTERVAL_MS", 30_000),
             enable_prewarm: get_bool(&file_env, "ENABLE_PREWARM", true),
             prewarm_interval_ms: get_u64(&file_env, "PREWARM_INTERVAL_MS", 60_000),
+            post_only_margin_ticks: get_f64(&file_env, "POST_ONLY_MARGIN_TICKS", 2.0),
+            reject_backoff_ms: get_u64(&file_env, "REJECT_BACKOFF_MS", 500),
             enable_real_orders: get(&file_env, "ENABLE_REAL_ORDERS", ""),
             polymarket_clob_host: get(
                 &file_env,
