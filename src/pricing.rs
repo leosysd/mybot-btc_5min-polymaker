@@ -210,6 +210,38 @@ pub fn market_maker_bids(p: &MmParams) -> ModelQuote {
     ModelQuote { up_bid, down_bid }
 }
 
+/// Cost-basis lock: the per-quote `enforce_binary_edge` only bounds the two
+/// *simultaneous* quotes. It can't stop "legging in" — filling Up and Down at
+/// different times when each was the expensive side, so the *accumulated* avg
+/// pair cost exceeds 1 and locks a guaranteed loss.
+///
+/// This caps the bid for `side` by what we've ALREADY paid for the opposite
+/// side: if we hold the other side at average cost `C`, completing a pair must
+/// keep `bid + C <= 1 - min_lock_edge`. So `bid <= 1 - min_lock_edge - C`.
+/// Returns the (possibly lowered) bid; the caller's post-only/min-bid checks
+/// then suppress the quote entirely if it falls below the floor.
+#[allow(clippy::too_many_arguments)]
+pub fn lock_capped_bid(
+    side_is_up: bool,
+    bid: f64,
+    up_shares: f64,
+    up_cost: f64,
+    down_shares: f64,
+    down_cost: f64,
+    min_lock_edge: f64,
+) -> f64 {
+    let budget = (1.0 - min_lock_edge).clamp(0.02, 0.999);
+    let opposite_avg = if side_is_up {
+        (down_shares > 0.0).then(|| down_cost / down_shares)
+    } else {
+        (up_shares > 0.0).then(|| up_cost / up_shares)
+    };
+    match opposite_avg {
+        Some(avg) => bid.min((budget - avg).max(0.0)),
+        None => bid, // flat on the opposite side -> no pair to complete, no cap
+    }
+}
+
 /// Post-only buy: never cross the spread. Sits at least `margin_ticks` below
 /// the best ask so a small ask move between quoting and order arrival doesn't
 /// turn it into a crossing (rejected) order. Floors to tick. Returns None if
@@ -483,6 +515,21 @@ mod tests {
         let long_up = mk(10.0, 0.0);
         assert!(long_up.up_bid < neutral.up_bid);
         assert!(long_up.down_bid > neutral.down_bid);
+    }
+
+    #[test]
+    fn lock_cap_blocks_losing_pair_completion() {
+        // Already hold Down at avg 0.54. With lock 0.02 the Up bid must not
+        // exceed 1 - 0.02 - 0.54 = 0.44, so a 0.52 Up bid gets capped to 0.44
+        // (which the caller's min_bid check then likely suppresses).
+        let capped = lock_capped_bid(true, 0.52, 0.0, 0.0, 25.0, 25.0 * 0.54, 0.02);
+        assert!((capped - 0.44).abs() < 1e-9, "got {capped}");
+        // Flat on the opposite side -> no cap.
+        let free = lock_capped_bid(true, 0.52, 0.0, 0.0, 0.0, 0.0, 0.02);
+        assert!((free - 0.52).abs() < 1e-9);
+        // Cheap existing side leaves room to complete profitably.
+        let ok = lock_capped_bid(false, 0.40, 25.0, 25.0 * 0.45, 0.0, 0.0, 0.02);
+        assert!((ok - 0.40).abs() < 1e-9, "0.45+0.40=0.85<0.98, no cap; got {ok}");
     }
 
     #[test]
