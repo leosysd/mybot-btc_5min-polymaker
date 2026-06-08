@@ -6,9 +6,9 @@ mod unix {
         OrderAccepted, OrderCancelled, QuoteIntent, WireMessage,
     };
     use crate::pricing::{
-        digital_p_up, half_spread, market_maker_bids, phase_for, post_only_bid, price_sensitivity,
-        side_allowed, time_boosted_skew, uncertainty_width, MmParams, Phase, SpreadInputs,
-        ToxicityMonitor, VolEstimator,
+        digital_p_up, half_spread, lock_capped_bid, market_maker_bids, phase_for, post_only_bid,
+        price_sensitivity, side_allowed, time_boosted_skew, uncertainty_width, MmParams, Phase,
+        SpreadInputs, ToxicityMonitor, VolEstimator,
     };
     use crate::real_orders::{PositionReconciler, PositionSnapshot, RealOrderClient, UserWsCredentials};
     use crate::AppResult;
@@ -808,11 +808,34 @@ mod unix {
             min_lock_edge: cfg.min_lock_edge,
         });
 
+        // ── 4b. Cost-basis lock: cap the side that would COMPLETE a pair so the
+        // realized avg pair cost can't exceed the lock budget (prevents legging
+        // into a guaranteed-loss Up+Down pair when each side filled at a
+        // different time). Uses filled cost basis, not pending.
+        let up_capped = lock_capped_bid(
+            true,
+            model.up_bid,
+            inventory.up_shares,
+            inventory.up_cost,
+            inventory.down_shares,
+            inventory.down_cost,
+            cfg.min_lock_edge,
+        );
+        let down_capped = lock_capped_bid(
+            false,
+            model.down_bid,
+            inventory.up_shares,
+            inventory.up_cost,
+            inventory.down_shares,
+            inventory.down_cost,
+            cfg.min_lock_edge,
+        );
+
         // ── 5. Endgame protocol: which sides may be quoted at all right now.
         let phase = phase_for(tau, cfg.endgame_reduce_secs, cfg.endgame_pull_secs);
         let up_px = if side_allowed(true, phase, up_eff, down_eff) {
             post_only_bid(
-                model.up_bid,
+                up_capped,
                 frame.up_ask,
                 cfg.tick_size,
                 cfg.min_bid,
@@ -824,7 +847,7 @@ mod unix {
         };
         let down_px = if side_allowed(false, phase, up_eff, down_eff) {
             post_only_bid(
-                model.down_bid,
+                down_capped,
                 frame.down_ask,
                 cfg.tick_size,
                 cfg.min_bid,
