@@ -89,7 +89,7 @@ impl RealOrderClientInner {
             return Err(format!("quote {} missing token_id", quote.quote_id).into());
         }
         let token_id = U256::from_str(quote.token_id.trim())?;
-        let price = Decimal::from_str(&format!("{:.4}", quote.price))?;
+        let price = Decimal::from_str(&format!("{:.2}", quote.price))?;
         let size = Decimal::from_str(&format!("{:.2}", quote.size))?;
         let response = self
             .client
