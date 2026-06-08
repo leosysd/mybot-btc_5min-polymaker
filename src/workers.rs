@@ -1839,7 +1839,16 @@ mod unix {
             quote.size = quote.size.min(capped_size);
         }
         let exchange_order_id = if let Some(real_orders) = real_orders {
-            let ack = real_orders.place_buy_limit(&quote)?;
+            // None = exchange rejected this quote (e.g. post-only crosses book).
+            // Skip it WITHOUT resting/accounting and keep the gateway running.
+            let Some(ack) = real_orders.place_buy_limit(&quote)? else {
+                heartbeat(
+                    cfg,
+                    "order-gateway",
+                    format!("order rejected, skipped {} @ {:.2}", quote.side, quote.price),
+                )?;
+                return Ok(false);
+            };
             heartbeat(
                 cfg,
                 "order-gateway",

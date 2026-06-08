@@ -148,7 +148,7 @@ impl RealOrderClient {
         Ok(Self { runtime, inner })
     }
 
-    pub fn place_buy_limit(&self, quote: &QuoteIntent) -> AppResult<RealOrderAck> {
+    pub fn place_buy_limit(&self, quote: &QuoteIntent) -> AppResult<Option<RealOrderAck>> {
         self.runtime.block_on(self.inner.place_buy_limit(quote))
     }
 
@@ -210,7 +210,11 @@ impl RealOrderClientInner {
         Ok(Self { signer, client })
     }
 
-    async fn place_buy_limit(&self, quote: &QuoteIntent) -> AppResult<RealOrderAck> {
+    /// Returns `Ok(None)` when the exchange rejects the order (e.g. post-only
+    /// "crosses book", insufficient balance) — that's a normal, expected event
+    /// in fast markets and must NOT crash the gateway. Only structural failures
+    /// (bad token id, build/sign) return `Err`.
+    async fn place_buy_limit(&self, quote: &QuoteIntent) -> AppResult<Option<RealOrderAck>> {
         if quote.token_id.trim().is_empty() {
             return Err(format!("quote {} missing token_id", quote.quote_id).into());
         }
@@ -239,29 +243,39 @@ impl RealOrderClientInner {
         let sign_ms = tsg.elapsed().as_millis();
 
         let tp = Instant::now();
-        let response = self.client.post_order(signed).await?;
+        let post_result = self.client.post_order(signed).await;
         let post_ms = tp.elapsed().as_millis();
         let total_ms = build_ms + sign_ms + post_ms;
         eprintln!("[ORDER_LAT] build={build_ms}ms sign={sign_ms}ms post={post_ms}ms 总={total_ms}ms");
 
+        // A failed POST (HTTP 4xx like "post-only crosses book", balance, etc.)
+        // means this quote couldn't rest — skip it, keep the gateway alive.
+        let response = match post_result {
+            Ok(resp) => resp,
+            Err(err) => {
+                eprintln!("[ORDER_REJECT] {} post failed (post={post_ms}ms): {err}", quote.side);
+                return Ok(None);
+            }
+        };
         if !response.success {
-            return Err(format!(
-                "Polymarket order rejected: {}",
+            eprintln!(
+                "[ORDER_REJECT] {} rejected: {}",
+                quote.side,
                 response
                     .error_msg
                     .unwrap_or_else(|| "unknown error".to_string())
-            )
-            .into());
+            );
+            return Ok(None);
         }
 
-        Ok(RealOrderAck {
+        Ok(Some(RealOrderAck {
             order_id: response.order_id,
             status: format!("{:?}", response.status),
             build_ms,
             sign_ms,
             post_ms,
             total_ms,
-        })
+        }))
     }
 
     async fn cancel_order(&self, order_id: &str) -> AppResult<CancelOrderAck> {
