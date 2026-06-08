@@ -363,7 +363,7 @@ POLY_SECRET=
 POLY_PASSPHRASE=
 ```
 
-不填 L2 凭证时，SDK 会用私钥创建或派生 API key 来下单；但 Polymarket user WS 需要 `.env` 里有 `POLY_API_KEY`、`POLY_SECRET`、`POLY_PASSPHRASE` 才能订阅真实订单回报。不要把 `.env` 或私钥提交到 GitHub。
+不填 L2 凭证时，SDK 会用私钥创建或派生 API key。实单进程会复用这组已认证凭证连接 Polymarket user WS，所以真实成交/取消回报不要求你额外手填 L2。不要把 `.env` 或私钥提交到 GitHub。
 
 菜单 2 的三个常用切换：
 

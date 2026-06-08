@@ -8,6 +8,7 @@ use polymarket_client_sdk_v2::clob::types::{Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 use polymarket_client_sdk_v2::POLYGON;
+use secrecy::ExposeSecret;
 use std::str::FromStr;
 use tokio::runtime::Runtime;
 
@@ -31,6 +32,13 @@ pub struct RealOrderAck {
     pub status: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct UserWsCredentials {
+    pub api_key: String,
+    pub secret: String,
+    pub passphrase: String,
+}
+
 impl RealOrderClient {
     pub fn connect(cfg: &Config) -> AppResult<Self> {
         cfg.ensure_real_order_config()?;
@@ -45,6 +53,10 @@ impl RealOrderClient {
 
     pub fn cancel_order(&self, order_id: &str) -> AppResult<()> {
         self.runtime.block_on(self.inner.cancel_order(order_id))
+    }
+
+    pub fn user_ws_credentials(&self) -> UserWsCredentials {
+        self.inner.user_ws_credentials()
     }
 }
 
@@ -116,6 +128,15 @@ impl RealOrderClientInner {
             return Err(format!("Polymarket cancel rejected for {order_id}").into());
         }
         Ok(())
+    }
+
+    fn user_ws_credentials(&self) -> UserWsCredentials {
+        let credentials = self.client.credentials();
+        UserWsCredentials {
+            api_key: credentials.key().to_string(),
+            secret: credentials.secret().expose_secret().to_string(),
+            passphrase: credentials.passphrase().expose_secret().to_string(),
+        }
     }
 }
 

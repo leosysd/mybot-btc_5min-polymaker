@@ -6,7 +6,7 @@ mod unix {
         OrderAccepted, OrderCancelled, QuoteIntent, WireMessage,
     };
     use crate::pricing::{market_maker_bids, normal_cdf, post_only_bid};
-    use crate::real_orders::RealOrderClient;
+    use crate::real_orders::{RealOrderClient, UserWsCredentials};
     use crate::AppResult;
     use serde::Serialize;
     use serde_json::Value;
@@ -259,8 +259,12 @@ mod unix {
         } else {
             None
         };
-        if real_orders.is_some() {
-            start_user_channel(&cfg, Arc::clone(&order_map))?;
+        if let Some(real_orders) = &real_orders {
+            start_user_channel(
+                &cfg,
+                real_orders.user_ws_credentials(),
+                Arc::clone(&order_map),
+            )?;
         }
 
         while !should_stop(&cfg) {
@@ -1575,37 +1579,30 @@ mod unix {
         )
     }
 
-    fn start_user_channel(cfg: &Config, order_map: SharedOrderMap) -> AppResult<()> {
-        if !has_user_channel_credentials(cfg) {
-            heartbeat(
-                cfg,
-                "order-gateway",
-                "user ws disabled: missing POLY_API_KEY/POLY_SECRET/POLY_PASSPHRASE",
-            )?;
-            return Ok(());
-        }
-
+    fn start_user_channel(
+        cfg: &Config,
+        credentials: UserWsCredentials,
+        order_map: SharedOrderMap,
+    ) -> AppResult<()> {
         let cfg = cfg.clone();
-        thread::spawn(move || user_channel_loop(cfg, order_map));
+        thread::spawn(move || user_channel_loop(cfg, credentials, order_map));
         Ok(())
     }
 
-    fn has_user_channel_credentials(cfg: &Config) -> bool {
-        !cfg.poly_api_key.trim().is_empty()
-            && !cfg.poly_secret.trim().is_empty()
-            && !cfg.poly_passphrase.trim().is_empty()
-    }
-
-    fn user_channel_loop(cfg: Config, order_map: SharedOrderMap) {
+    fn user_channel_loop(cfg: Config, credentials: UserWsCredentials, order_map: SharedOrderMap) {
         while !should_stop(&cfg) {
-            if let Err(err) = user_channel_once(&cfg, &order_map) {
+            if let Err(err) = user_channel_once(&cfg, &credentials, &order_map) {
                 let _ = heartbeat(&cfg, "order-gateway", format!("user ws reconnect: {err}"));
                 sleep_ms(1_000);
             }
         }
     }
 
-    fn user_channel_once(cfg: &Config, order_map: &SharedOrderMap) -> AppResult<()> {
+    fn user_channel_once(
+        cfg: &Config,
+        credentials: &UserWsCredentials,
+        order_map: &SharedOrderMap,
+    ) -> AppResult<()> {
         let sock = UnixDatagram::unbound()?;
         let (mut socket, _) = connect(cfg.polymarket_user_ws_url.as_str())?;
         tune_ws_socket(&mut socket, Duration::from_millis(250))?;
@@ -1613,9 +1610,9 @@ mod unix {
         let markets = known_condition_ids(order_map);
         let mut sub = serde_json::json!({
             "auth": {
-                "apiKey": cfg.poly_api_key.trim(),
-                "secret": cfg.poly_secret.trim(),
-                "passphrase": cfg.poly_passphrase.trim(),
+                "apiKey": credentials.api_key.as_str(),
+                "secret": credentials.secret.as_str(),
+                "passphrase": credentials.passphrase.as_str(),
             },
             "type": "user"
         });

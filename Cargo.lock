@@ -2795,6 +2795,7 @@ dependencies = [
  "alloy",
  "polymarket_client_sdk_v2",
  "rustls",
+ "secrecy",
  "serde",
  "serde_json",
  "tokio",
