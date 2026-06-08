@@ -808,28 +808,40 @@ mod unix {
             min_lock_edge: cfg.min_lock_edge,
         });
 
-        // ── 4b. Cost-basis lock: cap the side that would COMPLETE a pair so the
-        // realized avg pair cost can't exceed the lock budget (prevents legging
-        // into a guaranteed-loss Up+Down pair when each side filled at a
-        // different time). Uses filled cost basis, not pending.
-        let up_capped = lock_capped_bid(
-            true,
-            model.up_bid,
-            inventory.up_shares,
-            inventory.up_cost,
-            inventory.down_shares,
-            inventory.down_cost,
-            cfg.min_lock_edge,
-        );
-        let down_capped = lock_capped_bid(
-            false,
-            model.down_bid,
-            inventory.up_shares,
-            inventory.up_cost,
-            inventory.down_shares,
-            inventory.down_cost,
-            cfg.min_lock_edge,
-        );
+        // ── 4b. Asymmetric cost-basis lock: only cap the LOW-probability side,
+        // so we never pile the underdog into a balanced losing pair, while the
+        // HIGH-probability (favorite) side loads freely — directional
+        // favorite-weighting is the edge, and the combined avg is allowed to
+        // exceed 1 as long as the favorite is the larger position.
+        // Caveat: within a window the favorite can flip, so this can't fully
+        // prevent legging; it only stops piling the currently-cheap underdog.
+        let favorite_is_up = p_up >= 0.5;
+        let up_capped = if favorite_is_up {
+            model.up_bid
+        } else {
+            lock_capped_bid(
+                true,
+                model.up_bid,
+                inventory.up_shares,
+                inventory.up_cost,
+                inventory.down_shares,
+                inventory.down_cost,
+                cfg.min_lock_edge,
+            )
+        };
+        let down_capped = if favorite_is_up {
+            lock_capped_bid(
+                false,
+                model.down_bid,
+                inventory.up_shares,
+                inventory.up_cost,
+                inventory.down_shares,
+                inventory.down_cost,
+                cfg.min_lock_edge,
+            )
+        } else {
+            model.down_bid
+        };
 
         // ── 5. Endgame protocol: which sides may be quoted at all right now.
         let phase = phase_for(tau, cfg.endgame_reduce_secs, cfg.endgame_pull_secs);
