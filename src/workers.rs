@@ -232,7 +232,8 @@ mod unix {
                 Some(_) => {}
                 None => {
                     if let Some(ts) = last_market_ts {
-                        if now_ms().saturating_sub(ts) > cfg.stale_after_ms {
+                        let market_silence_ms = cfg.ws_stale_after_ms.max(cfg.stale_after_ms);
+                        if now_ms().saturating_sub(ts) > market_silence_ms {
                             heartbeat(&cfg, "quote-engine", "kill switch: market stale")?;
                             write_stop(&cfg)?;
                             break;
