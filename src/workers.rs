@@ -10,7 +10,7 @@ mod unix {
         side_allowed, time_boosted_skew, uncertainty_width, MmParams, Phase, SpreadInputs,
         ToxicityMonitor, VolEstimator,
     };
-    use crate::real_orders::{RealOrderClient, UserWsCredentials};
+    use crate::real_orders::{PositionReconciler, PositionSnapshot, RealOrderClient, UserWsCredentials};
     use crate::AppResult;
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
@@ -510,9 +510,61 @@ mod unix {
         let mut buf = [0u8; 16 * 1024];
         let logger = spawn_jsonl_writer();
 
+        // Position reconciliation: periodically read the wallet's true on-chain
+        // share holdings and correct the locally-derived inventory if a fill was
+        // ever missed over the user WS. Only in real mode (Data API is public).
+        let position_reconciler = if cfg.real_orders_enabled() {
+            match PositionReconciler::connect(&cfg) {
+                Ok(r) => Some(r),
+                Err(err) => {
+                    heartbeat(&cfg, "risk-ledger", format!("position reconciler off: {err}"))?;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let mut last_position_sync = Instant::now();
+        let mut up_token = cfg.polymarket_up_token_id.clone();
+        let mut down_token = cfg.polymarket_down_token_id.clone();
+
         while !should_stop(&cfg) {
+            // Periodic on-chain position reconciliation (real mode only).
+            if let Some(reconciler) = &position_reconciler {
+                if cfg.reconcile_interval_ms > 0
+                    && last_position_sync.elapsed() >= Duration::from_millis(cfg.reconcile_interval_ms)
+                    && !up_token.trim().is_empty()
+                    && !down_token.trim().is_empty()
+                {
+                    last_position_sync = Instant::now();
+                    match reconciler.fetch(&up_token, &down_token) {
+                        Ok(snap) => {
+                            if reconcile_inventory_with_chain(&cfg, &mut inventory, &pending, &snap)? {
+                                write_json(&cfg.inventory_path(), &inventory)?;
+                                send_msg(
+                                    &sock,
+                                    &cfg.engine_socket(),
+                                    &WireMessage::Inventory(inventory.clone()),
+                                )?;
+                                check_kill_switch(&cfg, &inventory)?;
+                            }
+                        }
+                        Err(err) => {
+                            heartbeat(&cfg, "risk-ledger", format!("position reconcile failed: {err}"))?
+                        }
+                    }
+                }
+            }
             match recv_msg(&sock, &mut buf)? {
                 Some(WireMessage::OrderAccepted(accepted)) => {
+                    // Learn the current market's Up/Down token ids for reconcile.
+                    if !accepted.quote.token_id.trim().is_empty() {
+                        match accepted.quote.side.as_str() {
+                            "Up" => up_token = accepted.quote.token_id.clone(),
+                            "Down" => down_token = accepted.quote.token_id.clone(),
+                            _ => {}
+                        }
+                    }
                     reset_inventory_for_market(
                         &mut inventory,
                         &mut pending,
@@ -2515,6 +2567,39 @@ mod unix {
             market: market.to_string(),
             ..Default::default()
         };
+    }
+
+    /// Overwrite locally-derived filled inventory with authoritative on-chain
+    /// holdings when they diverge beyond tolerance. Cost basis comes from the
+    /// Data API's initial_value, so PnL stays correct. Pending (resting) orders
+    /// are recomputed but never touched by this — they aren't on-chain yet.
+    /// Returns true if a correction was applied.
+    fn reconcile_inventory_with_chain(
+        cfg: &Config,
+        inventory: &mut Inventory,
+        pending: &[PendingOrder],
+        snap: &PositionSnapshot,
+    ) -> AppResult<bool> {
+        const TOL: f64 = 0.5;
+        let drift_up = (snap.up_shares - inventory.up_shares).abs();
+        let drift_down = (snap.down_shares - inventory.down_shares).abs();
+        if drift_up < TOL && drift_down < TOL {
+            return Ok(false);
+        }
+        heartbeat(
+            cfg,
+            "risk-ledger",
+            format!(
+                "position reconcile: up {:.0}->{:.0} down {:.0}->{:.0}",
+                inventory.up_shares, snap.up_shares, inventory.down_shares, snap.down_shares
+            ),
+        )?;
+        inventory.up_shares = snap.up_shares;
+        inventory.up_cost = snap.up_cost;
+        inventory.down_shares = snap.down_shares;
+        inventory.down_cost = snap.down_cost;
+        recompute_pending(inventory, pending);
+        Ok(true)
     }
 
     fn check_kill_switch(cfg: &Config, inventory: &Inventory) -> AppResult<()> {
