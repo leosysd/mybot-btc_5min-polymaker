@@ -194,6 +194,11 @@ ensure_env_defaults() {
     append_env_line REJECT_BACKOFF_MS "# 同一边被拒后冷却毫秒数，避免空转刷 400 被限流。0=关。" "REJECT_BACKOFF_MS=500"
   fi
 
+  if section_has_missing MIN_FAIR_TO_QUOTE; then
+    append_section_header "# ── 最低胜率门槛（install.sh 自动补齐）──────────────────────"
+    append_env_line MIN_FAIR_TO_QUOTE "# 某边胜率低于此值就不报该边(不碰深度劣势方)。0=关;建议 0.25~0.35。" "MIN_FAIR_TO_QUOTE=0"
+  fi
+
   if [ "$ENV_BACKUP_DONE" -eq 1 ]; then
     echo "已保留原 .env，并补齐缺失字段。备份: $ENV_BACKUP_PATH"
   fi
