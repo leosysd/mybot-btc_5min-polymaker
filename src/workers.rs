@@ -855,7 +855,11 @@ mod unix {
             if now_ms() / 1000 >= market.window_end_s {
                 return None;
             }
-            if self.up_ask <= 0.0 || self.down_ask <= 0.0 || self.btc_price <= 0.0 {
+            if self.last_btc_ts == 0
+                || self.up_ask <= 0.0
+                || self.down_ask <= 0.0
+                || self.btc_price <= 0.0
+            {
                 return None;
             }
             Some(MarketFrame {
@@ -1189,6 +1193,17 @@ mod unix {
     }
 
     fn live_btc_loop(cfg: Config, state: Arc<Mutex<LiveMarketState>>, sink: LiveFrameSink) {
+        if let Some(price) = fetch_btc_rest_price(&cfg) {
+            {
+                let mut state = state.lock().unwrap();
+                state.started = true;
+                state.btc_price = price;
+                state.last_btc_ts = now_ms();
+            }
+            let _ = push_live_frame(&cfg, &state, &sink, "btc rest seed");
+            let _ = heartbeat(&cfg, "collector", format!("btc rest seed {price:.2}"));
+        }
+
         while !should_stop(&cfg) {
             let mut last_err = None;
             for url in btc_ws_urls(&cfg) {
