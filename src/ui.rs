@@ -984,54 +984,95 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         stat.fills += 1;
     }
 
+    // Settlement proxy: the latest book frame per market tells who won
+    // (BTC close vs 判定价). Inferred from our own feed, not Polymarket's
+    // official Chainlink resolution — usually agrees, may differ at the wire.
+    let mut won_up: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let mut close_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for fr in read_all_jsonl::<MarketFrame>(&cfg.book_path())? {
+        if fr.btc_price <= 0.0 || fr.price_to_beat <= 0.0 {
+            continue;
+        }
+        if close_ts.get(&fr.market).map_or(true, |&t| fr.ts_ms >= t) {
+            close_ts.insert(fr.market.clone(), fr.ts_ms);
+            won_up.insert(fr.market.clone(), fr.btc_price > fr.price_to_beat);
+        }
+    }
+
     println!(
         "{}",
         table_row(&[
-            ("盘口".to_string(), 22, Align::Left),
-            ("成交".to_string(), 5, Align::Right),
-            ("Up份".to_string(), 7, Align::Right),
-            ("Up均".to_string(), 7, Align::Right),
-            ("Dn份".to_string(), 7, Align::Right),
-            ("Dn均".to_string(), 7, Align::Right),
-            ("双边成本".to_string(), 9, Align::Right),
-            ("Up赢".to_string(), 9, Align::Right),
-            ("Dn赢".to_string(), 9, Align::Right),
-            ("状态".to_string(), 8, Align::Left),
+            ("盘口".to_string(), 12, Align::Left),
+            ("成交".to_string(), 4, Align::Right),
+            ("Up份".to_string(), 5, Align::Right),
+            ("Up均".to_string(), 6, Align::Right),
+            ("Dn份".to_string(), 5, Align::Right),
+            ("Dn均".to_string(), 6, Align::Right),
+            ("双边成本".to_string(), 8, Align::Right),
+            ("Up赢".to_string(), 7, Align::Right),
+            ("Dn赢".to_string(), 7, Align::Right),
+            ("结算".to_string(), 6, Align::Left),
+            ("实现".to_string(), 8, Align::Right),
         ])
     );
 
     let (mut locked, mut directional) = (0u64, 0u64);
     let (mut sum_worst, mut sum_locked_edge, mut total_fills) = (0.0_f64, 0.0_f64, 0u64);
+    let (mut sum_realized, mut settled, mut wins, mut losses, mut up_wins, mut dn_wins) =
+        (0.0_f64, 0u64, 0u64, 0u64, 0u64, 0u64);
     for market in &order {
         let s = &agg[market];
         let up_avg = if s.up_shares > 0.0 { s.up_cost / s.up_shares } else { 0.0 };
         let dn_avg = if s.down_shares > 0.0 { s.down_cost / s.down_shares } else { 0.0 };
         let two_sided = s.up_shares > 0.0 && s.down_shares > 0.0;
         let combined = if two_sided { up_avg + dn_avg } else { up_avg.max(dn_avg) };
-        let status = if two_sided {
+        if two_sided {
             locked += 1;
             let pairs = s.up_shares.min(s.down_shares);
             sum_locked_edge += (pairs * (1.0 - (up_avg + dn_avg))).max(0.0);
-            format!("{C_GREEN}双边{C_RESET}")
         } else {
             directional += 1;
-            format!("{C_YELLOW}单边{C_RESET}")
-        };
+        }
         sum_worst += s.pnl_if_up().min(s.pnl_if_down());
         total_fills += s.fills;
+
+        // Actual settlement + realized PnL for the window (if we have a close).
+        let (settle_cell, realized_cell) = match won_up.get(market).copied() {
+            Some(up) => {
+                settled += 1;
+                let realized = if up { s.pnl_if_up() } else { s.pnl_if_down() };
+                sum_realized += realized;
+                if realized > 0.0 { wins += 1 } else if realized < 0.0 { losses += 1 }
+                if up { up_wins += 1 } else { dn_wins += 1 }
+                let label = if up {
+                    format!("{C_GREEN}Up{C_RESET}")
+                } else {
+                    format!("{C_RED}Down{C_RESET}")
+                };
+                let pnl = if realized >= 0.0 {
+                    format!("{C_GREEN}{realized:+.2}{C_RESET}")
+                } else {
+                    format!("{C_RED}{realized:+.2}{C_RESET}")
+                };
+                (label, pnl)
+            }
+            None => (format!("{C_DIM}?{C_RESET}"), format!("{C_DIM}-{C_RESET}")),
+        };
+
         println!(
             "{}",
             table_row(&[
-                (fmt_market_label(market), 22, Align::Left),
-                (s.fills.to_string(), 5, Align::Right),
-                (format!("{:.0}", s.up_shares), 7, Align::Right),
-                (format!("{:.3}", up_avg), 7, Align::Right),
-                (format!("{:.0}", s.down_shares), 7, Align::Right),
-                (format!("{:.3}", dn_avg), 7, Align::Right),
-                (format!("{:.3}", combined), 9, Align::Right),
-                (format!("{:+.2}", s.pnl_if_up()), 9, Align::Right),
-                (format!("{:+.2}", s.pnl_if_down()), 9, Align::Right),
-                (status, 8, Align::Left),
+                (fmt_market_label(market), 12, Align::Left),
+                (s.fills.to_string(), 4, Align::Right),
+                (format!("{:.0}", s.up_shares), 5, Align::Right),
+                (format!("{:.3}", up_avg), 6, Align::Right),
+                (format!("{:.0}", s.down_shares), 5, Align::Right),
+                (format!("{:.3}", dn_avg), 6, Align::Right),
+                (format!("{:.3}", combined), 8, Align::Right),
+                (format!("{:+.2}", s.pnl_if_up()), 7, Align::Right),
+                (format!("{:+.2}", s.pnl_if_down()), 7, Align::Right),
+                (settle_cell, 6, Align::Left),
+                (realized_cell, 8, Align::Right),
             ])
         );
     }
@@ -1053,10 +1094,26 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         format!("{C_RED}{sum_worst:+.2}{C_RESET}")
     };
     println!("  {}锁定毛利合计{} ≈ {}   {}最坏情景PnL合计{} {}", C_BOLD, C_RESET, edge_styled, C_BOLD, C_RESET, worst_styled);
+    let realized_styled = if sum_realized >= 0.0 {
+        format!("{C_GREEN}{sum_realized:+.2}{C_RESET}")
+    } else {
+        format!("{C_RED}{sum_realized:+.2}{C_RESET}")
+    };
+    let win_rate = if wins + losses > 0 {
+        format!("{:.0}%", 100.0 * wins as f64 / (wins + losses) as f64)
+    } else {
+        "—".to_string()
+    };
+    println!(
+        "  {}已结算{} {} 盘 (Up赢 {} / Down赢 {})   {}盈/亏{} {}/{} 胜率 {}   {}实现PnL合计{} {}",
+        C_BOLD, C_RESET, settled, up_wins, dn_wins, C_BOLD, C_RESET, wins, losses, win_rate,
+        C_BOLD, C_RESET, realized_styled
+    );
     println!();
     println!(
-        "{}说明:按成交聚合的情景 PnL,不含真实结算结果(本版未追踪逐盘结算)。\
-         双边=两边都成交可锁利;单边=方向暴露。{}",
+        "{}说明:结算列按本机 BTC 行情最后一档 vs 判定价推断(非 Polymarket 官方 \
+         Chainlink 结算,临界盘可能有偏差);实现PnL=按该结算方向的逐盘已实现盈亏。\
+         未结算的盘口结算列显示 ?。{}",
         C_DIM, C_RESET
     );
     Ok(())
