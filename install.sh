@@ -188,6 +188,12 @@ ensure_env_defaults() {
     append_env_line PREWARM_INTERVAL_MS "" "PREWARM_INTERVAL_MS=60000"
   fi
 
+  if section_has_missing POST_ONLY_MARGIN_TICKS REJECT_BACKOFF_MS; then
+    append_section_header "# ── 报价/拒单防护（install.sh 自动补齐）──────────────────────"
+    append_env_line POST_ONLY_MARGIN_TICKS "# post-only 买价至少低于卖一价多少 tick，降低 crosses book 拒单。" "POST_ONLY_MARGIN_TICKS=2"
+    append_env_line REJECT_BACKOFF_MS "# 同一边被拒后冷却毫秒数，避免空转刷 400 被限流。0=关。" "REJECT_BACKOFF_MS=500"
+  fi
+
   if [ "$ENV_BACKUP_DONE" -eq 1 ]; then
     echo "已保留原 .env，并补齐缺失字段。备份: $ENV_BACKUP_PATH"
   fi

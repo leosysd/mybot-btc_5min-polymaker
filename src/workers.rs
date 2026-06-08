@@ -361,6 +361,9 @@ mod unix {
         let mut last_reconcile = Instant::now();
         let mut last_prewarm = Instant::now();
         let mut primed: HashSet<String> = HashSet::new();
+        // Per-side cooldown after a rejected order, so we don't spin and hammer
+        // the exchange with crossing orders (and risk rate-limiting).
+        let mut reject_until: HashMap<String, u64> = HashMap::new();
         let loop_result = (|| -> AppResult<()> {
             while !should_stop(&cfg) {
                 let order_map_ref = real_orders.as_ref().map(|_| &order_map);
@@ -404,6 +407,14 @@ mod unix {
                                 last_prewarm = Instant::now();
                             }
                         }
+                        // Backing off this side after a recent rejection: don't
+                        // re-quote (avoids hammering the book with crossing orders).
+                        if reject_until
+                            .get(&quote.side)
+                            .is_some_and(|&until| now_ms() < until)
+                        {
+                            continue;
+                        }
                         if should_keep_resting(&cfg, resting.get(&quote.side), &quote) {
                             heartbeat(&cfg, "order-gateway", "kept resting quote")?;
                             continue;
@@ -428,6 +439,11 @@ mod unix {
                             &mut resting,
                             quote.clone(),
                         )? {
+                            // Not placed (rejected / too small): cool this side down.
+                            if real_orders.is_some() && cfg.reject_backoff_ms > 0 {
+                                reject_until
+                                    .insert(quote.side.clone(), now_ms() + cfg.reject_backoff_ms);
+                            }
                             continue;
                         }
                         if real_orders.is_none() && rng.next_unit() <= cfg.sim_fill_chance {
@@ -795,7 +811,14 @@ mod unix {
         // ── 5. Endgame protocol: which sides may be quoted at all right now.
         let phase = phase_for(tau, cfg.endgame_reduce_secs, cfg.endgame_pull_secs);
         let up_px = if side_allowed(true, phase, up_eff, down_eff) {
-            post_only_bid(model.up_bid, frame.up_ask, cfg.tick_size, cfg.min_bid, cfg.max_bid)
+            post_only_bid(
+                model.up_bid,
+                frame.up_ask,
+                cfg.tick_size,
+                cfg.min_bid,
+                cfg.max_bid,
+                cfg.post_only_margin_ticks,
+            )
         } else {
             None
         };
@@ -806,6 +829,7 @@ mod unix {
                 cfg.tick_size,
                 cfg.min_bid,
                 cfg.max_bid,
+                cfg.post_only_margin_ticks,
             )
         } else {
             None
