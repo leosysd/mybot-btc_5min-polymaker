@@ -319,6 +319,7 @@ mod unix {
             HashMap::new()
         };
         let order_map: SharedOrderMap = Arc::new(Mutex::new(order_map_from_resting(&resting)));
+        let filled: SharedFilled = Arc::new(Mutex::new(FilledTally::default()));
         if let Some(real_orders) = &real_orders {
             if !resting.is_empty() {
                 heartbeat(
@@ -355,6 +356,7 @@ mod unix {
                 &cfg,
                 real_orders.user_ws_credentials(),
                 Arc::clone(&order_map),
+                Arc::clone(&filled),
             )?;
         }
 
@@ -364,13 +366,9 @@ mod unix {
         // Per-side cooldown after a rejected order, so we don't spin and hammer
         // the exchange with crossing orders (and risk rate-limiting).
         let mut reject_until: HashMap<String, u64> = HashMap::new();
-        // Gateway-authoritative per-side fill tally for the CURRENT market. The
-        // engine's inventory feed can lag/drop; this counts the fills WE see
-        // (real via user-WS, or sim) and hard-caps each side locally so we never
-        // blow past QUOTE_SIZE*INVENTORY_MULT regardless of IPC state.
-        let mut filled_market = String::new();
-        let mut filled_up = 0.0_f64;
-        let mut filled_down = 0.0_f64;
+        // `filled` (shared, above) is the authoritative per-side fill tally for
+        // the current market, updated in-process by both the user-WS thread (real
+        // fills) and the sim-fill path below — never lost to socket congestion.
         let loop_result = (|| -> AppResult<()> {
             while !should_stop(&cfg) {
                 let order_map_ref = real_orders.as_ref().map(|_| &order_map);
@@ -414,16 +412,11 @@ mod unix {
                                 last_prewarm = Instant::now();
                             }
                         }
-                        // New market -> reset the local fill tally.
-                        if quote.market != filled_market {
-                            filled_market = quote.market.clone();
-                            filled_up = 0.0;
-                            filled_down = 0.0;
-                        }
                         // Gateway-authoritative side cap: never let our own filled
-                        // count exceed QUOTE_SIZE*INVENTORY_MULT, no matter what the
-                        // engine thinks. This is what stops the "30 shares" runaway.
-                        let held = if quote.side == "Up" { filled_up } else { filled_down };
+                        // count (shared tally, auto-resets per market) exceed
+                        // QUOTE_SIZE*INVENTORY_MULT, no matter what the engine
+                        // thinks. This is what stops the "30 shares" runaway.
+                        let held = filled.lock().unwrap().held(&quote.market, &quote.side);
                         let room = (cfg.max_side_inventory() - held).floor();
                         if room < 1.0 {
                             heartbeat(
@@ -489,11 +482,10 @@ mod unix {
                                 pnl_if_down: 0.0,
                                 source: "dry_run_gateway".to_string(),
                             };
-                            if quote.side == "Up" {
-                                filled_up += fill.size;
-                            } else if quote.side == "Down" {
-                                filled_down += fill.size;
-                            }
+                            filled
+                                .lock()
+                                .unwrap()
+                                .add(&quote.market, &quote.side, fill.size);
                             let risk = WireMessage::FillEvent(fill);
                             send_msg(&sock, &cfg.risk_socket(), &risk)?;
                             resting.remove(&quote.side);
@@ -505,17 +497,9 @@ mod unix {
                         }
                     }
                     Some(WireMessage::FillEvent(fill)) => {
-                        // Count real fills toward the local side cap.
-                        if fill.market != filled_market {
-                            filled_market = fill.market.clone();
-                            filled_up = 0.0;
-                            filled_down = 0.0;
-                        }
-                        if fill.side == "Up" {
-                            filled_up += fill.size;
-                        } else if fill.side == "Down" {
-                            filled_down += fill.size;
-                        }
+                        // The cap tally is updated in-process by emit_user_fill /
+                        // the sim path; here we only sync the resting map (the
+                        // socket fill is best-effort and may be missed — that's OK).
                         if apply_fill_to_resting(&cfg, real_orders.as_ref(), &mut resting, &fill)? {
                             heartbeat(&cfg, "order-gateway", "resting fill synced")?;
                         }
@@ -1882,6 +1866,45 @@ mod unix {
 
     type SharedOrderMap = Arc<Mutex<HashMap<String, QuoteMeta>>>;
 
+    /// Authoritative per-side filled tally for the CURRENT market, shared between
+    /// the order-gateway main loop and the user-WS thread (same process). Updated
+    /// in-process (lock, not socket) so the order-placer always has an accurate,
+    /// timely view of its fills — this is what makes the inventory cap reliable.
+    #[derive(Default)]
+    struct FilledTally {
+        market: String,
+        up: f64,
+        down: f64,
+    }
+
+    impl FilledTally {
+        fn add(&mut self, market: &str, side: &str, size: f64) {
+            if self.market != market {
+                self.market = market.to_string();
+                self.up = 0.0;
+                self.down = 0.0;
+            }
+            match side {
+                "Up" => self.up += size,
+                "Down" => self.down += size,
+                _ => {}
+            }
+        }
+
+        fn held(&self, market: &str, side: &str) -> f64 {
+            if self.market != market {
+                return 0.0;
+            }
+            match side {
+                "Up" => self.up,
+                "Down" => self.down,
+                _ => 0.0,
+            }
+        }
+    }
+
+    type SharedFilled = Arc<Mutex<FilledTally>>;
+
     struct PendingOrder {
         quote_id: String,
         market: String,
@@ -2322,15 +2345,21 @@ mod unix {
         cfg: &Config,
         credentials: UserWsCredentials,
         order_map: SharedOrderMap,
+        filled: SharedFilled,
     ) -> AppResult<()> {
         let cfg = cfg.clone();
-        thread::spawn(move || user_channel_loop(cfg, credentials, order_map));
+        thread::spawn(move || user_channel_loop(cfg, credentials, order_map, filled));
         Ok(())
     }
 
-    fn user_channel_loop(cfg: Config, credentials: UserWsCredentials, order_map: SharedOrderMap) {
+    fn user_channel_loop(
+        cfg: Config,
+        credentials: UserWsCredentials,
+        order_map: SharedOrderMap,
+        filled: SharedFilled,
+    ) {
         while !should_stop(&cfg) {
-            if let Err(err) = user_channel_once(&cfg, &credentials, &order_map) {
+            if let Err(err) = user_channel_once(&cfg, &credentials, &order_map, &filled) {
                 let _ = heartbeat(&cfg, "order-gateway", format!("user ws reconnect: {err}"));
                 sleep_ms(1_000);
             }
@@ -2341,6 +2370,7 @@ mod unix {
         cfg: &Config,
         credentials: &UserWsCredentials,
         order_map: &SharedOrderMap,
+        filled: &SharedFilled,
     ) -> AppResult<()> {
         let sock = UnixDatagram::unbound()?;
         let (mut socket, _) = connect(cfg.polymarket_user_ws_url.as_str())?;
@@ -2407,6 +2437,7 @@ mod unix {
                             cfg,
                             &sock,
                             order_map,
+                            filled,
                             &mut seen_trades,
                             &value,
                         )?;
@@ -2440,12 +2471,13 @@ mod unix {
         cfg: &Config,
         sock: &UnixDatagram,
         order_map: &SharedOrderMap,
+        filled: &SharedFilled,
         seen_trades: &mut HashSet<String>,
         value: &Value,
     ) -> AppResult<()> {
         if let Some(items) = value.as_array() {
             for item in items {
-                apply_user_channel_message(cfg, sock, order_map, seen_trades, item)?;
+                apply_user_channel_message(cfg, sock, order_map, filled, seen_trades, item)?;
             }
             return Ok(());
         }
@@ -2455,7 +2487,7 @@ mod unix {
             .unwrap_or_default()
             .to_ascii_lowercase();
         if event_type == "trade" {
-            handle_user_trade(cfg, sock, order_map, seen_trades, value)?;
+            handle_user_trade(cfg, sock, order_map, filled, seen_trades, value)?;
         } else if event_type == "order" {
             handle_user_order(cfg, sock, order_map, value)?;
         }
@@ -2466,6 +2498,7 @@ mod unix {
         cfg: &Config,
         sock: &UnixDatagram,
         order_map: &SharedOrderMap,
+        filled: &SharedFilled,
         seen_trades: &mut HashSet<String>,
         value: &Value,
     ) -> AppResult<()> {
@@ -2499,7 +2532,7 @@ mod unix {
                 let price = parse_f64_value(maker.get("price"))
                     .or_else(|| parse_f64_value(value.get("price")))
                     .unwrap_or(0.0);
-                emit_user_fill(cfg, sock, order_map, order_id, price, size)?;
+                emit_user_fill(cfg, sock, order_map, filled, order_id, price, size)?;
             }
             return Ok(());
         }
@@ -2514,7 +2547,7 @@ mod unix {
             }
             let price = parse_f64_value(value.get("price")).unwrap_or(0.0);
             let size = parse_f64_value(value.get("size")).unwrap_or(0.0);
-            emit_user_fill(cfg, sock, order_map, order_id, price, size)?;
+            emit_user_fill(cfg, sock, order_map, filled, order_id, price, size)?;
         }
         Ok(())
     }
@@ -2574,6 +2607,7 @@ mod unix {
         cfg: &Config,
         sock: &UnixDatagram,
         order_map: &SharedOrderMap,
+        filled: &SharedFilled,
         order_id: &str,
         price: f64,
         size: f64,
@@ -2603,6 +2637,14 @@ mod unix {
             pnl_if_down: 0.0,
             source: "polymarket_user_ws".to_string(),
         };
+        // Authoritative in-process count for the gateway's inventory cap — this
+        // never gets lost/buried like the socket path can.
+        filled
+            .lock()
+            .unwrap()
+            .add(&fill.market, &fill.side, fill.size);
+        // Best-effort socket sync so the gateway can drop the resting order
+        // (non-critical: cancel of a filled order is now idempotent anyway).
         if let Err(err) = send_msg(
             sock,
             &cfg.gateway_socket(),
