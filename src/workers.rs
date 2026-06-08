@@ -364,6 +364,13 @@ mod unix {
         // Per-side cooldown after a rejected order, so we don't spin and hammer
         // the exchange with crossing orders (and risk rate-limiting).
         let mut reject_until: HashMap<String, u64> = HashMap::new();
+        // Gateway-authoritative per-side fill tally for the CURRENT market. The
+        // engine's inventory feed can lag/drop; this counts the fills WE see
+        // (real via user-WS, or sim) and hard-caps each side locally so we never
+        // blow past QUOTE_SIZE*INVENTORY_MULT regardless of IPC state.
+        let mut filled_market = String::new();
+        let mut filled_up = 0.0_f64;
+        let mut filled_down = 0.0_f64;
         let loop_result = (|| -> AppResult<()> {
             while !should_stop(&cfg) {
                 let order_map_ref = real_orders.as_ref().map(|_| &order_map);
@@ -394,7 +401,7 @@ mod unix {
                     }
                 }
                 match recv_msg(&sock, &mut buf)? {
-                    Some(WireMessage::QuoteIntent(quote)) => {
+                    Some(WireMessage::QuoteIntent(mut quote)) => {
                         // First time we see a new window's token: warm its metadata
                         // cache + connection so the first order's build/post are fast.
                         if let Some(real_orders) = real_orders.as_ref() {
@@ -406,6 +413,28 @@ mod unix {
                                 real_orders.prewarm();
                                 last_prewarm = Instant::now();
                             }
+                        }
+                        // New market -> reset the local fill tally.
+                        if quote.market != filled_market {
+                            filled_market = quote.market.clone();
+                            filled_up = 0.0;
+                            filled_down = 0.0;
+                        }
+                        // Gateway-authoritative side cap: never let our own filled
+                        // count exceed QUOTE_SIZE*INVENTORY_MULT, no matter what the
+                        // engine thinks. This is what stops the "30 shares" runaway.
+                        let held = if quote.side == "Up" { filled_up } else { filled_down };
+                        let room = (cfg.max_side_inventory() - held).floor();
+                        if room < 1.0 {
+                            heartbeat(
+                                &cfg,
+                                "order-gateway",
+                                format!("side cap reached {} held={:.0}", quote.side, held),
+                            )?;
+                            continue;
+                        }
+                        if quote.size > room {
+                            quote.size = room;
                         }
                         // Backing off this side after a recent rejection: don't
                         // re-quote (avoids hammering the book with crossing orders).
@@ -460,6 +489,11 @@ mod unix {
                                 pnl_if_down: 0.0,
                                 source: "dry_run_gateway".to_string(),
                             };
+                            if quote.side == "Up" {
+                                filled_up += fill.size;
+                            } else if quote.side == "Down" {
+                                filled_down += fill.size;
+                            }
                             let risk = WireMessage::FillEvent(fill);
                             send_msg(&sock, &cfg.risk_socket(), &risk)?;
                             resting.remove(&quote.side);
@@ -471,6 +505,17 @@ mod unix {
                         }
                     }
                     Some(WireMessage::FillEvent(fill)) => {
+                        // Count real fills toward the local side cap.
+                        if fill.market != filled_market {
+                            filled_market = fill.market.clone();
+                            filled_up = 0.0;
+                            filled_down = 0.0;
+                        }
+                        if fill.side == "Up" {
+                            filled_up += fill.size;
+                        } else if fill.side == "Down" {
+                            filled_down += fill.size;
+                        }
                         if apply_fill_to_resting(&cfg, real_orders.as_ref(), &mut resting, &fill)? {
                             heartbeat(&cfg, "order-gateway", "resting fill synced")?;
                         }
@@ -995,28 +1040,46 @@ mod unix {
 
     fn send_msg(sock: &UnixDatagram, path: &Path, msg: &WireMessage) -> AppResult<()> {
         let bytes = serde_json::to_vec(msg)?;
-        for attempt in 0..5 {
+        // Two very different failure kinds must be handled differently:
+        //  • WouldBlock = the receiver's datagram buffer is momentarily full
+        //    (peer is ALIVE, just draining). These messages carry state
+        //    (fills/accepts/cancels/inventory) — dropping them corrupts
+        //    accounting and breaks the inventory cap. So retry generously; the
+        //    receiver drains every ~100ms, so it WILL clear.
+        //  • NotFound/ConnectionRefused = the peer socket is gone (a sibling is
+        //    restarting). Brief retry, then drop (non-fatal) — crashing here
+        //    just causes a restart storm, and the restarted peer reloads state.
+        let mut would_block_waited_ms: u64 = 0;
+        let max_block_ms: u64 = 1_000;
+        let mut gone_attempts = 0u32;
+        loop {
             match sock.send_to(&bytes, path) {
                 Ok(_) => return Ok(()),
-                // Peer socket momentarily absent/refused (a sibling worker is
-                // restarting). Retry briefly, then DROP the datagram and keep
-                // running — a missed IPC frame self-heals (next tick re-sends;
-                // inventory is corrected by position reconciliation). Crashing
-                // the worker here just causes a restart storm.
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    if would_block_waited_ms >= max_block_ms {
+                        eprintln!(
+                            "[IPC_DROP] {} congested >{}ms; dropped",
+                            path.display(),
+                            max_block_ms
+                        );
+                        return Ok(());
+                    }
+                    sleep_ms(5);
+                    would_block_waited_ms += 5;
+                }
                 Err(err)
                     if matches!(
                         err.kind(),
-                        io::ErrorKind::ConnectionRefused
-                            | io::ErrorKind::NotFound
-                            | io::ErrorKind::WouldBlock
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
                     ) =>
                 {
-                    if attempt < 4 {
+                    if gone_attempts < 4 {
+                        gone_attempts += 1;
                         sleep_ms(20);
                         continue;
                     }
                     eprintln!(
-                        "[IPC_DROP] send to {} failed ({:?}); dropped frame",
+                        "[IPC_DROP] peer {} gone ({:?}); dropped",
                         path.display(),
                         err.kind()
                     );
@@ -1025,7 +1088,6 @@ mod unix {
                 Err(err) => return Err(err.into()),
             }
         }
-        Ok(())
     }
 
     fn recv_msg(sock: &UnixDatagram, buf: &mut [u8]) -> AppResult<Option<WireMessage>> {
