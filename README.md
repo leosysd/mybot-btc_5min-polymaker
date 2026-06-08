@@ -286,8 +286,7 @@ pm2 save
 
 ```bash
 pm2 status
-pm2 logs polymaker-quote-engine
-pm2 logs polymaker-order-gateway
+pm2 logs polymaker-supervisor
 ```
 
 停止：
@@ -476,6 +475,7 @@ LIVE_ORDER_NOTIONAL_CAP=5
 - 官方 Rust CLOB SDK post-only 下单/撤单。
 - Polymarket user WS 真实订单成交/取消回报。
 - DRY_RUN/实单共用撤单/改单状态机。
+- 实单 active orders 落盘；重启、STOP、kill switch、IPC 异常时优先撤掉已知真实挂单。
 - pending 库存风控。
 - kill switch：最大亏损、最大库存、行情过期、WS 断流。
 - JSONL 后台异步写入。

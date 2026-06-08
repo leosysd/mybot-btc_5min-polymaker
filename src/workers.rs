@@ -8,7 +8,7 @@ mod unix {
     use crate::pricing::{market_maker_bids, normal_cdf, post_only_bid};
     use crate::real_orders::{RealOrderClient, UserWsCredentials};
     use crate::AppResult;
-    use serde::Serialize;
+    use serde::{Deserialize, Serialize};
     use serde_json::Value;
     use std::collections::{HashMap, HashSet};
     use std::fs::OpenOptions;
@@ -61,7 +61,7 @@ mod unix {
         }
 
         write_stop(&cfg)?;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(12);
         while Instant::now() < deadline {
             let mut all_stopped = true;
             for (_, child) in &mut children {
@@ -253,14 +253,33 @@ mod unix {
         let sock = bind_socket(&cfg.gateway_socket())?;
         let mut buf = [0u8; 16 * 1024];
         let mut rng = FastRng::new(now_ms());
-        let mut resting: HashMap<String, RestingOrder> = HashMap::new();
-        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
         let real_orders = if cfg.real_orders_enabled() {
             Some(RealOrderClient::connect(&cfg)?)
         } else {
             None
         };
+        let mut resting = if real_orders.is_some() {
+            load_active_orders(&cfg)?
+        } else {
+            HashMap::new()
+        };
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(order_map_from_resting(&resting)));
         if let Some(real_orders) = &real_orders {
+            if !resting.is_empty() {
+                heartbeat(
+                    &cfg,
+                    "order-gateway",
+                    "startup cancel previous active orders",
+                )?;
+                cancel_all_resting_orders(
+                    &cfg,
+                    &sock,
+                    real_orders,
+                    &order_map,
+                    &mut resting,
+                    "startup_cleanup",
+                )?;
+            }
             start_user_channel(
                 &cfg,
                 real_orders.user_ws_credentials(),
@@ -268,70 +287,106 @@ mod unix {
             )?;
         }
 
-        while !should_stop(&cfg) {
-            let order_map_ref = real_orders.as_ref().map(|_| &order_map);
-            expire_resting_orders(
-                &cfg,
-                &sock,
-                real_orders.as_ref(),
-                order_map_ref,
-                &mut resting,
-            )?;
-            match recv_msg(&sock, &mut buf)? {
-                Some(WireMessage::QuoteIntent(quote)) => {
-                    if should_keep_resting(&cfg, resting.get(&quote.side), &quote) {
-                        heartbeat(&cfg, "order-gateway", "kept resting quote")?;
-                        continue;
-                    }
-                    if let Some(old) = resting.remove(&quote.side) {
-                        send_cancel(
+        let loop_result = (|| -> AppResult<()> {
+            while !should_stop(&cfg) {
+                let order_map_ref = real_orders.as_ref().map(|_| &order_map);
+                expire_resting_orders(
+                    &cfg,
+                    &sock,
+                    real_orders.as_ref(),
+                    order_map_ref,
+                    &mut resting,
+                )?;
+                match recv_msg(&sock, &mut buf)? {
+                    Some(WireMessage::QuoteIntent(quote)) => {
+                        if should_keep_resting(&cfg, resting.get(&quote.side), &quote) {
+                            heartbeat(&cfg, "order-gateway", "kept resting quote")?;
+                            continue;
+                        }
+                        if let Some(old) = resting.remove(&quote.side) {
+                            resting.insert(quote.side.clone(), old);
+                            cancel_resting_side(
+                                &cfg,
+                                &sock,
+                                real_orders.as_ref(),
+                                Some(&order_map),
+                                &mut resting,
+                                &quote.side,
+                                "requote",
+                            )?;
+                        }
+                        if !accept_resting_order(
                             &cfg,
                             &sock,
                             real_orders.as_ref(),
                             order_map_ref,
-                            old,
-                            "requote",
-                        )?;
+                            &mut resting,
+                            quote.clone(),
+                        )? {
+                            continue;
+                        }
+                        if real_orders.is_none() && rng.next_unit() <= cfg.sim_fill_chance {
+                            let fill = FillEvent {
+                                quote_id: quote.quote_id.clone(),
+                                ts_ms: now_ms(),
+                                market: quote.market.clone(),
+                                side: quote.side.clone(),
+                                price: quote.price,
+                                size: quote.size,
+                                inventory_up: 0.0,
+                                inventory_down: 0.0,
+                                pnl_if_up: 0.0,
+                                pnl_if_down: 0.0,
+                                source: "dry_run_gateway".to_string(),
+                            };
+                            let risk = WireMessage::FillEvent(fill);
+                            send_msg(&sock, &cfg.risk_socket(), &risk)?;
+                            resting.remove(&quote.side);
+                            heartbeat(&cfg, "order-gateway", "simulated fill")?;
+                        } else if real_orders.is_some() {
+                            heartbeat(&cfg, "order-gateway", "real order resting")?;
+                        } else {
+                            heartbeat(&cfg, "order-gateway", "resting quote")?;
+                        }
                     }
-                    if !accept_resting_order(
-                        &cfg,
-                        &sock,
-                        real_orders.as_ref(),
-                        order_map_ref,
-                        &mut resting,
-                        quote.clone(),
-                    )? {
-                        continue;
+                    Some(WireMessage::FillEvent(fill)) => {
+                        if apply_fill_to_resting(&cfg, real_orders.as_ref(), &mut resting, &fill)? {
+                            heartbeat(&cfg, "order-gateway", "resting fill synced")?;
+                        }
                     }
-                    if real_orders.is_none() && rng.next_unit() <= cfg.sim_fill_chance {
-                        let fill = FillEvent {
-                            quote_id: quote.quote_id.clone(),
-                            ts_ms: now_ms(),
-                            market: quote.market.clone(),
-                            side: quote.side.clone(),
-                            price: quote.price,
-                            size: quote.size,
-                            inventory_up: 0.0,
-                            inventory_down: 0.0,
-                            pnl_if_up: 0.0,
-                            pnl_if_down: 0.0,
-                            source: "dry_run_gateway".to_string(),
-                        };
-                        let risk = WireMessage::FillEvent(fill);
-                        send_msg(&sock, &cfg.risk_socket(), &risk)?;
-                        resting.remove(&quote.side);
-                        heartbeat(&cfg, "order-gateway", "simulated fill")?;
-                    } else if real_orders.is_some() {
-                        heartbeat(&cfg, "order-gateway", "real order resting")?;
-                    } else {
-                        heartbeat(&cfg, "order-gateway", "resting quote")?;
+                    Some(WireMessage::OrderCancelled(cancel)) => {
+                        if apply_cancel_to_resting(
+                            &cfg,
+                            real_orders.as_ref(),
+                            &mut resting,
+                            &cancel,
+                        )? {
+                            heartbeat(&cfg, "order-gateway", "resting cancel synced")?;
+                        }
                     }
+                    Some(_) => {}
+                    None => heartbeat(&cfg, "order-gateway", "waiting")?,
                 }
-                Some(_) => {}
-                None => heartbeat(&cfg, "order-gateway", "waiting")?,
             }
+            Ok(())
+        })();
+        let cleanup_result = if let Some(real_orders) = &real_orders {
+            cancel_all_resting_orders(
+                &cfg,
+                &sock,
+                real_orders,
+                &order_map,
+                &mut resting,
+                "shutdown",
+            )
+        } else {
+            Ok(())
+        };
+        match (loop_result, cleanup_result) {
+            (Err(err), _) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Ok(()), Ok(())) => Ok(()),
         }
-        Ok(())
     }
 
     pub fn run_risk(cfg: Config) -> AppResult<()> {
@@ -1420,6 +1475,7 @@ mod unix {
 
     struct FastRng(u64);
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
     struct RestingOrder {
         quote_id: String,
         exchange_order_id: Option<String>,
@@ -1469,6 +1525,57 @@ mod unix {
         (old.price - quote.price).abs() < threshold && (old.size - quote.size).abs() < 0.001
     }
 
+    fn load_active_orders(cfg: &Config) -> AppResult<HashMap<String, RestingOrder>> {
+        Ok(
+            read_json::<HashMap<String, RestingOrder>>(&cfg.active_orders_path())?
+                .unwrap_or_default(),
+        )
+    }
+
+    fn persist_active_orders(
+        cfg: &Config,
+        resting: &HashMap<String, RestingOrder>,
+    ) -> AppResult<()> {
+        if resting.is_empty() {
+            let _ = std::fs::remove_file(cfg.active_orders_path());
+            return Ok(());
+        }
+        write_json(&cfg.active_orders_path(), resting)
+    }
+
+    fn persist_active_orders_if_real(
+        cfg: &Config,
+        real_orders: Option<&RealOrderClient>,
+        resting: &HashMap<String, RestingOrder>,
+    ) -> AppResult<()> {
+        if real_orders.is_some() {
+            persist_active_orders(cfg, resting)?;
+        }
+        Ok(())
+    }
+
+    fn order_map_from_resting(
+        resting: &HashMap<String, RestingOrder>,
+    ) -> HashMap<String, QuoteMeta> {
+        resting
+            .values()
+            .filter_map(|order| {
+                let order_id = order.exchange_order_id.as_ref()?;
+                Some((
+                    order_id.clone(),
+                    QuoteMeta {
+                        quote_id: order.quote_id.clone(),
+                        market: order.market.clone(),
+                        condition_id: order.condition_id.clone(),
+                        side: order.side.clone(),
+                        price: order.price,
+                        size: order.size,
+                    },
+                ))
+            })
+            .collect()
+    }
+
     fn accept_resting_order(
         cfg: &Config,
         sock: &UnixDatagram,
@@ -1510,6 +1617,17 @@ mod unix {
             None
         };
         let expires_ts_ms = now_ms() + cfg.quote_ttl_ms;
+        let order = RestingOrder {
+            quote_id: quote.quote_id.clone(),
+            exchange_order_id,
+            market: quote.market.clone(),
+            condition_id: quote.condition_id.clone(),
+            token_id: quote.token_id.clone(),
+            side: quote.side.clone(),
+            price: quote.price,
+            size: quote.size,
+            expires_ts_ms,
+        };
         let accepted = OrderAccepted {
             accepted_ts_ms: now_ms(),
             expires_ts_ms,
@@ -1520,25 +1638,29 @@ mod unix {
                 "dry_run_gateway".to_string()
             },
         };
-        resting.insert(
-            quote.side.clone(),
-            RestingOrder {
-                quote_id: quote.quote_id.clone(),
-                exchange_order_id,
-                market: quote.market.clone(),
-                condition_id: quote.condition_id.clone(),
-                token_id: quote.token_id.clone(),
-                side: quote.side.clone(),
-                price: quote.price,
-                size: quote.size,
-                expires_ts_ms,
-            },
-        );
-        send_msg(
+        resting.insert(quote.side.clone(), order);
+        persist_active_orders_if_real(cfg, real_orders, resting)?;
+        if let Err(err) = send_msg(
             sock,
             &cfg.risk_socket(),
             &WireMessage::OrderAccepted(accepted),
-        )?;
+        ) {
+            let _ = heartbeat(
+                cfg,
+                "order-gateway",
+                format!("risk accept ipc failed: {err}"),
+            );
+            let _ = cancel_resting_side(
+                cfg,
+                sock,
+                real_orders,
+                order_map,
+                resting,
+                &quote.side,
+                "risk_ipc_failed",
+            );
+            return Err(err);
+        }
         Ok(true)
     }
 
@@ -1555,9 +1677,62 @@ mod unix {
             .filter_map(|(side, order)| (order.expires_ts_ms <= now).then_some(side.clone()))
             .collect::<Vec<_>>();
         for side in expired {
-            if let Some(order) = resting.remove(&side) {
-                send_cancel(cfg, sock, real_orders, order_map, order, "expired")?;
+            cancel_resting_side(cfg, sock, real_orders, order_map, resting, &side, "expired")?;
+        }
+        Ok(())
+    }
+
+    fn cancel_resting_side(
+        cfg: &Config,
+        sock: &UnixDatagram,
+        real_orders: Option<&RealOrderClient>,
+        order_map: Option<&SharedOrderMap>,
+        resting: &mut HashMap<String, RestingOrder>,
+        side: &str,
+        reason: &str,
+    ) -> AppResult<()> {
+        let Some(order) = resting.get(side).cloned() else {
+            return Ok(());
+        };
+        send_cancel(cfg, sock, real_orders, order_map, order, reason)?;
+        resting.remove(side);
+        persist_active_orders_if_real(cfg, real_orders, resting)?;
+        Ok(())
+    }
+
+    fn cancel_all_resting_orders(
+        cfg: &Config,
+        sock: &UnixDatagram,
+        real_orders: &RealOrderClient,
+        order_map: &SharedOrderMap,
+        resting: &mut HashMap<String, RestingOrder>,
+        reason: &str,
+    ) -> AppResult<()> {
+        let sides = resting.keys().cloned().collect::<Vec<_>>();
+        let mut first_error = None;
+        for side in sides {
+            if let Err(err) = cancel_resting_side(
+                cfg,
+                sock,
+                Some(real_orders),
+                Some(order_map),
+                resting,
+                &side,
+                reason,
+            ) {
+                let msg = err.to_string();
+                let _ = heartbeat(
+                    cfg,
+                    "order-gateway",
+                    format!("cancel {reason} failed: {msg}"),
+                );
+                if first_error.is_none() {
+                    first_error = Some(msg);
+                }
             }
+        }
+        if let Some(err) = first_error {
+            return Err(format!("one or more cancels failed: {err}").into());
         }
         Ok(())
     }
@@ -1573,11 +1748,25 @@ mod unix {
         if let (Some(real_orders), Some(exchange_order_id)) =
             (real_orders, order.exchange_order_id.as_deref())
         {
-            real_orders.cancel_order(exchange_order_id)?;
+            let ack = real_orders.cancel_order(exchange_order_id)?;
+            if !ack.is_terminal_noop() {
+                return Err(format!(
+                    "Polymarket cancel rejected for {exchange_order_id}: {}",
+                    ack.reason.unwrap_or_else(|| "unknown reason".to_string())
+                )
+                .into());
+            }
             heartbeat(
                 cfg,
                 "order-gateway",
-                format!("real cancel {exchange_order_id}"),
+                if ack.canceled {
+                    format!("real cancel {exchange_order_id}")
+                } else {
+                    format!(
+                        "real cancel noop {exchange_order_id}: {}",
+                        ack.reason.unwrap_or_else(|| "not active".to_string())
+                    )
+                },
             )?;
             if let Some(order_map) = order_map {
                 order_map.lock().unwrap().remove(exchange_order_id);
@@ -1596,11 +1785,96 @@ mod unix {
                 "dry_run_gateway".to_string()
             },
         };
-        send_msg(
+        if let Err(err) = send_msg(
             sock,
             &cfg.risk_socket(),
             &WireMessage::OrderCancelled(cancel),
-        )
+        ) {
+            heartbeat(
+                cfg,
+                "order-gateway",
+                format!("risk cancel ipc failed: {err}"),
+            )?;
+            if real_orders.is_none() {
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_fill_to_resting(
+        cfg: &Config,
+        real_orders: Option<&RealOrderClient>,
+        resting: &mut HashMap<String, RestingOrder>,
+        fill: &FillEvent,
+    ) -> AppResult<bool> {
+        let changed = apply_fill_to_resting_map(resting, fill);
+        if changed {
+            persist_active_orders_if_real(cfg, real_orders, resting)?;
+        }
+        Ok(changed)
+    }
+
+    fn apply_fill_to_resting_map(
+        resting: &mut HashMap<String, RestingOrder>,
+        fill: &FillEvent,
+    ) -> bool {
+        let key = resting.iter().find_map(|(side, order)| {
+            ((!fill.quote_id.is_empty() && order.quote_id == fill.quote_id)
+                || (fill.quote_id.is_empty()
+                    && order.market == fill.market
+                    && order.side == fill.side))
+                .then(|| side.clone())
+        });
+        let Some(key) = key else {
+            return false;
+        };
+
+        let mut remove = false;
+        if let Some(order) = resting.get_mut(&key) {
+            let fill_size = if fill.size > 0.0 {
+                fill.size.min(order.size)
+            } else {
+                order.size
+            };
+            order.size = (order.size - fill_size).max(0.0);
+            remove = order.size <= 0.001;
+        }
+        if remove {
+            resting.remove(&key);
+        }
+        true
+    }
+
+    fn apply_cancel_to_resting(
+        cfg: &Config,
+        real_orders: Option<&RealOrderClient>,
+        resting: &mut HashMap<String, RestingOrder>,
+        cancel: &OrderCancelled,
+    ) -> AppResult<bool> {
+        let changed = apply_cancel_to_resting_map(resting, cancel);
+        if changed {
+            persist_active_orders_if_real(cfg, real_orders, resting)?;
+        }
+        Ok(changed)
+    }
+
+    fn apply_cancel_to_resting_map(
+        resting: &mut HashMap<String, RestingOrder>,
+        cancel: &OrderCancelled,
+    ) -> bool {
+        let key = resting.iter().find_map(|(side, order)| {
+            ((!cancel.quote_id.is_empty() && order.quote_id == cancel.quote_id)
+                || (cancel.quote_id.is_empty()
+                    && order.market == cancel.market
+                    && order.side == cancel.side))
+                .then(|| side.clone())
+        });
+        let Some(key) = key else {
+            return false;
+        };
+        resting.remove(&key);
+        true
     }
 
     fn start_user_channel(
@@ -1835,6 +2109,17 @@ mod unix {
             reason: "user_ws_cancel".to_string(),
             source: "polymarket_user_ws".to_string(),
         };
+        if let Err(err) = send_msg(
+            sock,
+            &cfg.gateway_socket(),
+            &WireMessage::OrderCancelled(cancel.clone()),
+        ) {
+            heartbeat(
+                cfg,
+                "order-gateway",
+                format!("gateway cancel sync failed: {err}"),
+            )?;
+        }
         send_msg(
             sock,
             &cfg.risk_socket(),
@@ -1877,6 +2162,17 @@ mod unix {
             pnl_if_down: 0.0,
             source: "polymarket_user_ws".to_string(),
         };
+        if let Err(err) = send_msg(
+            sock,
+            &cfg.gateway_socket(),
+            &WireMessage::FillEvent(fill.clone()),
+        ) {
+            heartbeat(
+                cfg,
+                "order-gateway",
+                format!("gateway fill sync failed: {err}"),
+            )?;
+        }
         send_msg(sock, &cfg.risk_socket(), &WireMessage::FillEvent(fill))?;
         heartbeat(cfg, "order-gateway", "user ws fill")?;
         Ok(())
@@ -1999,6 +2295,96 @@ mod unix {
             write_stop(cfg)?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn resting(side: &str, quote_id: &str, size: f64) -> RestingOrder {
+            RestingOrder {
+                quote_id: quote_id.to_string(),
+                exchange_order_id: Some(format!("exchange-{quote_id}")),
+                market: "btc-updown-5m-test".to_string(),
+                condition_id: "condition".to_string(),
+                token_id: format!("token-{side}"),
+                side: side.to_string(),
+                price: 0.42,
+                size,
+                expires_ts_ms: now_ms() + 1_000,
+            }
+        }
+
+        fn fill(side: &str, quote_id: &str, size: f64) -> FillEvent {
+            FillEvent {
+                quote_id: quote_id.to_string(),
+                ts_ms: now_ms(),
+                market: "btc-updown-5m-test".to_string(),
+                side: side.to_string(),
+                price: 0.42,
+                size,
+                inventory_up: 0.0,
+                inventory_down: 0.0,
+                pnl_if_up: 0.0,
+                pnl_if_down: 0.0,
+                source: "test".to_string(),
+            }
+        }
+
+        #[test]
+        fn user_fill_reduces_resting_size() {
+            let mut resting_orders = HashMap::from([("Up".to_string(), resting("Up", "q1", 5.0))]);
+
+            assert!(apply_fill_to_resting_map(
+                &mut resting_orders,
+                &fill("Up", "q1", 2.0)
+            ));
+
+            assert_eq!(resting_orders.get("Up").unwrap().size, 3.0);
+        }
+
+        #[test]
+        fn full_user_fill_removes_resting_order() {
+            let mut resting_orders =
+                HashMap::from([("Down".to_string(), resting("Down", "q2", 5.0))]);
+
+            assert!(apply_fill_to_resting_map(
+                &mut resting_orders,
+                &fill("Down", "q2", 5.0)
+            ));
+
+            assert!(resting_orders.is_empty());
+        }
+
+        #[test]
+        fn user_cancel_removes_resting_order() {
+            let mut resting_orders = HashMap::from([("Up".to_string(), resting("Up", "q3", 5.0))]);
+            let cancel = OrderCancelled {
+                ts_ms: now_ms(),
+                quote_id: "q3".to_string(),
+                market: "btc-updown-5m-test".to_string(),
+                side: "Up".to_string(),
+                size: 5.0,
+                reason: "user_ws_cancel".to_string(),
+                source: "test".to_string(),
+            };
+
+            assert!(apply_cancel_to_resting_map(&mut resting_orders, &cancel));
+
+            assert!(resting_orders.is_empty());
+        }
+
+        #[test]
+        fn active_orders_restore_order_map() {
+            let resting_orders = HashMap::from([("Up".to_string(), resting("Up", "q4", 5.0))]);
+
+            let order_map = order_map_from_resting(&resting_orders);
+
+            let meta = order_map.get("exchange-q4").unwrap();
+            assert_eq!(meta.quote_id, "q4");
+            assert_eq!(meta.side, "Up");
+            assert_eq!(meta.size, 5.0);
+        }
     }
 
     impl FastRng {

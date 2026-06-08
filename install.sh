@@ -101,6 +101,7 @@ append_env_line() {
 ensure_env_defaults() {
   if [ ! -f "$ENV_FILE" ] && [ -f "$INSTALL_DIR/.env.example" ]; then
     cp "$INSTALL_DIR/.env.example" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
     echo "已创建默认配置: $ENV_FILE"
     return
   fi
@@ -108,6 +109,7 @@ ensure_env_defaults() {
   if [ ! -f "$ENV_FILE" ]; then
     return
   fi
+  chmod 600 "$ENV_FILE"
 
   if section_has_missing ENABLE_REAL_ORDERS DATA_MODE AUTO_DISCOVER_MARKET POLYMARKET_GAMMA_API_URL MARKET_WINDOW_SECS MARKET_DISCOVERY_MS MARKET_SWITCH_GRACE_MS POLYMARKET_UP_TOKEN_ID POLYMARKET_DOWN_TOKEN_ID POLYMARKET_WS_URL POLYMARKET_USER_WS_URL BINANCE_WS_URL BINANCE_REST_URL POLYMARKET_CLOB_HOST POLY_CHAIN_ID POLY_PRIVATE_KEY POLY_API_KEY POLY_SECRET POLY_PASSPHRASE POLY_SIGNATURE_TYPE POLY_FUNDER_ADDRESS PRICE_TO_BEAT; then
     append_section_header "# ── 运行模式 / 真实行情 / 实单密钥（install.sh 自动补齐）──────────────"

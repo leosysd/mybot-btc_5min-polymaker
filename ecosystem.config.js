@@ -7,10 +7,10 @@ const bin = fs.existsSync(releaseBin) ? releaseBin : sourceBin;
 const runDir = path.join(__dirname, "run");
 fs.mkdirSync(runDir, { recursive: true });
 
-const app = (name, role) => ({
+const app = (name, args) => ({
   name,
   script: bin,
-  args: role,
+  args,
   cwd: __dirname,
   interpreter: "none",
   instances: 1,
@@ -32,10 +32,5 @@ const app = (name, role) => ({
 });
 
 module.exports = {
-  apps: [
-    app("polymaker-quote-engine", "quote-engine"),
-    app("polymaker-order-gateway", "order-gateway"),
-    app("polymaker-risk-ledger", "risk-ledger"),
-    app("polymaker-collector", "collector"),
-  ],
+  apps: [app("polymaker-supervisor", "supervisor")],
 };

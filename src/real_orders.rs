@@ -33,6 +33,39 @@ pub struct RealOrderAck {
 }
 
 #[derive(Debug, Clone)]
+pub struct CancelOrderAck {
+    pub canceled: bool,
+    pub reason: Option<String>,
+}
+
+impl CancelOrderAck {
+    pub fn is_terminal_noop(&self) -> bool {
+        if self.canceled {
+            return true;
+        }
+        let Some(reason) = &self.reason else {
+            return false;
+        };
+        let reason = reason.to_ascii_lowercase();
+        [
+            "already",
+            "cancel",
+            "canceled",
+            "cancelled",
+            "filled",
+            "matched",
+            "closed",
+            "not found",
+            "not open",
+            "not active",
+            "does not exist",
+        ]
+        .iter()
+        .any(|needle| reason.contains(needle))
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct UserWsCredentials {
     pub api_key: String,
     pub secret: String,
@@ -51,7 +84,7 @@ impl RealOrderClient {
         self.runtime.block_on(self.inner.place_buy_limit(quote))
     }
 
-    pub fn cancel_order(&self, order_id: &str) -> AppResult<()> {
+    pub fn cancel_order(&self, order_id: &str) -> AppResult<CancelOrderAck> {
         self.runtime.block_on(self.inner.cancel_order(order_id))
     }
 
@@ -118,16 +151,18 @@ impl RealOrderClientInner {
         })
     }
 
-    async fn cancel_order(&self, order_id: &str) -> AppResult<()> {
+    async fn cancel_order(&self, order_id: &str) -> AppResult<CancelOrderAck> {
         let response = self.client.cancel_order(order_id).await?;
-        if response
-            .not_canceled
-            .get(order_id)
-            .is_some_and(|reason| !reason.is_empty())
-        {
-            return Err(format!("Polymarket cancel rejected for {order_id}").into());
+        if response.canceled.iter().any(|id| id == order_id) {
+            return Ok(CancelOrderAck {
+                canceled: true,
+                reason: None,
+            });
         }
-        Ok(())
+        Ok(CancelOrderAck {
+            canceled: false,
+            reason: response.not_canceled.get(order_id).cloned(),
+        })
     }
 
     fn user_ws_credentials(&self) -> UserWsCredentials {

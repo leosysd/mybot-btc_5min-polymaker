@@ -282,6 +282,10 @@ impl Config {
         self.run_dir.join("inventory.json")
     }
 
+    pub fn active_orders_path(&self) -> PathBuf {
+        self.run_dir.join("active_orders.json")
+    }
+
     pub fn max_side_inventory(&self) -> f64 {
         (self.quote_size * self.inventory_mult).round().max(0.0)
     }
