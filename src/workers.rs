@@ -1250,16 +1250,23 @@ mod unix {
         let (mut socket, _) = connect(url)?;
         tune_ws_socket(&mut socket, Duration::from_millis(1_000))?;
         heartbeat(cfg, "collector", format!("btc ws subscribed {url}"))?;
+        let mut last_event = Instant::now();
         while !should_stop(cfg) {
             let msg = match socket.read() {
                 Ok(msg) => msg,
-                Err(err) if is_ws_timeout(&err) => continue,
+                Err(err) if is_ws_timeout(&err) => {
+                    if last_event.elapsed() >= Duration::from_secs(2) {
+                        return Err(format!("btc ws quiet for {:?}", last_event.elapsed()).into());
+                    }
+                    continue;
+                }
                 Err(err) => return Err(err.into()),
             };
             match msg {
                 Message::Text(raw) => {
                     if let Ok(value) = serde_json::from_str::<Value>(&raw) {
                         if let Some(price) = parse_btc_price(&value) {
+                            last_event = Instant::now();
                             {
                                 let mut state = state.lock().unwrap();
                                 state.started = true;
