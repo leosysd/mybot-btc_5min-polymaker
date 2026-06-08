@@ -8,7 +8,7 @@ alloy = { version = "1.8.3", features = ["signer-local"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 secrecy = "0.10"
-polymarket_client_sdk_v2 = { version = "0.6.0-canary.1", features = ["clob"] }
+polymarket_client_sdk_v2 = { version = "0.6.0-canary.1", features = ["clob", "data"] }
 rustls = { version = "0.23", features = ["ring"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tungstenite = { version = "0.24", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }

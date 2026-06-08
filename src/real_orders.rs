@@ -7,6 +7,8 @@ use polymarket_client_sdk_v2::auth::{Credentials, Uuid};
 use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
 use polymarket_client_sdk_v2::clob::types::{Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config as ClobConfig};
+use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
+use polymarket_client_sdk_v2::data::Client as DataClient;
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 use polymarket_client_sdk_v2::POLYGON;
 use secrecy::ExposeSecret;
@@ -68,6 +70,66 @@ impl CancelOrderAck {
         ]
         .iter()
         .any(|needle| reason.contains(needle))
+    }
+}
+
+/// Authoritative on-chain share holdings for the current market's tokens,
+/// read from the Polymarket Data API. Used to correct the locally-derived
+/// inventory if a fill was ever missed over the user WS.
+#[derive(Debug, Clone, Default)]
+pub struct PositionSnapshot {
+    pub up_shares: f64,
+    pub up_cost: f64,
+    pub down_shares: f64,
+    pub down_cost: f64,
+}
+
+/// Reads on-chain positions for a wallet from the public Data API (no auth,
+/// just the user address). Holds its own runtime; cheap to poll periodically.
+pub struct PositionReconciler {
+    runtime: Runtime,
+    client: DataClient,
+    user: Address,
+}
+
+impl PositionReconciler {
+    pub fn connect(cfg: &Config) -> AppResult<Self> {
+        // Positions are held by the funder/proxy wallet when set, otherwise by
+        // the signing EOA itself.
+        let user = if !cfg.poly_funder_address.trim().is_empty() {
+            Address::from_str(cfg.poly_funder_address.trim())?
+        } else {
+            let signer = PrivateKeySigner::from_str(cfg.poly_private_key.trim())?;
+            Address::from_str(&signer.address().to_string())?
+        };
+        let runtime = Runtime::new()?;
+        let client = DataClient::default();
+        Ok(Self {
+            runtime,
+            client,
+            user,
+        })
+    }
+
+    /// Fetch the wallet's holdings and bucket them into Up/Down by token id.
+    pub fn fetch(&self, up_token: &str, down_token: &str) -> AppResult<PositionSnapshot> {
+        let request = PositionsRequest::builder().user(self.user).build();
+        let positions = self.runtime.block_on(self.client.positions(&request))?;
+        let mut snap = PositionSnapshot::default();
+        let (up, down) = (up_token.trim(), down_token.trim());
+        for p in &positions {
+            let asset = p.asset.to_string();
+            let size = p.size.to_string().parse::<f64>().unwrap_or(0.0);
+            let cost = p.initial_value.to_string().parse::<f64>().unwrap_or(0.0);
+            if asset == up {
+                snap.up_shares += size;
+                snap.up_cost += cost;
+            } else if asset == down {
+                snap.down_shares += size;
+                snap.down_cost += cost;
+            }
+        }
+        Ok(snap)
     }
 }
 
