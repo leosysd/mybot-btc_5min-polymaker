@@ -31,6 +31,15 @@ pub struct Config {
     pub max_loss: f64,
     pub max_total_inventory: f64,
     pub live_order_notional_cap: f64,
+    pub enable_real_orders: String,
+    pub polymarket_clob_host: String,
+    pub poly_private_key: String,
+    pub poly_api_key: String,
+    pub poly_secret: String,
+    pub poly_passphrase: String,
+    pub poly_signature_type: String,
+    pub poly_funder_address: String,
+    pub poly_chain_id: u64,
 }
 
 impl Config {
@@ -79,6 +88,19 @@ impl Config {
             max_loss: get_f64(&file_env, "MAX_LOSS", 25.0),
             max_total_inventory: get_f64(&file_env, "MAX_TOTAL_INVENTORY", 50.0),
             live_order_notional_cap: get_f64(&file_env, "LIVE_ORDER_NOTIONAL_CAP", 5.0),
+            enable_real_orders: get(&file_env, "ENABLE_REAL_ORDERS", ""),
+            polymarket_clob_host: get(
+                &file_env,
+                "POLYMARKET_CLOB_HOST",
+                "https://clob-v2.polymarket.com",
+            ),
+            poly_private_key: get(&file_env, "POLY_PRIVATE_KEY", ""),
+            poly_api_key: get(&file_env, "POLY_API_KEY", ""),
+            poly_secret: get(&file_env, "POLY_SECRET", ""),
+            poly_passphrase: get(&file_env, "POLY_PASSPHRASE", ""),
+            poly_signature_type: get(&file_env, "POLY_SIGNATURE_TYPE", "eoa"),
+            poly_funder_address: get(&file_env, "POLY_FUNDER_ADDRESS", ""),
+            poly_chain_id: get_u64(&file_env, "POLY_CHAIN_ID", 137),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -115,6 +137,9 @@ impl Config {
         if self.max_total_inventory < 0.0 || !self.max_total_inventory.is_finite() {
             return Err("MAX_TOTAL_INVENTORY must be finite and non-negative".into());
         }
+        if self.live_order_notional_cap < 0.0 || !self.live_order_notional_cap.is_finite() {
+            return Err("LIVE_ORDER_NOTIONAL_CAP must be finite and non-negative".into());
+        }
         Ok(())
     }
 
@@ -133,8 +158,34 @@ impl Config {
     }
 
     pub fn ensure_trading_supported(&self) -> AppResult<()> {
-        if !self.dry_run {
-            return Err("真实下单接口尚未接入；当前必须保持 DRY_RUN=1".into());
+        if self.dry_run {
+            return Ok(());
+        }
+        self.ensure_real_order_config()
+    }
+
+    pub fn real_orders_enabled(&self) -> bool {
+        !self.dry_run && self.enable_real_orders == "I_UNDERSTAND_REAL_MONEY"
+    }
+
+    pub fn ensure_real_order_config(&self) -> AppResult<()> {
+        if self.enable_real_orders != "I_UNDERSTAND_REAL_MONEY" {
+            return Err(
+                "实单需要同时设置 DRY_RUN=0 和 ENABLE_REAL_ORDERS=I_UNDERSTAND_REAL_MONEY".into(),
+            );
+        }
+        if self.data_mode != "live" {
+            return Err("实单必须使用 DATA_MODE=live 真实行情".into());
+        }
+        self.ensure_live_market_config()?;
+        if self.poly_private_key.trim().is_empty() {
+            return Err("实单需要 POLY_PRIVATE_KEY，且只能放在 VPS 的 .env 里".into());
+        }
+        if self.live_order_notional_cap <= 0.0 || self.live_order_notional_cap > 25.0 {
+            return Err("实单 LIVE_ORDER_NOTIONAL_CAP 必须在 (0, 25]，先小额验证".into());
+        }
+        if self.poly_chain_id != 137 {
+            return Err("当前只支持 Polygon 主网 POLY_CHAIN_ID=137".into());
         }
         Ok(())
     }

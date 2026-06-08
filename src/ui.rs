@@ -19,6 +19,14 @@ const C_BLUE: &str = "\x1b[34m";
 const C_CYAN: &str = "\x1b[36m";
 const C_RED: &str = "\x1b[31m";
 
+const ROLES: [&str; 5] = [
+    "collector",
+    "order-gateway",
+    "quote-engine",
+    "risk-ledger",
+    "supervisor",
+];
+
 pub fn init_config(cfg: &Config) -> AppResult<()> {
     let env_path = cfg.env_file();
     if env_path.exists() {
@@ -123,10 +131,17 @@ pub fn run_dashboard(cfg: &Config, seconds: Option<u64>) -> AppResult<()> {
         print_latest_quotes(cfg)?;
         print_latest_fills(cfg)?;
         println!();
-        println!(
-            "{}按 Ctrl+C 退出监控页。当前版本为 DRY_RUN 模拟，不会真实下单。{}",
-            C_DIM, C_RESET
-        );
+        if cfg.dry_run {
+            println!(
+                "{}按 Ctrl+C 退出监控页。当前为 DRY_RUN 模拟，不会真实下单。{}",
+                C_DIM, C_RESET
+            );
+        } else {
+            println!(
+                "{}按 Ctrl+C 退出监控页。当前为 LIVE 实单模式，请确认小额限额和 kill switch。{}",
+                C_RED, C_RESET
+            );
+        }
 
         if let Some(limit) = seconds {
             if started.elapsed() >= Duration::from_secs(limit) {
@@ -168,9 +183,18 @@ fn print_status_cards(cfg: &Config) -> AppResult<()> {
         cfg.run_dir.display()
     );
     println!(
+        "{}后台:{} {}   {}停止信号:{} {}",
+        C_BOLD,
+        C_RESET,
+        service_status(cfg),
+        C_BOLD,
+        C_RESET,
+        stop_status(cfg)
+    );
+    println!(
         "{}心跳:{} {}/{} 活跃   {}库存:{} Up {:.0}+{:.0} / Down {:.0}+{:.0}   {}PnL情景:{} Up赢 {:+.2} / Down赢 {:+.2}",
         C_BOLD, C_RESET, running,
-        expected_heartbeat_count(&hbs),
+        ROLES.len(),
         C_BOLD, C_RESET, inv.up_shares, inv.pending_up, inv.down_shares, inv.pending_down,
         C_BOLD, C_RESET, inv.pnl_if_up(), inv.pnl_if_down()
     );
@@ -188,36 +212,46 @@ fn print_status_cards(cfg: &Config) -> AppResult<()> {
                 ("进程".to_string(), 18, Align::Left),
                 ("PID".to_string(), 8, Align::Right),
                 ("延迟".to_string(), 8, Align::Right),
-                ("状态".to_string(), 24, Align::Left),
+                ("运行".to_string(), 8, Align::Left),
+                ("状态".to_string(), 28, Align::Left),
             ])
         );
-        for hb in hbs {
-            let age = now.saturating_sub(hb.ts_ms);
-            let color = if age <= 3_000 { C_GREEN } else { C_RED };
+        for role in ROLES {
+            let hb = hbs.iter().find(|h| h.role == role);
+            let (pid, age, running, status) = if let Some(hb) = hb {
+                let age = now.saturating_sub(hb.ts_ms);
+                let running = if age <= 3_000 {
+                    format!("{C_GREEN}活跃{C_RESET}")
+                } else {
+                    format!("{C_RED}过期{C_RESET}")
+                };
+                (
+                    hb.pid.to_string(),
+                    format_age(age),
+                    running,
+                    hb.status.clone(),
+                )
+            } else {
+                (
+                    "-".to_string(),
+                    "-".to_string(),
+                    format!("{C_RED}缺失{C_RESET}"),
+                    "no heartbeat".to_string(),
+                )
+            };
             println!(
                 "{}",
                 table_row(&[
-                    (hb.role, 18, Align::Left),
-                    (hb.pid.to_string(), 8, Align::Right),
-                    (
-                        format!("{color}{}{C_RESET}", format_age(age)),
-                        8,
-                        Align::Right
-                    ),
-                    (hb.status, 24, Align::Left),
+                    (role.to_string(), 18, Align::Left),
+                    (pid, 8, Align::Right),
+                    (age, 8, Align::Right),
+                    (running, 8, Align::Left),
+                    (status, 28, Align::Left),
                 ])
             );
         }
     }
     Ok(())
-}
-
-fn expected_heartbeat_count(hbs: &[Heartbeat]) -> usize {
-    if hbs.iter().any(|h| h.role == "supervisor") {
-        5
-    } else {
-        4
-    }
 }
 
 fn print_latest_market(cfg: &Config) -> AppResult<()> {
@@ -322,8 +356,12 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
     }
     let keys = [
         ("DATA_MODE", "行情来源 sim/live"),
+        ("ENABLE_REAL_ORDERS", "实单确认串"),
         ("POLYMARKET_UP_TOKEN_ID", "live Up token id"),
         ("POLYMARKET_DOWN_TOKEN_ID", "live Down token id"),
+        ("POLYMARKET_CLOB_HOST", "CLOB API地址"),
+        ("POLY_SIGNATURE_TYPE", "eoa/proxy/gnosis_safe/poly1271"),
+        ("POLY_FUNDER_ADDRESS", "代理钱包/funder地址"),
         ("PRICE_TO_BEAT", "当前5分钟BTC判定价"),
         ("QUOTE_SIZE", "每次单边挂单份数"),
         ("QUOTE_SPREAD", "做市毛价差"),
@@ -378,10 +416,12 @@ fn print_param_help() {
     println!("  INVENTORY_MULT    单边最大库存 = QUOTE_SIZE * INVENTORY_MULT");
     println!("  MAX_LOSS          最坏结算情景亏损达到阈值就停止");
     println!("  MAX_TOTAL_*       Up+Down 已成交+pending 达到阈值就停止");
+    println!("  ENABLE_REAL_*     实单确认串；私钥和API凭证请手动编辑.env，不在菜单显示");
+    println!("  POLY_SIGNATURE_*  钱包签名类型；代理钱包通常是 proxy + funder");
     println!("  MIN_BID/MAX_BID   最低/最高挂买价");
     println!("  STALE_AFTER_MS    行情过期阈值，超过则停止用旧行情报价");
     println!("  WS_STALE_AFTER_MS live WS断流阈值，超过则停止");
-    println!("  DRY_RUN           当前必须为 1，本版本不会真实下单");
+    println!("  DRY_RUN           1=模拟；0=实单，还必须设置 ENABLE_REAL_ORDERS 确认串");
 }
 
 fn read_heartbeats(cfg: &Config) -> AppResult<Vec<Heartbeat>> {
@@ -401,6 +441,33 @@ fn read_heartbeats(cfg: &Config) -> AppResult<Vec<Heartbeat>> {
     }
     out.sort_by(|a, b| a.role.cmp(&b.role));
     Ok(out)
+}
+
+fn service_status(cfg: &Config) -> String {
+    let Some(pid) = read_pid(&cfg.pid_file()) else {
+        return format!("{C_RED}未运行{C_RESET}");
+    };
+    if process_alive(pid) {
+        format!("{C_GREEN}运行中 pid={pid}{C_RESET}")
+    } else {
+        format!("{C_RED}pid={pid} 已退出{C_RESET}")
+    }
+}
+
+fn stop_status(cfg: &Config) -> String {
+    if cfg.stop_file().exists() {
+        format!("{C_YELLOW}存在{C_RESET}")
+    } else {
+        format!("{C_GREEN}无{C_RESET}")
+    }
+}
+
+fn read_pid(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
+}
+
+fn process_alive(pid: u32) -> bool {
+    Path::new(&format!("/proc/{pid}")).exists()
 }
 
 fn tail_jsonl<T: DeserializeOwned>(path: &Path, n: usize) -> AppResult<Vec<T>> {

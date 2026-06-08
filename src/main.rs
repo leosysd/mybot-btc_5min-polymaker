@@ -1,6 +1,7 @@
 mod config;
 mod ipc;
 mod pricing;
+mod real_orders;
 mod ui;
 mod workers;
 
@@ -73,7 +74,7 @@ fn print_usage() {
   polymaker start                     后台启动完整多进程\n\
   polymaker collector                 启动模拟行情采集进程\n\
   polymaker quote-engine              启动 fair value/报价进程\n\
-  polymaker order-gateway             启动 dry-run 下单网关进程\n\
+  polymaker order-gateway             启动下单网关进程\n\
   polymaker risk-ledger               启动库存/风控账本进程\n\
   polymaker dashboard [--seconds N]   打开交易监控页\n\
   polymaker menu                      打开中文交互菜单\n\

@@ -2,7 +2,7 @@
 
 这是一个 **Rust 多进程 BTC 5 分钟二元市场做市机器人骨架**。
 
-当前版本是低延迟架构骨架，默认 **DRY_RUN 模拟模式**，不会真实下单。已经支持 `DATA_MODE=live` 读取真实 Polymarket market WebSocket + Binance BTC WebSocket 行情；真实下单仍被安全闸门拦住，不能误下真钱。
+当前版本是低延迟架构骨架，默认 **DRY_RUN 模拟模式**，不会真实下单。已经支持 `DATA_MODE=live` 读取真实 Polymarket market WebSocket + Binance BTC WebSocket 行情，也接入了官方 Rust CLOB SDK 的 post-only 买单/撤单路径。实单需要双重确认开关和小额限额。
 
 ## 架构
 
@@ -17,7 +17,7 @@ collector      -> quote-engine -> order-gateway -> risk-ledger
 
 - `collector`：采集行情。`DATA_MODE=sim` 用本地模拟数据；`DATA_MODE=live` 用 Polymarket market WS + Binance BTC WS。
 - `quote-engine`：计算 fair value、Up/Down 双边报价、库存偏移。
-- `order-gateway`：下单热路径。当前是 DRY_RUN 网关，带撤单/改单状态机；以后真实 SDK 下单、签名、撤单、HTTP 保活都放这里。
+- `order-gateway`：下单热路径。DRY_RUN 时走模拟撮合；实单时走官方 Rust CLOB SDK，发 post-only BUY limit，并按状态机撤旧换新。
 - `risk-ledger`：记录成交、库存、两种结算情景下的 PnL，并把库存反馈给报价引擎；同时执行 kill switch。
 - `supervisor`：启动并守护上面 4 个进程。
 
@@ -302,7 +302,16 @@ polymaker stop
 DRY_RUN=1
 ```
 
-必须保持 `1`。当前版本没有真实下单实现，不能实盘。
+默认保持 `1`，只模拟。要实单必须同时满足：
+
+```text
+DRY_RUN=0
+ENABLE_REAL_ORDERS=I_UNDERSTAND_REAL_MONEY
+DATA_MODE=live
+LIVE_ORDER_NOTIONAL_CAP=5
+```
+
+实单只发 post-only BUY limit，不主动吃单；`LIVE_ORDER_NOTIONAL_CAP` 必须在 `(0, 25]`，先小额验证。
 
 ```text
 DATA_MODE=sim
@@ -322,6 +331,24 @@ PRICE_TO_BEAT=68000
 ```
 
 `POLYMARKET_UP_TOKEN_ID` / `POLYMARKET_DOWN_TOKEN_ID` 是当前 5 分钟市场的两个 CLOB token id。`PRICE_TO_BEAT` 是这个 5 分钟市场的判定价/开盘价，必须按当前市场问题填写。
+
+实单还需要在 VPS 的 `.env` 里手动填：
+
+```text
+POLY_PRIVATE_KEY=
+POLY_SIGNATURE_TYPE=proxy
+POLY_FUNDER_ADDRESS=
+```
+
+如果你已经有 L2 API 凭证，也可以填：
+
+```text
+POLY_API_KEY=
+POLY_SECRET=
+POLY_PASSPHRASE=
+```
+
+不填 L2 凭证时，SDK 会用私钥创建或派生 API key。不要把 `.env` 或私钥提交到 GitHub。
 
 ```text
 QUOTE_SIZE=5
@@ -402,7 +429,7 @@ LIVE_ORDER_NOTIONAL_CAP=5
 - `WS_STALE_AFTER_MS`：live WS 断流超过阈值，写入停止信号。
 - `MAX_LOSS`：最坏结算情景亏损达到阈值，停止服务。
 - `MAX_TOTAL_INVENTORY`：Up+Down 已成交+pending 总库存达到阈值，停止服务。
-- `LIVE_ORDER_NOTIONAL_CAP`：未来打开真实下单时的单笔名义金额上限；当前 DRY_RUN 也会按它截断模拟挂单。
+- `LIVE_ORDER_NOTIONAL_CAP`：真实下单单笔名义金额上限；当前 DRY_RUN 也会按它截断模拟挂单。
 
 ## 做市逻辑
 
@@ -421,17 +448,16 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 当前版本还没有接入：
 
-- 真实 Polymarket CLOB SDK 下单
-- 真实私钥签名
 - 真实订单回报 user channel
-- 真实下单/撤单 HTTP 状态同步
+- 真实成交自动入账同步
 - 自动发现当前 5 分钟 BTC 市场 token id
 - Web dashboard 页面
 
 已经接入/优化：
 
 - `DATA_MODE=live` 真实 Polymarket market WS + Binance BTC WS 行情。
-- DRY_RUN 网关撤单/改单状态机。
+- 官方 Rust CLOB SDK post-only 下单/撤单。
+- DRY_RUN/实单共用撤单/改单状态机。
 - pending 库存风控。
 - kill switch：最大亏损、最大库存、行情过期、WS 断流。
 - CLI dashboard 对齐显示。
@@ -441,9 +467,9 @@ LIVE_ORDER_NOTIONAL_CAP=5
 优先顺序：
 
 1. 自动发现当前 5 分钟 BTC 市场，并自动填充 Up/Down token id 与 `PRICE_TO_BEAT`。
-2. 接 Polymarket user channel，拿真实订单成交/取消回报做 DRY_RUN 对照。
-3. 把 `order-gateway` 接官方 Rust CLOB SDK，但先只允许小额、手动确认、DRY_RUN shadow。
+2. 接 Polymarket user channel，拿真实订单成交/取消回报做自动入账。
+3. 把实单成交同步接入 `risk-ledger`，替换当前“pending + 撤单释放”的保守账本。
 4. 做 Web dashboard 页面。
-5. 最后才考虑关闭 `DRY_RUN`，并且必须有私钥隔离、限额和 kill switch。
+5. 长时间小额验证后再考虑提高 `LIVE_ORDER_NOTIONAL_CAP`。
 
 不要把私钥写进仓库。真实私钥只放 VPS 的 `.env` 或系统 secret。

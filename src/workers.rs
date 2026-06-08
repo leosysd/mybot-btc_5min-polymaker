@@ -6,6 +6,7 @@ mod unix {
         MarketFrame, OrderAccepted, OrderCancelled, QuoteIntent, WireMessage,
     };
     use crate::pricing::{market_maker_bids, normal_cdf, post_only_bid};
+    use crate::real_orders::RealOrderClient;
     use crate::AppResult;
     use serde_json::Value;
     use std::collections::HashMap;
@@ -213,9 +214,14 @@ mod unix {
         let mut buf = [0u8; 16 * 1024];
         let mut rng = FastRng::new(now_ms());
         let mut resting: HashMap<String, RestingOrder> = HashMap::new();
+        let real_orders = if cfg.real_orders_enabled() {
+            Some(RealOrderClient::connect(&cfg)?)
+        } else {
+            None
+        };
 
         while !should_stop(&cfg) {
-            expire_resting_orders(&cfg, &sock, &mut resting)?;
+            expire_resting_orders(&cfg, &sock, real_orders.as_ref(), &mut resting)?;
             match recv_msg(&sock, &mut buf)? {
                 Some(WireMessage::QuoteIntent(quote)) => {
                     if should_keep_resting(&cfg, resting.get(&quote.side), &quote) {
@@ -223,12 +229,18 @@ mod unix {
                         continue;
                     }
                     if let Some(old) = resting.remove(&quote.side) {
-                        send_cancel(&cfg, &sock, old, "requote")?;
+                        send_cancel(&cfg, &sock, real_orders.as_ref(), old, "requote")?;
                     }
-                    if !accept_resting_order(&cfg, &sock, &mut resting, quote.clone())? {
+                    if !accept_resting_order(
+                        &cfg,
+                        &sock,
+                        real_orders.as_ref(),
+                        &mut resting,
+                        quote.clone(),
+                    )? {
                         continue;
                     }
-                    if rng.next_unit() <= cfg.sim_fill_chance {
+                    if real_orders.is_none() && rng.next_unit() <= cfg.sim_fill_chance {
                         let fill = FillEvent {
                             quote_id: quote.quote_id.clone(),
                             ts_ms: now_ms(),
@@ -246,6 +258,8 @@ mod unix {
                         send_msg(&sock, &cfg.risk_socket(), &risk)?;
                         resting.remove(&quote.side);
                         heartbeat(&cfg, "order-gateway", "simulated fill")?;
+                    } else if real_orders.is_some() {
+                        heartbeat(&cfg, "order-gateway", "real order resting")?;
                     } else {
                         heartbeat(&cfg, "order-gateway", "resting quote")?;
                     }
@@ -803,6 +817,7 @@ mod unix {
 
     struct RestingOrder {
         quote_id: String,
+        exchange_order_id: Option<String>,
         market: String,
         side: String,
         price: f64,
@@ -831,6 +846,7 @@ mod unix {
     fn accept_resting_order(
         cfg: &Config,
         sock: &UnixDatagram,
+        real_orders: Option<&RealOrderClient>,
         resting: &mut HashMap<String, RestingOrder>,
         mut quote: QuoteIntent,
     ) -> AppResult<bool> {
@@ -842,17 +858,33 @@ mod unix {
             }
             quote.size = quote.size.min(capped_size);
         }
+        let exchange_order_id = if let Some(real_orders) = real_orders {
+            let ack = real_orders.place_buy_limit(&quote)?;
+            heartbeat(
+                cfg,
+                "order-gateway",
+                format!("real order {} {}", ack.order_id, ack.status),
+            )?;
+            Some(ack.order_id)
+        } else {
+            None
+        };
         let expires_ts_ms = now_ms() + cfg.quote_ttl_ms;
         let accepted = OrderAccepted {
             accepted_ts_ms: now_ms(),
             expires_ts_ms,
             quote: quote.clone(),
-            source: "dry_run_gateway".to_string(),
+            source: if real_orders.is_some() {
+                "polymarket_clob".to_string()
+            } else {
+                "dry_run_gateway".to_string()
+            },
         };
         resting.insert(
             quote.side.clone(),
             RestingOrder {
                 quote_id: quote.quote_id.clone(),
+                exchange_order_id,
                 market: quote.market.clone(),
                 side: quote.side.clone(),
                 price: quote.price,
@@ -871,6 +903,7 @@ mod unix {
     fn expire_resting_orders(
         cfg: &Config,
         sock: &UnixDatagram,
+        real_orders: Option<&RealOrderClient>,
         resting: &mut HashMap<String, RestingOrder>,
     ) -> AppResult<()> {
         let now = now_ms();
@@ -880,7 +913,7 @@ mod unix {
             .collect::<Vec<_>>();
         for side in expired {
             if let Some(order) = resting.remove(&side) {
-                send_cancel(cfg, sock, order, "expired")?;
+                send_cancel(cfg, sock, real_orders, order, "expired")?;
             }
         }
         Ok(())
@@ -889,9 +922,20 @@ mod unix {
     fn send_cancel(
         cfg: &Config,
         sock: &UnixDatagram,
+        real_orders: Option<&RealOrderClient>,
         order: RestingOrder,
         reason: &str,
     ) -> AppResult<()> {
+        if let (Some(real_orders), Some(exchange_order_id)) =
+            (real_orders, order.exchange_order_id.as_deref())
+        {
+            real_orders.cancel_order(exchange_order_id)?;
+            heartbeat(
+                cfg,
+                "order-gateway",
+                format!("real cancel {exchange_order_id}"),
+            )?;
+        }
         let cancel = OrderCancelled {
             ts_ms: now_ms(),
             quote_id: order.quote_id,
@@ -899,7 +943,11 @@ mod unix {
             side: order.side,
             size: order.size,
             reason: reason.to_string(),
-            source: "dry_run_gateway".to_string(),
+            source: if real_orders.is_some() {
+                "polymarket_clob".to_string()
+            } else {
+                "dry_run_gateway".to_string()
+            },
         };
         send_msg(
             sock,
