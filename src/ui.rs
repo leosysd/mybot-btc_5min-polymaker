@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::ipc::{now_ms, read_json, FillEvent, Heartbeat, Inventory, MarketFrame, QuoteIntent};
+use crate::ipc::{now_ms, FillEvent, Heartbeat, Inventory, MarketFrame, QuoteIntent};
 use crate::workers;
 use crate::AppResult;
 use serde::de::DeserializeOwned;
@@ -177,7 +177,7 @@ pub fn run_dashboard(cfg: &Config, seconds: Option<u64>) -> AppResult<()> {
 }
 
 fn print_status_cards(cfg: &Config) -> AppResult<()> {
-    let inv = read_json::<Inventory>(&cfg.inventory_path())?.unwrap_or_default();
+    let inv = read_dashboard_json::<Inventory>(&cfg.inventory_path()).unwrap_or_default();
     let hbs = read_heartbeats(cfg)?;
     let now = now_ms();
     let running = hbs
@@ -634,7 +634,7 @@ fn configure_real_account(cfg: &Config) -> AppResult<()> {
     upsert_env_if_missing(
         &cfg.env_file(),
         "POLYMARKET_CLOB_HOST",
-        "https://clob-v2.polymarket.com",
+        "https://clob.polymarket.com",
     )?;
     upsert_env_if_missing(&cfg.env_file(), "POLY_CHAIN_ID", "137")?;
     println!("账户配置已写入 .env。");
@@ -766,7 +766,7 @@ fn read_heartbeats(cfg: &Config) -> AppResult<Vec<Heartbeat>> {
         if entry.path().extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        if let Some(hb) = read_json::<Heartbeat>(&entry.path())? {
+        if let Some(hb) = read_dashboard_json::<Heartbeat>(&entry.path()) {
             out.push(hb);
         }
     }
@@ -840,6 +840,11 @@ fn tail_jsonl<T: DeserializeOwned>(path: &Path, n: usize) -> AppResult<Vec<T>> {
     Ok(out)
 }
 
+fn read_dashboard_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<T>(&raw).ok()
+}
+
 fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "DRY_RUN", "1")?;
     upsert_env_if_missing(path, "ENABLE_REAL_ORDERS", "")?;
@@ -873,11 +878,7 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_blank(path, "BINANCE_REST_URL", "https://api.binance.com")?;
     upsert_env_if_missing(path, "POLYMARKET_UP_TOKEN_ID", "")?;
     upsert_env_if_missing(path, "POLYMARKET_DOWN_TOKEN_ID", "")?;
-    upsert_env_if_blank(
-        path,
-        "POLYMARKET_CLOB_HOST",
-        "https://clob-v2.polymarket.com",
-    )?;
+    upsert_env_if_blank(path, "POLYMARKET_CLOB_HOST", "https://clob.polymarket.com")?;
     upsert_env_if_blank(path, "POLY_CHAIN_ID", "137")?;
     upsert_env_if_missing(path, "POLY_PRIVATE_KEY", "")?;
     upsert_env_if_missing(path, "POLY_API_KEY", "")?;

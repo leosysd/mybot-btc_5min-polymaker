@@ -124,7 +124,7 @@ ensure_env_defaults() {
     append_env_line POLYMARKET_USER_WS_URL "" "POLYMARKET_USER_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws/user"
     append_env_line BINANCE_WS_URL "" "BINANCE_WS_URL=wss://stream.binance.com:9443/ws/btcusdt@trade"
     append_env_line BINANCE_REST_URL "" "BINANCE_REST_URL=https://api.binance.com"
-    append_env_line POLYMARKET_CLOB_HOST "# 真实 CLOB 下单配置。不要把私钥提交到 GitHub。" "POLYMARKET_CLOB_HOST=https://clob-v2.polymarket.com"
+    append_env_line POLYMARKET_CLOB_HOST "# 真实 CLOB 下单配置。不要把私钥提交到 GitHub。" "POLYMARKET_CLOB_HOST=https://clob.polymarket.com"
     append_env_line POLY_CHAIN_ID "" "POLY_CHAIN_ID=137"
     append_env_line POLY_PRIVATE_KEY "" "POLY_PRIVATE_KEY="
     append_env_line POLY_API_KEY "" "POLY_API_KEY="

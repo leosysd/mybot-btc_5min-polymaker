@@ -114,7 +114,7 @@ impl Config {
             polymarket_clob_host: get(
                 &file_env,
                 "POLYMARKET_CLOB_HOST",
-                "https://clob-v2.polymarket.com",
+                "https://clob.polymarket.com",
             ),
             poly_private_key: get(&file_env, "POLY_PRIVATE_KEY", ""),
             poly_api_key: get(&file_env, "POLY_API_KEY", ""),
