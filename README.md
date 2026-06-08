@@ -106,8 +106,11 @@ polymaker menu
 
 菜单里可以做这些事：
 
-- 初始化 `.env` 配置
-- 调整做市参数
+- 初始化/修复 `.env` 配置
+- 切换本地模拟、真实行情模拟、实单模式
+- 填 Polymarket 私钥、签名类型、funder 地址和 L2 API 凭证
+- 填当前 5 分钟市场 Up/Down token id 与判定价
+- 调整做市和风控参数
 - 查看当前状态
 - 打开交易监控页
 - 试跑 15 秒模拟做市
@@ -334,7 +337,7 @@ PRICE_TO_BEAT=68000
 
 `POLYMARKET_UP_TOKEN_ID` / `POLYMARKET_DOWN_TOKEN_ID` 是当前 5 分钟市场的两个 CLOB token id。`PRICE_TO_BEAT` 是这个 5 分钟市场的判定价/开盘价，必须按当前市场问题填写。
 
-实单还需要在 VPS 的 `.env` 里手动填：
+实单还需要填 Polymarket 账户信息。可以直接在 `polymaker menu` 的 `2. 切换模拟/实单 + 填 Polymarket 账户` 里输入，不需要手动翻 `.env`：
 
 ```text
 POLY_PRIVATE_KEY=
@@ -351,6 +354,12 @@ POLY_PASSPHRASE=
 ```
 
 不填 L2 凭证时，SDK 会用私钥创建或派生 API key。不要把 `.env` 或私钥提交到 GitHub。
+
+菜单 2 的三个常用切换：
+
+- 本地模拟：`DATA_MODE=sim`、`DRY_RUN=1`，完全不下单。
+- 真实行情模拟：`DATA_MODE=live`、`DRY_RUN=1`，读取真实行情但不下单。
+- 实单模式：`DATA_MODE=live`、`DRY_RUN=0`、`ENABLE_REAL_ORDERS=I_UNDERSTAND_REAL_MONEY`，走 Polymarket CLOB SDK 下单。
 
 ```text
 QUOTE_SIZE=5

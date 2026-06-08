@@ -123,7 +123,7 @@ ensure_env_defaults() {
     append_env_line POLY_API_KEY "" "POLY_API_KEY="
     append_env_line POLY_SECRET "" "POLY_SECRET="
     append_env_line POLY_PASSPHRASE "" "POLY_PASSPHRASE="
-    append_env_line POLY_SIGNATURE_TYPE "# eoa / proxy / gnosis_safe / poly1271。多数 Polymarket 代理钱包用 proxy。" "POLY_SIGNATURE_TYPE=eoa"
+    append_env_line POLY_SIGNATURE_TYPE "# eoa / proxy / gnosis_safe / poly1271。多数 Polymarket 账户/代理钱包用 proxy。" "POLY_SIGNATURE_TYPE=proxy"
     append_env_line POLY_FUNDER_ADDRESS "" "POLY_FUNDER_ADDRESS="
     append_env_line PRICE_TO_BEAT "# 当前 5 分钟 BTC 市场的判定价/开盘价。live 模式要按市场问题填写。" "PRICE_TO_BEAT=68000"
   fi

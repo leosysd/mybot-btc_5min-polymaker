@@ -18,6 +18,7 @@ const C_YELLOW: &str = "\x1b[33m";
 const C_BLUE: &str = "\x1b[34m";
 const C_CYAN: &str = "\x1b[36m";
 const C_RED: &str = "\x1b[31m";
+const REAL_ORDER_CONFIRMATION: &str = "I_UNDERSTAND_REAL_MONEY";
 
 const ROLES: [&str; 5] = [
     "collector",
@@ -28,76 +29,98 @@ const ROLES: [&str; 5] = [
 ];
 
 pub fn init_config(cfg: &Config) -> AppResult<()> {
+    repair_env_config(cfg)
+}
+
+fn repair_env_config(cfg: &Config) -> AppResult<()> {
     let env_path = cfg.env_file();
-    if env_path.exists() {
-        println!(".env 已存在，不覆盖。需要重置时先手动备份/删除 .env。");
-        return Ok(());
+    let mut created = false;
+    if !env_path.exists() {
+        fs::copy(cfg.env_example_file(), &env_path)?;
+        created = true;
     }
-    fs::copy(cfg.env_example_file(), &env_path)?;
-    println!("已创建 {}，请按需要修改参数。", env_path.display());
+
+    ensure_cli_defaults(&env_path)?;
+    if created {
+        println!("已创建 {}，并补齐默认配置。", env_path.display());
+    } else {
+        println!(
+            "{} 已存在，已保留原值并补齐 CLI 需要的缺失字段。",
+            env_path.display()
+        );
+    }
     Ok(())
 }
 
 pub fn run_menu(cfg: &Config) -> AppResult<()> {
     loop {
+        let active_cfg = Config::from_env().unwrap_or_else(|_| cfg.clone());
         clear_screen();
         print_banner("POLYMAKER 控制台");
-        print_status_cards(cfg)?;
+        print_status_cards(&active_cfg)?;
         println!();
         println!("{}选择操作{}", C_BOLD, C_RESET);
-        println!("  {}1.{} 初始化 .env 配置", C_GREEN, C_RESET);
-        println!("  {}2.{} 调整做市参数", C_GREEN, C_RESET);
-        println!("  {}3.{} 查看当前状态", C_GREEN, C_RESET);
-        println!("  {}4.{} 打开交易监控页", C_GREEN, C_RESET);
-        println!("  {}5.{} 试跑 15 秒模拟做市", C_GREEN, C_RESET);
-        println!("  {}6.{} 后台启动服务", C_GREEN, C_RESET);
-        println!("  {}7.{} 停止服务", C_GREEN, C_RESET);
-        println!("  {}8.{} 重启服务", C_GREEN, C_RESET);
-        println!("  {}9.{} 清空运行数据", C_GREEN, C_RESET);
-        println!("  {}10.{} 参数说明", C_GREEN, C_RESET);
+        println!("  {}1.{} 初始化/修复 .env 配置", C_GREEN, C_RESET);
+        println!(
+            "  {}2.{} 切换模拟/实单 + 填 Polymarket 账户",
+            C_GREEN, C_RESET
+        );
+        println!("  {}3.{} 调整做市参数", C_GREEN, C_RESET);
+        println!("  {}4.{} 查看当前状态", C_GREEN, C_RESET);
+        println!("  {}5.{} 打开交易监控页", C_GREEN, C_RESET);
+        println!("  {}6.{} 试跑 15 秒模拟做市", C_GREEN, C_RESET);
+        println!("  {}7.{} 后台启动服务", C_GREEN, C_RESET);
+        println!("  {}8.{} 停止服务", C_GREEN, C_RESET);
+        println!("  {}9.{} 重启服务", C_GREEN, C_RESET);
+        println!("  {}10.{} 清空运行数据", C_GREEN, C_RESET);
+        println!("  {}11.{} 参数说明", C_GREEN, C_RESET);
         println!("  {}0.{} 退出", C_GREEN, C_RESET);
         println!();
 
         match prompt("输入编号")?.trim() {
             "1" => {
-                init_config(cfg)?;
+                repair_env_config(&active_cfg)?;
                 pause()?;
             }
             "2" => {
-                edit_market_maker_params(cfg)?;
+                configure_trading_profile(&active_cfg)?;
                 pause()?;
             }
             "3" => {
-                clear_screen();
-                print_status(cfg)?;
+                edit_market_maker_params(&active_cfg)?;
                 pause()?;
             }
             "4" => {
-                run_dashboard(cfg, None)?;
+                clear_screen();
+                print_status(&active_cfg)?;
+                pause()?;
             }
             "5" => {
+                run_dashboard(&active_cfg, None)?;
+            }
+            "6" => {
                 run_smoke_test()?;
                 pause()?;
             }
-            "6" => {
-                workers::start_background(cfg)?;
-                pause()?;
-            }
             "7" => {
-                workers::write_stop(cfg)?;
-                println!("已写入停止信号。");
+                workers::start_background(&active_cfg)?;
                 pause()?;
             }
             "8" => {
-                workers::restart_background(cfg)?;
+                workers::write_stop(&active_cfg)?;
+                println!("已写入停止信号。");
                 pause()?;
             }
             "9" => {
-                workers::clean_run_dir(cfg)?;
-                println!("已清空 {}", cfg.run_dir.display());
+                workers::restart_background(&active_cfg)?;
                 pause()?;
             }
             "10" => {
+                workers::clean_run_dir(&active_cfg)?;
+                println!("已清空 {}", active_cfg.run_dir.display());
+                pause()?;
+            }
+            "11" => {
                 print_param_help();
                 pause()?;
             }
@@ -161,7 +184,9 @@ fn print_status_cards(cfg: &Config) -> AppResult<()> {
         .iter()
         .filter(|h| now.saturating_sub(h.ts_ms) <= 3_000)
         .count();
-    let mode = if cfg.dry_run {
+    let mode = if cfg.dry_run && cfg.data_mode == "live" {
+        format!("{C_YELLOW}LIVE行情模拟{C_RESET}")
+    } else if cfg.dry_run {
         format!("{C_YELLOW}DRY_RUN{C_RESET}")
     } else {
         format!("{C_RED}LIVE{C_RESET}")
@@ -350,19 +375,305 @@ fn print_latest_fills(cfg: &Config) -> AppResult<()> {
     Ok(())
 }
 
+fn configure_trading_profile(cfg: &Config) -> AppResult<()> {
+    repair_env_config(cfg)?;
+    loop {
+        clear_screen();
+        print_banner("模式 / 账户配置");
+        print_env_profile(cfg)?;
+        println!();
+        println!("{}选择配置{}", C_BOLD, C_RESET);
+        println!(
+            "  {}1.{} 切到本地模拟：sim 行情 + DRY_RUN，不下单",
+            C_GREEN, C_RESET
+        );
+        println!(
+            "  {}2.{} 切到真实行情模拟：live 行情 + DRY_RUN，不下单",
+            C_GREEN, C_RESET
+        );
+        println!(
+            "  {}3.{} 切到实单模式：live 行情 + Polymarket 真下单",
+            C_RED, C_RESET
+        );
+        println!(
+            "  {}4.{} 填 Polymarket 私钥 / 钱包地址 / L2 API",
+            C_GREEN, C_RESET
+        );
+        println!(
+            "  {}5.{} 填当前 5 分钟市场 token 和判定价",
+            C_GREEN, C_RESET
+        );
+        println!("  {}0.{} 返回上级菜单", C_GREEN, C_RESET);
+        println!();
+
+        match prompt("输入编号")?.trim() {
+            "1" => {
+                switch_to_sim_mode(cfg)?;
+                maybe_restart_background(cfg)?;
+                return Ok(());
+            }
+            "2" => {
+                switch_to_live_dry_run(cfg)?;
+                configure_live_market(cfg)?;
+                maybe_restart_background(cfg)?;
+                return Ok(());
+            }
+            "3" => {
+                configure_real_account(cfg)?;
+                configure_live_market(cfg)?;
+                if let Err(err) = switch_to_real_mode(cfg) {
+                    println!("{C_RED}未切到实单：{err}{C_RESET}");
+                    println!("已保留当前模式。补齐后再选择 3 切到实单。");
+                    pause()?;
+                    continue;
+                }
+                maybe_restart_background(cfg)?;
+                return Ok(());
+            }
+            "4" => {
+                configure_real_account(cfg)?;
+                pause()?;
+            }
+            "5" => {
+                configure_live_market(cfg)?;
+                pause()?;
+            }
+            "0" => return Ok(()),
+            _ => {
+                println!("无效选择。");
+                pause()?;
+            }
+        }
+    }
+}
+
+fn print_env_profile(cfg: &Config) -> AppResult<()> {
+    let path = cfg.env_file();
+    let dry_run = env_value(&path, "DRY_RUN").unwrap_or_else(|| "1".to_string());
+    let data_mode = env_value(&path, "DATA_MODE").unwrap_or_else(|| "sim".to_string());
+    let enable_real = env_value(&path, "ENABLE_REAL_ORDERS").unwrap_or_default();
+    let real_ready = enable_real == REAL_ORDER_CONFIRMATION;
+    let private_key = secret_state(&path, "POLY_PRIVATE_KEY");
+    let api_key = secret_state(&path, "POLY_API_KEY");
+    let funder = env_value(&path, "POLY_FUNDER_ADDRESS").unwrap_or_default();
+    let up = env_value(&path, "POLYMARKET_UP_TOKEN_ID").unwrap_or_default();
+    let down = env_value(&path, "POLYMARKET_DOWN_TOKEN_ID").unwrap_or_default();
+    let price = env_value(&path, "PRICE_TO_BEAT").unwrap_or_else(|| "68000".to_string());
+    let signature = env_value(&path, "POLY_SIGNATURE_TYPE").unwrap_or_else(|| "proxy".to_string());
+
+    let mode = if dry_run == "0" && real_ready {
+        format!("{C_RED}实单{C_RESET}")
+    } else if data_mode == "live" {
+        format!("{C_YELLOW}真实行情模拟{C_RESET}")
+    } else {
+        format!("{C_GREEN}本地模拟{C_RESET}")
+    };
+
+    println!("{}当前模式:{} {}", C_BOLD, C_RESET, mode);
+    println!(
+        "{}开关:{} DRY_RUN={}  DATA_MODE={}  ENABLE_REAL_ORDERS={}",
+        C_BOLD,
+        C_RESET,
+        dry_run,
+        data_mode,
+        if real_ready { "已确认" } else { "未开启" }
+    );
+    println!(
+        "{}账户:{} 私钥={}  L2 API={}  签名类型={}  funder={}",
+        C_BOLD,
+        C_RESET,
+        private_key,
+        api_key,
+        signature,
+        if funder.is_empty() {
+            "(未填)"
+        } else {
+            "(已填)"
+        }
+    );
+    println!(
+        "{}市场:{} UpToken={}  DownToken={}  PRICE_TO_BEAT={}",
+        C_BOLD,
+        C_RESET,
+        if up.is_empty() {
+            "(未填)"
+        } else {
+            "(已填)"
+        },
+        if down.is_empty() {
+            "(未填)"
+        } else {
+            "(已填)"
+        },
+        price
+    );
+    println!(
+        "{}提醒:{} 实单必须填当前 5 分钟市场 token；当前版本还不会自动每 5 分钟换市场。",
+        C_DIM, C_RESET
+    );
+    Ok(())
+}
+
+fn switch_to_sim_mode(cfg: &Config) -> AppResult<()> {
+    ensure_cli_defaults(&cfg.env_file())?;
+    upsert_env(&cfg.env_file(), "DRY_RUN", "1")?;
+    upsert_env(&cfg.env_file(), "ENABLE_REAL_ORDERS", "")?;
+    upsert_env(&cfg.env_file(), "DATA_MODE", "sim")?;
+    println!("已切到本地模拟：sim 行情 + DRY_RUN，不会真实下单。");
+    Ok(())
+}
+
+fn switch_to_live_dry_run(cfg: &Config) -> AppResult<()> {
+    ensure_cli_defaults(&cfg.env_file())?;
+    upsert_env(&cfg.env_file(), "DRY_RUN", "1")?;
+    upsert_env(&cfg.env_file(), "ENABLE_REAL_ORDERS", "")?;
+    upsert_env(&cfg.env_file(), "DATA_MODE", "live")?;
+    println!("已切到真实行情模拟：live 行情 + DRY_RUN，不会真实下单。");
+    Ok(())
+}
+
+fn switch_to_real_mode(cfg: &Config) -> AppResult<()> {
+    ensure_cli_defaults(&cfg.env_file())?;
+    upsert_env(&cfg.env_file(), "POLY_SIGNATURE_TYPE", "proxy")?;
+    ensure_real_inputs_present(cfg)?;
+    upsert_env(&cfg.env_file(), "DRY_RUN", "0")?;
+    upsert_env(
+        &cfg.env_file(),
+        "ENABLE_REAL_ORDERS",
+        REAL_ORDER_CONFIRMATION,
+    )?;
+    upsert_env(&cfg.env_file(), "DATA_MODE", "live")?;
+    println!("已切到实单模式：live 行情 + Polymarket 真下单。");
+    println!("请确认 `LIVE_ORDER_NOTIONAL_CAP`、`MAX_LOSS`、`MAX_TOTAL_INVENTORY` 仍是小额。");
+    Ok(())
+}
+
+fn ensure_real_inputs_present(cfg: &Config) -> AppResult<()> {
+    let path = cfg.env_file();
+    let mut missing = Vec::new();
+    for (key, label) in [
+        ("POLY_PRIVATE_KEY", "私钥"),
+        ("POLYMARKET_UP_TOKEN_ID", "Up token id"),
+        ("POLYMARKET_DOWN_TOKEN_ID", "Down token id"),
+        ("PRICE_TO_BEAT", "BTC 判定价/开盘价"),
+    ] {
+        if env_value(&path, key).is_none_or(|v| v.trim().is_empty()) {
+            missing.push(format!("{key}({label})"));
+        }
+    }
+
+    let signature = env_value(&path, "POLY_SIGNATURE_TYPE").unwrap_or_else(|| "proxy".to_string());
+    if signature.trim() != "eoa"
+        && env_value(&path, "POLY_FUNDER_ADDRESS").is_none_or(|v| v.trim().is_empty())
+    {
+        missing.push("POLY_FUNDER_ADDRESS(proxy/funder地址)".to_string());
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("缺少 {}", missing.join("、")).into())
+    }
+}
+
+fn configure_real_account(cfg: &Config) -> AppResult<()> {
+    ensure_cli_defaults(&cfg.env_file())?;
+    println!("直接回车表示保留原值；输入 CLEAR 表示清空该项。");
+    println!("私钥不会回显。Polymarket 网站账户通常用 signature type=proxy。");
+
+    let private_key = prompt_secret(&format!(
+        "POLY_PRIVATE_KEY 当前={}  钱包私钥",
+        secret_state(&cfg.env_file(), "POLY_PRIVATE_KEY")
+    ))?;
+    apply_optional_env(&cfg.env_file(), "POLY_PRIVATE_KEY", &private_key)?;
+
+    let current_signature =
+        env_value(&cfg.env_file(), "POLY_SIGNATURE_TYPE").unwrap_or_else(|| "proxy".to_string());
+    let signature = prompt(&format!(
+        "POLY_SIGNATURE_TYPE 当前={}  eoa/proxy/gnosis_safe/poly1271，Polymarket账户建议proxy",
+        current_signature
+    ))?;
+    if signature.trim().is_empty() && current_signature.trim().is_empty() {
+        upsert_env(&cfg.env_file(), "POLY_SIGNATURE_TYPE", "proxy")?;
+    } else {
+        apply_optional_env(&cfg.env_file(), "POLY_SIGNATURE_TYPE", &signature)?;
+    }
+
+    let funder_current = public_state(&cfg.env_file(), "POLY_FUNDER_ADDRESS");
+    let funder = prompt(&format!(
+        "POLY_FUNDER_ADDRESS 当前={}  Polymarket代理钱包/funder地址",
+        funder_current
+    ))?;
+    apply_optional_env(&cfg.env_file(), "POLY_FUNDER_ADDRESS", &funder)?;
+
+    println!();
+    println!("L2 API 凭证可以先不填；不填时 SDK 会尝试用私钥创建/派生。");
+    let api_key = prompt_secret(&format!(
+        "POLY_API_KEY 当前={}  L2 API key",
+        secret_state(&cfg.env_file(), "POLY_API_KEY")
+    ))?;
+    apply_optional_env(&cfg.env_file(), "POLY_API_KEY", &api_key)?;
+    let secret = prompt_secret(&format!(
+        "POLY_SECRET 当前={}  L2 secret",
+        secret_state(&cfg.env_file(), "POLY_SECRET")
+    ))?;
+    apply_optional_env(&cfg.env_file(), "POLY_SECRET", &secret)?;
+    let passphrase = prompt_secret(&format!(
+        "POLY_PASSPHRASE 当前={}  L2 passphrase",
+        secret_state(&cfg.env_file(), "POLY_PASSPHRASE")
+    ))?;
+    apply_optional_env(&cfg.env_file(), "POLY_PASSPHRASE", &passphrase)?;
+
+    upsert_env_if_missing(
+        &cfg.env_file(),
+        "POLYMARKET_CLOB_HOST",
+        "https://clob-v2.polymarket.com",
+    )?;
+    upsert_env_if_missing(&cfg.env_file(), "POLY_CHAIN_ID", "137")?;
+    println!("账户配置已写入 .env。");
+    Ok(())
+}
+
+fn configure_live_market(cfg: &Config) -> AppResult<()> {
+    ensure_cli_defaults(&cfg.env_file())?;
+    println!("直接回车表示保留原值。当前版本需要手动填当前 5 分钟市场。");
+    let up = prompt(&format!(
+        "POLYMARKET_UP_TOKEN_ID 当前={}  当前市场 Up CLOB token id",
+        public_state(&cfg.env_file(), "POLYMARKET_UP_TOKEN_ID")
+    ))?;
+    apply_optional_env(&cfg.env_file(), "POLYMARKET_UP_TOKEN_ID", &up)?;
+
+    let down = prompt(&format!(
+        "POLYMARKET_DOWN_TOKEN_ID 当前={}  当前市场 Down CLOB token id",
+        public_state(&cfg.env_file(), "POLYMARKET_DOWN_TOKEN_ID")
+    ))?;
+    apply_optional_env(&cfg.env_file(), "POLYMARKET_DOWN_TOKEN_ID", &down)?;
+
+    let price = prompt(&format!(
+        "PRICE_TO_BEAT 当前={}  题目里的BTC判定价/开盘价",
+        public_state(&cfg.env_file(), "PRICE_TO_BEAT")
+    ))?;
+    apply_optional_env(&cfg.env_file(), "PRICE_TO_BEAT", &price)?;
+
+    upsert_env_if_missing(
+        &cfg.env_file(),
+        "POLYMARKET_WS_URL",
+        "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+    )?;
+    upsert_env_if_missing(
+        &cfg.env_file(),
+        "BINANCE_WS_URL",
+        "wss://stream.binance.com:9443/ws/btcusdt@trade",
+    )?;
+    println!("当前市场配置已写入 .env。");
+    Ok(())
+}
+
 fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
     if !cfg.env_file().exists() {
         init_config(cfg)?;
     }
     let keys = [
-        ("DATA_MODE", "行情来源 sim/live"),
-        ("ENABLE_REAL_ORDERS", "实单确认串"),
-        ("POLYMARKET_UP_TOKEN_ID", "live Up token id"),
-        ("POLYMARKET_DOWN_TOKEN_ID", "live Down token id"),
-        ("POLYMARKET_CLOB_HOST", "CLOB API地址"),
-        ("POLY_SIGNATURE_TYPE", "eoa/proxy/gnosis_safe/poly1271"),
-        ("POLY_FUNDER_ADDRESS", "代理钱包/funder地址"),
-        ("PRICE_TO_BEAT", "当前5分钟BTC判定价"),
         ("QUOTE_SIZE", "每次单边挂单份数"),
         ("QUOTE_SPREAD", "做市毛价差"),
         ("QUOTE_TTL_MS", "未成交报价pending保留毫秒"),
@@ -373,6 +684,7 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("MAX_BID", "最高挂买价"),
         ("MAX_LOSS", "最坏情景最大亏损"),
         ("MAX_TOTAL_INVENTORY", "Up+Down最大总库存"),
+        ("LIVE_ORDER_NOTIONAL_CAP", "实单单笔名义金额上限"),
         ("MARKET_INTERVAL_MS", "模拟行情间隔毫秒"),
         ("STALE_AFTER_MS", "行情过期毫秒"),
         ("WS_STALE_AFTER_MS", "live WS断流停止毫秒"),
@@ -416,8 +728,9 @@ fn print_param_help() {
     println!("  INVENTORY_MULT    单边最大库存 = QUOTE_SIZE * INVENTORY_MULT");
     println!("  MAX_LOSS          最坏结算情景亏损达到阈值就停止");
     println!("  MAX_TOTAL_*       Up+Down 已成交+pending 达到阈值就停止");
-    println!("  ENABLE_REAL_*     实单确认串；私钥和API凭证请手动编辑.env，不在菜单显示");
-    println!("  POLY_SIGNATURE_*  钱包签名类型；代理钱包通常是 proxy + funder");
+    println!("  ENABLE_REAL_*     实单确认串；菜单2切实单时会自动写入");
+    println!("  POLY_PRIVATE_*    私钥；菜单2可隐藏输入，别提交到GitHub");
+    println!("  POLY_SIGNATURE_*  钱包签名类型；Polymarket账户通常是 proxy + funder");
     println!("  MIN_BID/MAX_BID   最低/最高挂买价");
     println!("  STALE_AFTER_MS    行情过期阈值，超过则停止用旧行情报价");
     println!("  WS_STALE_AFTER_MS live WS断流阈值，超过则停止");
@@ -470,6 +783,25 @@ fn process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+fn maybe_restart_background(cfg: &Config) -> AppResult<()> {
+    let Some(pid) = read_pid(&cfg.pid_file()) else {
+        println!("配置已保存。后台服务未运行，下次启动生效。");
+        return Ok(());
+    };
+    if !process_alive(pid) {
+        println!("配置已保存。旧 pid={pid} 已退出，下次启动生效。");
+        return Ok(());
+    }
+    let input = prompt("检测到后台服务正在运行，是否立即重启让配置生效？y/N")?;
+    if is_yes(&input) {
+        let updated = Config::from_env().unwrap_or_else(|_| cfg.clone());
+        workers::restart_background(&updated)?;
+    } else {
+        println!("配置已保存。稍后执行 `polymaker restart` 后生效。");
+    }
+    Ok(())
+}
+
 fn tail_jsonl<T: DeserializeOwned>(path: &Path, n: usize) -> AppResult<Vec<T>> {
     let Ok(raw) = fs::read_to_string(path) else {
         return Ok(Vec::new());
@@ -490,6 +822,57 @@ fn tail_jsonl<T: DeserializeOwned>(path: &Path, n: usize) -> AppResult<Vec<T>> {
     Ok(out)
 }
 
+fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
+    upsert_env_if_missing(path, "DRY_RUN", "1")?;
+    upsert_env_if_missing(path, "ENABLE_REAL_ORDERS", "")?;
+    upsert_env_if_missing(path, "BOT_RUN_DIR", "run")?;
+    upsert_env_if_missing(path, "MARKET_SLUG", "btc-updown-5m")?;
+    upsert_env_if_missing(path, "DATA_MODE", "sim")?;
+    upsert_env_if_blank(
+        path,
+        "POLYMARKET_WS_URL",
+        "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+    )?;
+    upsert_env_if_blank(
+        path,
+        "BINANCE_WS_URL",
+        "wss://stream.binance.com:9443/ws/btcusdt@trade",
+    )?;
+    upsert_env_if_missing(path, "POLYMARKET_UP_TOKEN_ID", "")?;
+    upsert_env_if_missing(path, "POLYMARKET_DOWN_TOKEN_ID", "")?;
+    upsert_env_if_blank(
+        path,
+        "POLYMARKET_CLOB_HOST",
+        "https://clob-v2.polymarket.com",
+    )?;
+    upsert_env_if_blank(path, "POLY_CHAIN_ID", "137")?;
+    upsert_env_if_missing(path, "POLY_PRIVATE_KEY", "")?;
+    upsert_env_if_missing(path, "POLY_API_KEY", "")?;
+    upsert_env_if_missing(path, "POLY_SECRET", "")?;
+    upsert_env_if_missing(path, "POLY_PASSPHRASE", "")?;
+    upsert_env_if_blank(path, "POLY_SIGNATURE_TYPE", "proxy")?;
+    upsert_env_if_missing(path, "POLY_FUNDER_ADDRESS", "")?;
+    upsert_env_if_missing(path, "PRICE_TO_BEAT", "68000")?;
+    upsert_env_if_missing(path, "QUOTE_SIZE", "5")?;
+    upsert_env_if_missing(path, "QUOTE_SPREAD", "0.04")?;
+    upsert_env_if_missing(path, "QUOTE_TTL_MS", "1500")?;
+    upsert_env_if_missing(path, "REQUOTE_THRESHOLD_TICKS", "1")?;
+    upsert_env_if_missing(path, "INVENTORY_SKEW", "0.03")?;
+    upsert_env_if_missing(path, "INVENTORY_MULT", "2")?;
+    upsert_env_if_missing(path, "MIN_BID", "0.05")?;
+    upsert_env_if_missing(path, "MAX_BID", "0.62")?;
+    upsert_env_if_missing(path, "TICK_SIZE", "0.01")?;
+    upsert_env_if_missing(path, "BTC_SIGMA_USD", "35")?;
+    upsert_env_if_missing(path, "SIM_FILL_CHANCE", "0.18")?;
+    upsert_env_if_missing(path, "MAX_LOSS", "25")?;
+    upsert_env_if_missing(path, "MAX_TOTAL_INVENTORY", "50")?;
+    upsert_env_if_missing(path, "LIVE_ORDER_NOTIONAL_CAP", "5")?;
+    upsert_env_if_missing(path, "MARKET_INTERVAL_MS", "120")?;
+    upsert_env_if_missing(path, "STALE_AFTER_MS", "800")?;
+    upsert_env_if_missing(path, "WS_STALE_AFTER_MS", "10000")?;
+    Ok(())
+}
+
 fn env_value(path: &Path, key: &str) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
     for line in raw.lines() {
@@ -505,6 +888,32 @@ fn env_value(path: &Path, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn upsert_env_if_missing(path: &Path, key: &str, value: &str) -> AppResult<()> {
+    if env_value(path, key).is_none() {
+        upsert_env(path, key, value)?;
+    }
+    Ok(())
+}
+
+fn upsert_env_if_blank(path: &Path, key: &str, value: &str) -> AppResult<()> {
+    if env_value(path, key).is_none_or(|v| v.trim().is_empty()) {
+        upsert_env(path, key, value)?;
+    }
+    Ok(())
+}
+
+fn apply_optional_env(path: &Path, key: &str, input: &str) -> AppResult<()> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    if trimmed.eq_ignore_ascii_case("CLEAR") {
+        upsert_env(path, key, "")
+    } else {
+        upsert_env(path, key, trimmed)
+    }
 }
 
 fn upsert_env(path: &Path, key: &str, value: &str) -> AppResult<()> {
@@ -528,12 +937,64 @@ fn upsert_env(path: &Path, key: &str, value: &str) -> AppResult<()> {
     Ok(())
 }
 
+fn secret_state(path: &Path, key: &str) -> &'static str {
+    if env_value(path, key).is_some_and(|v| !v.trim().is_empty()) {
+        "(已填)"
+    } else {
+        "(未填)"
+    }
+}
+
+fn public_state(path: &Path, key: &str) -> String {
+    env_value(path, key)
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| shorten_value(&v))
+        .unwrap_or_else(|| "(未填)".to_string())
+}
+
+fn shorten_value(value: &str) -> String {
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.len() <= 24 {
+        return value.to_string();
+    }
+    let head = chars.iter().take(10).collect::<String>();
+    let tail = chars
+        .iter()
+        .skip(chars.len().saturating_sub(6))
+        .collect::<String>();
+    format!("{head}...{tail}")
+}
+
 fn prompt(label: &str) -> AppResult<String> {
     print!("{C_CYAN}?{C_RESET} {label} > ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     Ok(input.trim_end().to_string())
+}
+
+fn prompt_secret(label: &str) -> AppResult<String> {
+    print!("{C_CYAN}?{C_RESET} {label} > ");
+    io::stdout().flush()?;
+    let echo_disabled = Command::new("stty")
+        .arg("-echo")
+        .status()
+        .is_ok_and(|status| status.success());
+    let mut input = String::new();
+    let read_result = io::stdin().read_line(&mut input);
+    if echo_disabled {
+        let _ = Command::new("stty").arg("echo").status();
+        println!();
+    }
+    read_result?;
+    Ok(input.trim_end().to_string())
+}
+
+fn is_yes(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "1"
+    ) || matches!(input.trim(), "是" | "好" | "确认")
 }
 
 fn pause() -> AppResult<()> {
