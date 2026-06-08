@@ -909,6 +909,46 @@ fn short_market(slug: &str) -> String {
     }
 }
 
+/// Market slugs end with the window-start unix seconds (btc-updown-5m-<start>).
+/// Render that as a human-readable Beijing-time label "MM-DD HH:MM"; fall back
+/// to the trimmed slug if there is no plausible trailing timestamp.
+fn fmt_market_label(slug: &str) -> String {
+    if let Some(ts) = slug
+        .rsplit('-')
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if (1_000_000_000..=4_000_000_000).contains(&ts) {
+            return fmt_window_time(ts);
+        }
+    }
+    short_market(slug)
+}
+
+/// Unix seconds -> "MM-DD HH:MM" in Beijing time (UTC+8), no external deps.
+fn fmt_window_time(unix_secs: u64) -> String {
+    let s = unix_secs as i64 + 8 * 3600;
+    let days = s.div_euclid(86_400);
+    let sod = s.rem_euclid(86_400);
+    let (hh, mm) = (sod / 3600, (sod % 3600) / 60);
+    let (_, mon, day) = civil_from_days(days);
+    format!("{mon:02}-{day:02} {hh:02}:{mm:02}")
+}
+
+/// Days since 1970-01-01 -> (year, month, day). Howard Hinnant's algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (y + i64::from(m <= 2), m, d)
+}
+
 /// 交易统计表：按盘口聚合成交，展示双边/单边、情景 PnL、锁定毛利与汇总。
 pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     print_banner("POLYMAKER 交易统计");
@@ -982,7 +1022,7 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         println!(
             "{}",
             table_row(&[
-                (short_market(market), 22, Align::Left),
+                (fmt_market_label(market), 22, Align::Left),
                 (s.fills.to_string(), 5, Align::Right),
                 (format!("{:.0}", s.up_shares), 7, Align::Right),
                 (format!("{:.3}", up_avg), 7, Align::Right),
