@@ -1,4 +1,5 @@
 mod config;
+mod hedge;
 mod ipc;
 mod pricing;
 mod real_orders;

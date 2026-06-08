@@ -21,6 +21,12 @@ pub struct MarketFrame {
     pub down_ask: f64,
     pub btc_price: f64,
     pub price_to_beat: f64,
+    /// Seconds remaining until this window settles. Drives time-aware pricing.
+    #[serde(default)]
+    pub tau_seconds: f64,
+    /// Adaptive BTC dollar volatility per sqrt-second (sigma_$), from collector.
+    #[serde(default)]
+    pub vol_per_sqrt_sec: f64,
     pub source: String,
 }
 

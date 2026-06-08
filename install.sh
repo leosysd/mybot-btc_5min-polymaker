@@ -154,6 +154,33 @@ ensure_env_defaults() {
     append_env_line WS_STALE_AFTER_MS "# live WS 超过多久没有更新就触发停止信号，毫秒。" "WS_STALE_AFTER_MS=10000"
   fi
 
+  if section_has_missing VOL_SEED_PER_SQRT_SEC WIDTH_FLOOR_USD BASE_HALF_SPREAD MIN_LOCK_EDGE \
+    LATENCY_SEC K_ADVERSE MIN_HALF_SPREAD MAX_HALF_SPREAD ENDGAME_REDUCE_SECS ENDGAME_PULL_SECS \
+    INVENTORY_SKEW_TIME_BOOST TOX_HORIZON_MS TOX_DECAY TOX_K_WIDEN TOX_MAX_WIDEN \
+    VOL_HALFLIFE_SEC VOL_MIN_PER_SQRT_SEC VOL_MAX_PER_SQRT_SEC ENABLE_DELTA_HEDGE HEDGE_VENUE; then
+    append_section_header "# ── 策略大脑 v3：时间感知定价/波动率/残局/逆选择（install.sh 自动补齐）──"
+    append_env_line VOL_SEED_PER_SQRT_SEC "# BTC 波动率初值(σ_$/√秒)，之后自适应。" "VOL_SEED_PER_SQRT_SEC=6"
+    append_env_line VOL_HALFLIFE_SEC "# 波动率 EWMA 半衰期(秒)。" "VOL_HALFLIFE_SEC=20"
+    append_env_line VOL_MIN_PER_SQRT_SEC "" "VOL_MIN_PER_SQRT_SEC=1.5"
+    append_env_line VOL_MAX_PER_SQRT_SEC "" "VOL_MAX_PER_SQRT_SEC=60"
+    append_env_line WIDTH_FLOOR_USD "# 收盘前不确定性 W 的下限，防 gamma 爆炸。" "WIDTH_FLOOR_USD=3"
+    append_env_line BASE_HALF_SPREAD "# 基础半价差。" "BASE_HALF_SPREAD=0.012"
+    append_env_line MIN_LOCK_EDGE "# 双边锁利下限 up_bid+down_bid<=1-该值。" "MIN_LOCK_EDGE=0.02"
+    append_env_line LATENCY_SEC "# 撤改单延迟(秒)，驱动逆选择溢价。" "LATENCY_SEC=0.4"
+    append_env_line K_ADVERSE "# 逆选择价差强度。" "K_ADVERSE=1"
+    append_env_line MIN_HALF_SPREAD "" "MIN_HALF_SPREAD=0.005"
+    append_env_line MAX_HALF_SPREAD "" "MAX_HALF_SPREAD=0.25"
+    append_env_line ENDGAME_REDUCE_SECS "# 剩余秒数<该值只挂减仓单。" "ENDGAME_REDUCE_SECS=60"
+    append_env_line ENDGAME_PULL_SECS "# 剩余秒数<该值撤掉所有单。" "ENDGAME_PULL_SECS=12"
+    append_env_line INVENTORY_SKEW_TIME_BOOST "# 库存偏移随临近收盘加码倍数。" "INVENTORY_SKEW_TIME_BOOST=2"
+    append_env_line TOX_HORIZON_MS "# 逆选择监控:成交后多久评估markout。" "TOX_HORIZON_MS=2500"
+    append_env_line TOX_DECAY "" "TOX_DECAY=0.5"
+    append_env_line TOX_K_WIDEN "" "TOX_K_WIDEN=1.5"
+    append_env_line TOX_MAX_WIDEN "" "TOX_MAX_WIDEN=0.08"
+    append_env_line ENABLE_DELTA_HEDGE "# 对冲为占位骨架，实单模式禁止开启，保持 0。" "ENABLE_DELTA_HEDGE=0"
+    append_env_line HEDGE_VENUE "" "HEDGE_VENUE=binance_perp"
+  fi
+
   if [ "$ENV_BACKUP_DONE" -eq 1 ]; then
     echo "已保留原 .env，并补齐缺失字段。备份: $ENV_BACKUP_PATH"
   fi
