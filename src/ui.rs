@@ -674,6 +674,11 @@ fn configure_live_market(cfg: &Config) -> AppResult<()> {
     )?;
     upsert_env_if_missing(
         &cfg.env_file(),
+        "POLYMARKET_USER_WS_URL",
+        "wss://ws-subscriptions-clob.polymarket.com/ws/user",
+    )?;
+    upsert_env_if_missing(
+        &cfg.env_file(),
         "BINANCE_WS_URL",
         "wss://stream.binance.com:9443/ws/btcusdt@trade",
     )?;
@@ -854,6 +859,11 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
         path,
         "POLYMARKET_WS_URL",
         "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+    )?;
+    upsert_env_if_blank(
+        path,
+        "POLYMARKET_USER_WS_URL",
+        "wss://ws-subscriptions-clob.polymarket.com/ws/user",
     )?;
     upsert_env_if_blank(
         path,

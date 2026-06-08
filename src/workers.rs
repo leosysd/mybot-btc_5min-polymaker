@@ -2,22 +2,26 @@
 mod unix {
     use crate::config::Config;
     use crate::ipc::{
-        append_jsonl, heartbeat, now_ms, read_json, should_stop, write_json, FillEvent, Inventory,
-        MarketFrame, OrderAccepted, OrderCancelled, QuoteIntent, WireMessage,
+        heartbeat, now_ms, read_json, should_stop, write_json, FillEvent, Inventory, MarketFrame,
+        OrderAccepted, OrderCancelled, QuoteIntent, WireMessage,
     };
     use crate::pricing::{market_maker_bids, normal_cdf, post_only_bid};
     use crate::real_orders::RealOrderClient;
     use crate::AppResult;
+    use serde::Serialize;
     use serde_json::Value;
-    use std::collections::HashMap;
-    use std::io;
+    use std::collections::{HashMap, HashSet};
+    use std::fs::OpenOptions;
+    use std::io::{self, Write};
+    use std::net::TcpStream;
     use std::os::unix::net::UnixDatagram;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
-    use tungstenite::{connect, Message};
+    use tungstenite::stream::MaybeTlsStream;
+    use tungstenite::{connect, Error as WsError, Message, WebSocket};
 
     pub fn run_supervisor(cfg: Config, seconds: Option<u64>) -> AppResult<()> {
         cfg.ensure_trading_supported()?;
@@ -57,8 +61,23 @@ mod unix {
         }
 
         write_stop(&cfg)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let mut all_stopped = true;
+            for (_, child) in &mut children {
+                if child.try_wait()?.is_none() {
+                    all_stopped = false;
+                }
+            }
+            if all_stopped {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
         for (role, mut child) in children {
-            let _ = child.kill();
+            if child.try_wait()?.is_none() {
+                let _ = child.kill();
+            }
             let _ = child.wait();
             eprintln!("[supervisor] stopped {role}");
         }
@@ -91,6 +110,7 @@ mod unix {
 
     fn run_sim_market_data(cfg: Config) -> AppResult<()> {
         let sock = UnixDatagram::unbound()?;
+        let logger = spawn_jsonl_writer();
         let mut step = 0u64;
         let price_to_beat = cfg.price_to_beat;
 
@@ -117,7 +137,7 @@ mod unix {
                 &WireMessage::MarketFrame(frame.clone()),
             ) {
                 Ok(()) => {
-                    append_jsonl(&cfg.book_path(), &frame)?;
+                    log_jsonl(&logger, &cfg.book_path(), &frame)?;
                     heartbeat(&cfg, "collector", format!("sent step={step}"))?;
                 }
                 Err(err) => {
@@ -131,13 +151,19 @@ mod unix {
     }
 
     fn run_live_market_data(cfg: Config) -> AppResult<()> {
-        let sock = UnixDatagram::unbound()?;
         let state = Arc::new(Mutex::new(LiveMarketState::new(&cfg)));
+        let sink = LiveFrameSink {
+            sock: Arc::new(Mutex::new(UnixDatagram::unbound()?)),
+            engine_socket: cfg.engine_socket(),
+            book_path: cfg.book_path(),
+            logger: spawn_jsonl_writer(),
+        };
 
         {
             let cfg = cfg.clone();
             let state = Arc::clone(&state);
-            thread::spawn(move || live_polymarket_loop(cfg, state));
+            let sink = sink.clone();
+            thread::spawn(move || live_polymarket_loop(cfg, state, sink));
         }
         if cfg.auto_discover_market {
             let cfg = cfg.clone();
@@ -147,30 +173,12 @@ mod unix {
         {
             let cfg = cfg.clone();
             let state = Arc::clone(&state);
-            thread::spawn(move || live_btc_loop(cfg, state));
+            let sink = sink.clone();
+            thread::spawn(move || live_btc_loop(cfg, state, sink));
         }
 
         while !should_stop(&cfg) {
-            let frame = {
-                let state = state.lock().unwrap();
-                state.frame(&cfg)
-            };
-
-            if let Some(frame) = frame {
-                match send_msg(
-                    &sock,
-                    &cfg.engine_socket(),
-                    &WireMessage::MarketFrame(frame.clone()),
-                ) {
-                    Ok(()) => {
-                        append_jsonl(&cfg.book_path(), &frame)?;
-                        heartbeat(&cfg, "collector", "live ws frame")?;
-                    }
-                    Err(err) => {
-                        heartbeat(&cfg, "collector", format!("engine socket wait: {err}"))?;
-                    }
-                }
-            } else {
+            if state.lock().unwrap().frame(&cfg).is_none() {
                 heartbeat(&cfg, "collector", "waiting live ws")?;
             }
 
@@ -188,7 +196,7 @@ mod unix {
                 break;
             }
 
-            sleep_ms(cfg.market_interval_ms);
+            sleep_ms(250);
         }
         Ok(())
     }
@@ -245,14 +253,25 @@ mod unix {
         let mut buf = [0u8; 16 * 1024];
         let mut rng = FastRng::new(now_ms());
         let mut resting: HashMap<String, RestingOrder> = HashMap::new();
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
         let real_orders = if cfg.real_orders_enabled() {
             Some(RealOrderClient::connect(&cfg)?)
         } else {
             None
         };
+        if real_orders.is_some() {
+            start_user_channel(&cfg, Arc::clone(&order_map))?;
+        }
 
         while !should_stop(&cfg) {
-            expire_resting_orders(&cfg, &sock, real_orders.as_ref(), &mut resting)?;
+            let order_map_ref = real_orders.as_ref().map(|_| &order_map);
+            expire_resting_orders(
+                &cfg,
+                &sock,
+                real_orders.as_ref(),
+                order_map_ref,
+                &mut resting,
+            )?;
             match recv_msg(&sock, &mut buf)? {
                 Some(WireMessage::QuoteIntent(quote)) => {
                     if should_keep_resting(&cfg, resting.get(&quote.side), &quote) {
@@ -260,12 +279,20 @@ mod unix {
                         continue;
                     }
                     if let Some(old) = resting.remove(&quote.side) {
-                        send_cancel(&cfg, &sock, real_orders.as_ref(), old, "requote")?;
+                        send_cancel(
+                            &cfg,
+                            &sock,
+                            real_orders.as_ref(),
+                            order_map_ref,
+                            old,
+                            "requote",
+                        )?;
                     }
                     if !accept_resting_order(
                         &cfg,
                         &sock,
                         real_orders.as_ref(),
+                        order_map_ref,
                         &mut resting,
                         quote.clone(),
                     )? {
@@ -316,6 +343,7 @@ mod unix {
         write_json(&cfg.inventory_path(), &inventory)?;
         let mut pending: Vec<PendingOrder> = Vec::new();
         let mut buf = [0u8; 16 * 1024];
+        let logger = spawn_jsonl_writer();
 
         while !should_stop(&cfg) {
             match recv_msg(&sock, &mut buf)? {
@@ -334,7 +362,7 @@ mod unix {
                         expires_ts_ms: accepted.expires_ts_ms,
                     });
                     recompute_pending(&mut inventory, &pending);
-                    append_jsonl(&cfg.quotes_path(), &accepted.quote)?;
+                    log_jsonl(&logger, &cfg.quotes_path(), &accepted.quote)?;
                     write_json(&cfg.inventory_path(), &inventory)?;
                     send_msg(
                         &sock,
@@ -377,7 +405,7 @@ mod unix {
                         pnl_if_down: inventory.pnl_if_down(),
                         source: fill.source,
                     };
-                    append_jsonl(&cfg.fills_path(), &enriched)?;
+                    log_jsonl(&logger, &cfg.fills_path(), &enriched)?;
                     write_json(&cfg.inventory_path(), &inventory)?;
                     send_msg(
                         &sock,
@@ -538,6 +566,7 @@ mod unix {
             quote_id: format!("{}-{side}-{}", frame.ts_ms, now_ms()),
             ts_ms: now_ms(),
             market: frame.market.clone(),
+            condition_id: frame.condition_id.clone(),
             token_id: if side == "Up" {
                 frame.up_token_id.clone()
             } else {
@@ -671,6 +700,106 @@ mod unix {
     }
 
     #[derive(Clone)]
+    struct AsyncJsonlWriter {
+        tx: mpsc::Sender<JsonlJob>,
+    }
+
+    struct JsonlJob {
+        path: PathBuf,
+        line: String,
+    }
+
+    fn spawn_jsonl_writer() -> AsyncJsonlWriter {
+        let (tx, rx) = mpsc::channel::<JsonlJob>();
+        thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                if let Some(parent) = job.path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&job.path) {
+                    let _ = file.write_all(job.line.as_bytes());
+                    let _ = file.write_all(b"\n");
+                }
+            }
+        });
+        AsyncJsonlWriter { tx }
+    }
+
+    fn log_jsonl<T: Serialize>(writer: &AsyncJsonlWriter, path: &Path, value: &T) -> AppResult<()> {
+        let line = serde_json::to_string(value)?;
+        writer
+            .tx
+            .send(JsonlJob {
+                path: path.to_path_buf(),
+                line,
+            })
+            .map_err(|err| format!("jsonl writer stopped: {err}").into())
+    }
+
+    #[derive(Clone)]
+    struct LiveFrameSink {
+        sock: Arc<Mutex<UnixDatagram>>,
+        engine_socket: PathBuf,
+        book_path: PathBuf,
+        logger: AsyncJsonlWriter,
+    }
+
+    fn push_live_frame(
+        cfg: &Config,
+        state: &Arc<Mutex<LiveMarketState>>,
+        sink: &LiveFrameSink,
+        status: &str,
+    ) -> AppResult<bool> {
+        let frame = {
+            let state = state.lock().unwrap();
+            state.frame(cfg)
+        };
+        let Some(frame) = frame else {
+            return Ok(false);
+        };
+
+        {
+            let sock = sink.sock.lock().unwrap();
+            send_msg(
+                &sock,
+                &sink.engine_socket,
+                &WireMessage::MarketFrame(frame.clone()),
+            )?;
+        }
+        log_jsonl(&sink.logger, &sink.book_path, &frame)?;
+        heartbeat(cfg, "collector", status)?;
+        Ok(true)
+    }
+
+    type WsSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+
+    fn tune_ws_socket(socket: &mut WsSocket, timeout: Duration) -> AppResult<()> {
+        match socket.get_mut() {
+            MaybeTlsStream::Plain(stream) => {
+                stream.set_nodelay(true)?;
+                stream.set_read_timeout(Some(timeout))?;
+            }
+            MaybeTlsStream::Rustls(stream) => {
+                stream.sock.set_nodelay(true)?;
+                stream.sock.set_read_timeout(Some(timeout))?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn is_ws_timeout(err: &WsError) -> bool {
+        matches!(
+            err,
+            WsError::Io(io_err)
+                if matches!(
+                    io_err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                )
+        )
+    }
+
+    #[derive(Clone)]
     struct LiveMarketIdentity {
         slug: String,
         condition_id: String,
@@ -756,9 +885,9 @@ mod unix {
         }
     }
 
-    fn live_polymarket_loop(cfg: Config, state: Arc<Mutex<LiveMarketState>>) {
+    fn live_polymarket_loop(cfg: Config, state: Arc<Mutex<LiveMarketState>>, sink: LiveFrameSink) {
         while !should_stop(&cfg) {
-            if let Err(err) = live_polymarket_once(&cfg, &state) {
+            if let Err(err) = live_polymarket_once(&cfg, &state, &sink) {
                 let _ = heartbeat(&cfg, "collector", format!("polymarket ws reconnect: {err}"));
                 sleep_ms(1_000);
             }
@@ -978,7 +1107,11 @@ mod unix {
         Some((up?, down?))
     }
 
-    fn live_polymarket_once(cfg: &Config, state: &Arc<Mutex<LiveMarketState>>) -> AppResult<()> {
+    fn live_polymarket_once(
+        cfg: &Config,
+        state: &Arc<Mutex<LiveMarketState>>,
+        sink: &LiveFrameSink,
+    ) -> AppResult<()> {
         let identity = loop {
             if should_stop(cfg) {
                 return Ok(());
@@ -999,6 +1132,7 @@ mod unix {
             "custom_feature_enabled": true
         });
         socket.send(Message::Text(sub.to_string()))?;
+        tune_ws_socket(&mut socket, Duration::from_millis(1_000))?;
         heartbeat(&cfg, "collector", format!("subscribed {}", identity.slug))?;
         let mut last_ping = Instant::now();
 
@@ -1016,59 +1150,27 @@ mod unix {
                 socket.send(Message::Text("PING".to_string()))?;
                 last_ping = Instant::now();
             }
-            let msg = socket.read()?;
+            let msg = match socket.read() {
+                Ok(msg) => msg,
+                Err(err) if is_ws_timeout(&err) => continue,
+                Err(err) => return Err(err.into()),
+            };
             match msg {
                 Message::Text(raw) => {
                     if raw == "PONG" {
                         continue;
                     }
                     if let Ok(value) = serde_json::from_str::<Value>(&raw) {
-                        apply_polymarket_message(state, &value);
-                    }
-                }
-                Message::Ping(payload) => {
-                    socket.send(Message::Pong(payload))?;
-                }
-                Message::Close(_) => break,
-                _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn live_btc_loop(cfg: Config, state: Arc<Mutex<LiveMarketState>>) {
-        while !should_stop(&cfg) {
-            if let Err(err) = live_btc_once(&cfg, &state) {
-                if let Some(price) = fetch_btc_rest_price(&cfg) {
-                    let mut state = state.lock().unwrap();
-                    state.started = true;
-                    state.btc_price = price;
-                    state.last_btc_ts = now_ms();
-                    let _ = heartbeat(
-                        &cfg,
-                        "collector",
-                        format!("btc ws reconnect: {err}; rest fallback {price:.2}"),
-                    );
-                } else {
-                    let _ = heartbeat(&cfg, "collector", format!("btc ws reconnect: {err}"));
-                }
-                sleep_ms(1_000);
-            }
-        }
-    }
-
-    fn live_btc_once(cfg: &Config, state: &Arc<Mutex<LiveMarketState>>) -> AppResult<()> {
-        let (mut socket, _) = connect(cfg.binance_ws_url.as_str())?;
-        while !should_stop(cfg) {
-            let msg = socket.read()?;
-            match msg {
-                Message::Text(raw) => {
-                    if let Ok(value) = serde_json::from_str::<Value>(&raw) {
-                        if let Some(price) = parse_btc_price(&value) {
-                            let mut state = state.lock().unwrap();
-                            state.started = true;
-                            state.btc_price = price;
-                            state.last_btc_ts = now_ms();
+                        if apply_polymarket_message(state, &value) {
+                            if let Err(err) =
+                                push_live_frame(cfg, state, sink, "live polymarket event")
+                            {
+                                let _ = heartbeat(
+                                    cfg,
+                                    "collector",
+                                    format!("engine socket wait: {err}"),
+                                );
+                            }
                         }
                     }
                 }
@@ -1082,12 +1184,109 @@ mod unix {
         Ok(())
     }
 
-    fn apply_polymarket_message(state: &Arc<Mutex<LiveMarketState>>, value: &Value) {
-        if let Some(items) = value.as_array() {
-            for item in items {
-                apply_polymarket_message(state, item);
+    fn live_btc_loop(cfg: Config, state: Arc<Mutex<LiveMarketState>>, sink: LiveFrameSink) {
+        while !should_stop(&cfg) {
+            let mut last_err = None;
+            for url in btc_ws_urls(&cfg) {
+                if should_stop(&cfg) {
+                    break;
+                }
+                match live_btc_once(&cfg, &state, &sink, &url) {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(err) => {
+                        let _ = heartbeat(&cfg, "collector", format!("btc ws switch {url}: {err}"));
+                        last_err = Some(err);
+                    }
+                }
             }
-            return;
+            if last_err.is_none() {
+                continue;
+            }
+
+            if let Some(price) = fetch_btc_rest_price(&cfg) {
+                {
+                    let mut state = state.lock().unwrap();
+                    state.started = true;
+                    state.btc_price = price;
+                    state.last_btc_ts = now_ms();
+                }
+                let _ = push_live_frame(&cfg, &state, &sink, "btc rest fallback");
+                let _ = heartbeat(&cfg, "collector", format!("btc rest fallback {price:.2}"));
+            } else if let Some(err) = last_err {
+                let _ = heartbeat(&cfg, "collector", format!("btc ws reconnect: {err}"));
+            }
+            sleep_ms(250);
+        }
+    }
+
+    fn live_btc_once(
+        cfg: &Config,
+        state: &Arc<Mutex<LiveMarketState>>,
+        sink: &LiveFrameSink,
+        url: &str,
+    ) -> AppResult<()> {
+        let (mut socket, _) = connect(url)?;
+        tune_ws_socket(&mut socket, Duration::from_millis(1_000))?;
+        heartbeat(cfg, "collector", format!("btc ws subscribed {url}"))?;
+        while !should_stop(cfg) {
+            let msg = match socket.read() {
+                Ok(msg) => msg,
+                Err(err) if is_ws_timeout(&err) => continue,
+                Err(err) => return Err(err.into()),
+            };
+            match msg {
+                Message::Text(raw) => {
+                    if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                        if let Some(price) = parse_btc_price(&value) {
+                            {
+                                let mut state = state.lock().unwrap();
+                                state.started = true;
+                                state.btc_price = price;
+                                state.last_btc_ts = now_ms();
+                            }
+                            if let Err(err) = push_live_frame(cfg, state, sink, "live btc event") {
+                                let _ = heartbeat(
+                                    cfg,
+                                    "collector",
+                                    format!("engine socket wait: {err}"),
+                                );
+                            }
+                        }
+                    }
+                }
+                Message::Ping(payload) => {
+                    socket.send(Message::Pong(payload))?;
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn btc_ws_urls(cfg: &Config) -> Vec<String> {
+        let mut urls = Vec::new();
+        let primary = cfg.binance_ws_url.trim();
+        if !primary.is_empty() {
+            urls.push(primary.to_string());
+        }
+        let us = "wss://stream.binance.us:9443/ws/btcusdt@trade";
+        if urls.iter().all(|url| url != us) {
+            urls.push(us.to_string());
+        }
+        urls
+    }
+
+    fn apply_polymarket_message(state: &Arc<Mutex<LiveMarketState>>, value: &Value) -> bool {
+        if let Some(items) = value.as_array() {
+            let mut updated = false;
+            for item in items {
+                updated |= apply_polymarket_message(state, item);
+            }
+            return updated;
         }
 
         let event_type = value
@@ -1097,26 +1296,27 @@ mod unix {
         match event_type {
             "book" => {
                 let Some(asset_id) = value.get("asset_id").and_then(Value::as_str) else {
-                    return;
+                    return false;
                 };
                 let Some(best_ask) = best_ask_from_levels(value.get("asks")) else {
-                    return;
+                    return false;
                 };
-                update_polymarket_ask(state, asset_id, best_ask);
+                update_polymarket_ask(state, asset_id, best_ask)
             }
             "best_bid_ask" => {
                 let Some(asset_id) = value.get("asset_id").and_then(Value::as_str) else {
-                    return;
+                    return false;
                 };
                 let Some(best_ask) = parse_f64_value(value.get("best_ask")) else {
-                    return;
+                    return false;
                 };
-                update_polymarket_ask(state, asset_id, best_ask);
+                update_polymarket_ask(state, asset_id, best_ask)
             }
             "price_change" => {
                 let Some(changes) = value.get("price_changes").and_then(Value::as_array) else {
-                    return;
+                    return false;
                 };
+                let mut updated = false;
                 for change in changes {
                     let Some(asset_id) = change.get("asset_id").and_then(Value::as_str) else {
                         continue;
@@ -1124,26 +1324,36 @@ mod unix {
                     let Some(best_ask) = parse_f64_value(change.get("best_ask")) else {
                         continue;
                     };
-                    update_polymarket_ask(state, asset_id, best_ask);
+                    updated |= update_polymarket_ask(state, asset_id, best_ask);
                 }
+                updated
             }
-            _ => {}
+            _ => false,
         }
     }
 
-    fn update_polymarket_ask(state: &Arc<Mutex<LiveMarketState>>, asset_id: &str, best_ask: f64) {
+    fn update_polymarket_ask(
+        state: &Arc<Mutex<LiveMarketState>>,
+        asset_id: &str,
+        best_ask: f64,
+    ) -> bool {
         if !(0.0..=1.0).contains(&best_ask) || best_ask <= 0.0 {
-            return;
+            return false;
         }
         let mut state = state.lock().unwrap();
         let Some(market) = state.market.as_ref() else {
-            return;
+            return false;
         };
         let is_up = asset_id == market.up_token_id;
         let is_down = asset_id == market.down_token_id;
         if !is_up && !is_down {
-            return;
+            return false;
         }
+        let changed = if is_up {
+            (state.up_ask - best_ask).abs() > f64::EPSILON
+        } else {
+            (state.down_ask - best_ask).abs() > f64::EPSILON
+        };
         state.started = true;
         state.last_polymarket_ts = now_ms();
         if is_up {
@@ -1151,6 +1361,7 @@ mod unix {
         } else if is_down {
             state.down_ask = best_ask;
         }
+        changed
     }
 
     fn best_ask_from_levels(levels: Option<&Value>) -> Option<f64> {
@@ -1185,12 +1396,25 @@ mod unix {
         quote_id: String,
         exchange_order_id: Option<String>,
         market: String,
+        condition_id: String,
         token_id: String,
         side: String,
         price: f64,
         size: f64,
         expires_ts_ms: u64,
     }
+
+    #[derive(Clone)]
+    struct QuoteMeta {
+        quote_id: String,
+        market: String,
+        condition_id: String,
+        side: String,
+        price: f64,
+        size: f64,
+    }
+
+    type SharedOrderMap = Arc<Mutex<HashMap<String, QuoteMeta>>>;
 
     struct PendingOrder {
         quote_id: String,
@@ -1207,7 +1431,10 @@ mod unix {
         if old.expires_ts_ms <= now_ms() {
             return false;
         }
-        if old.market != quote.market || old.token_id != quote.token_id {
+        if old.market != quote.market
+            || old.condition_id != quote.condition_id
+            || old.token_id != quote.token_id
+        {
             return false;
         }
         let threshold = cfg.tick_size * cfg.requote_threshold_ticks.max(0.0);
@@ -1218,6 +1445,7 @@ mod unix {
         cfg: &Config,
         sock: &UnixDatagram,
         real_orders: Option<&RealOrderClient>,
+        order_map: Option<&SharedOrderMap>,
         resting: &mut HashMap<String, RestingOrder>,
         mut quote: QuoteIntent,
     ) -> AppResult<bool> {
@@ -1236,6 +1464,19 @@ mod unix {
                 "order-gateway",
                 format!("real order {} {}", ack.order_id, ack.status),
             )?;
+            if let Some(order_map) = order_map {
+                order_map.lock().unwrap().insert(
+                    ack.order_id.clone(),
+                    QuoteMeta {
+                        quote_id: quote.quote_id.clone(),
+                        market: quote.market.clone(),
+                        condition_id: quote.condition_id.clone(),
+                        side: quote.side.clone(),
+                        price: quote.price,
+                        size: quote.size,
+                    },
+                );
+            }
             Some(ack.order_id)
         } else {
             None
@@ -1257,6 +1498,7 @@ mod unix {
                 quote_id: quote.quote_id.clone(),
                 exchange_order_id,
                 market: quote.market.clone(),
+                condition_id: quote.condition_id.clone(),
                 token_id: quote.token_id.clone(),
                 side: quote.side.clone(),
                 price: quote.price,
@@ -1276,6 +1518,7 @@ mod unix {
         cfg: &Config,
         sock: &UnixDatagram,
         real_orders: Option<&RealOrderClient>,
+        order_map: Option<&SharedOrderMap>,
         resting: &mut HashMap<String, RestingOrder>,
     ) -> AppResult<()> {
         let now = now_ms();
@@ -1285,7 +1528,7 @@ mod unix {
             .collect::<Vec<_>>();
         for side in expired {
             if let Some(order) = resting.remove(&side) {
-                send_cancel(cfg, sock, real_orders, order, "expired")?;
+                send_cancel(cfg, sock, real_orders, order_map, order, "expired")?;
             }
         }
         Ok(())
@@ -1295,6 +1538,7 @@ mod unix {
         cfg: &Config,
         sock: &UnixDatagram,
         real_orders: Option<&RealOrderClient>,
+        order_map: Option<&SharedOrderMap>,
         order: RestingOrder,
         reason: &str,
     ) -> AppResult<()> {
@@ -1307,6 +1551,9 @@ mod unix {
                 "order-gateway",
                 format!("real cancel {exchange_order_id}"),
             )?;
+            if let Some(order_map) = order_map {
+                order_map.lock().unwrap().remove(exchange_order_id);
+            }
         }
         let cancel = OrderCancelled {
             ts_ms: now_ms(),
@@ -1326,6 +1573,320 @@ mod unix {
             &cfg.risk_socket(),
             &WireMessage::OrderCancelled(cancel),
         )
+    }
+
+    fn start_user_channel(cfg: &Config, order_map: SharedOrderMap) -> AppResult<()> {
+        if !has_user_channel_credentials(cfg) {
+            heartbeat(
+                cfg,
+                "order-gateway",
+                "user ws disabled: missing POLY_API_KEY/POLY_SECRET/POLY_PASSPHRASE",
+            )?;
+            return Ok(());
+        }
+
+        let cfg = cfg.clone();
+        thread::spawn(move || user_channel_loop(cfg, order_map));
+        Ok(())
+    }
+
+    fn has_user_channel_credentials(cfg: &Config) -> bool {
+        !cfg.poly_api_key.trim().is_empty()
+            && !cfg.poly_secret.trim().is_empty()
+            && !cfg.poly_passphrase.trim().is_empty()
+    }
+
+    fn user_channel_loop(cfg: Config, order_map: SharedOrderMap) {
+        while !should_stop(&cfg) {
+            if let Err(err) = user_channel_once(&cfg, &order_map) {
+                let _ = heartbeat(&cfg, "order-gateway", format!("user ws reconnect: {err}"));
+                sleep_ms(1_000);
+            }
+        }
+    }
+
+    fn user_channel_once(cfg: &Config, order_map: &SharedOrderMap) -> AppResult<()> {
+        let sock = UnixDatagram::unbound()?;
+        let (mut socket, _) = connect(cfg.polymarket_user_ws_url.as_str())?;
+        tune_ws_socket(&mut socket, Duration::from_millis(250))?;
+
+        let markets = known_condition_ids(order_map);
+        let mut sub = serde_json::json!({
+            "auth": {
+                "apiKey": cfg.poly_api_key.trim(),
+                "secret": cfg.poly_secret.trim(),
+                "passphrase": cfg.poly_passphrase.trim(),
+            },
+            "type": "user"
+        });
+        if !markets.is_empty() {
+            if let Value::Object(obj) = &mut sub {
+                obj.insert("markets".to_string(), serde_json::json!(markets));
+            }
+        }
+        socket.send(Message::Text(sub.to_string()))?;
+        heartbeat(cfg, "order-gateway", "user ws subscribed")?;
+
+        let mut seen_trades = HashSet::new();
+        let mut subscribed = known_condition_ids(order_map)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut last_ping = Instant::now();
+        let mut last_subscribe_check = Instant::now();
+
+        while !should_stop(cfg) {
+            if last_ping.elapsed() >= Duration::from_secs(8) {
+                socket.send(Message::Text("PING".to_string()))?;
+                last_ping = Instant::now();
+            }
+            if last_subscribe_check.elapsed() >= Duration::from_millis(250) {
+                let next = known_condition_ids(order_map);
+                let fresh = next
+                    .into_iter()
+                    .filter(|condition_id| subscribed.insert(condition_id.clone()))
+                    .collect::<Vec<_>>();
+                if !fresh.is_empty() {
+                    let update = serde_json::json!({
+                        "operation": "subscribe",
+                        "markets": fresh
+                    });
+                    socket.send(Message::Text(update.to_string()))?;
+                    heartbeat(cfg, "order-gateway", "user ws market subscribe")?;
+                }
+                last_subscribe_check = Instant::now();
+            }
+
+            let msg = match socket.read() {
+                Ok(msg) => msg,
+                Err(err) if is_ws_timeout(&err) => continue,
+                Err(err) => return Err(err.into()),
+            };
+            match msg {
+                Message::Text(raw) => {
+                    if raw == "PONG" {
+                        continue;
+                    }
+                    if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                        apply_user_channel_message(
+                            cfg,
+                            &sock,
+                            order_map,
+                            &mut seen_trades,
+                            &value,
+                        )?;
+                    }
+                }
+                Message::Ping(payload) => {
+                    socket.send(Message::Pong(payload))?;
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn known_condition_ids(order_map: &SharedOrderMap) -> Vec<String> {
+        let mut seen = HashSet::new();
+        order_map
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|meta| {
+                let condition_id = meta.condition_id.trim();
+                (!condition_id.is_empty() && seen.insert(condition_id.to_string()))
+                    .then(|| condition_id.to_string())
+            })
+            .collect()
+    }
+
+    fn apply_user_channel_message(
+        cfg: &Config,
+        sock: &UnixDatagram,
+        order_map: &SharedOrderMap,
+        seen_trades: &mut HashSet<String>,
+        value: &Value,
+    ) -> AppResult<()> {
+        if let Some(items) = value.as_array() {
+            for item in items {
+                apply_user_channel_message(cfg, sock, order_map, seen_trades, item)?;
+            }
+            return Ok(());
+        }
+
+        let event_type = first_str(value, &["event_type"])
+            .or_else(|| first_str(value, &["type"]))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if event_type == "trade" {
+            handle_user_trade(cfg, sock, order_map, seen_trades, value)?;
+        } else if event_type == "order" {
+            handle_user_order(cfg, sock, order_map, value)?;
+        }
+        Ok(())
+    }
+
+    fn handle_user_trade(
+        cfg: &Config,
+        sock: &UnixDatagram,
+        order_map: &SharedOrderMap,
+        seen_trades: &mut HashSet<String>,
+        value: &Value,
+    ) -> AppResult<()> {
+        let trade_id = first_str(value, &["id", "trade_id", "transaction_hash"])
+            .filter(|id| !id.trim().is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "{}:{}",
+                    value
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    now_ms()
+                )
+            });
+
+        if let Some(makers) = value.get("maker_orders").and_then(Value::as_array) {
+            for maker in makers {
+                let Some(order_id) = first_str(maker, &["order_id", "id"]) else {
+                    continue;
+                };
+                let key = format!("{trade_id}:{order_id}");
+                if !seen_trades.insert(key) {
+                    continue;
+                }
+                let size = parse_f64_value(maker.get("matched_amount"))
+                    .or_else(|| parse_f64_value(maker.get("size")))
+                    .or_else(|| parse_f64_value(value.get("size")))
+                    .unwrap_or(0.0);
+                let price = parse_f64_value(maker.get("price"))
+                    .or_else(|| parse_f64_value(value.get("price")))
+                    .unwrap_or(0.0);
+                emit_user_fill(cfg, sock, order_map, order_id, price, size)?;
+            }
+            return Ok(());
+        }
+
+        for key in ["maker_order_id", "order_id", "taker_order_id"] {
+            let Some(order_id) = first_str(value, &[key]) else {
+                continue;
+            };
+            let seen_key = format!("{trade_id}:{order_id}");
+            if !seen_trades.insert(seen_key) {
+                continue;
+            }
+            let price = parse_f64_value(value.get("price")).unwrap_or(0.0);
+            let size = parse_f64_value(value.get("size")).unwrap_or(0.0);
+            emit_user_fill(cfg, sock, order_map, order_id, price, size)?;
+        }
+        Ok(())
+    }
+
+    fn handle_user_order(
+        cfg: &Config,
+        sock: &UnixDatagram,
+        order_map: &SharedOrderMap,
+        value: &Value,
+    ) -> AppResult<()> {
+        let status = first_str(value, &["status", "type"])
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !status.contains("cancel") {
+            return Ok(());
+        }
+        let Some(order_id) = first_str(value, &["id", "order_id"]) else {
+            return Ok(());
+        };
+        let Some(meta) = order_map.lock().unwrap().remove(order_id) else {
+            return Ok(());
+        };
+        let size = parse_f64_value(value.get("size_matched"))
+            .or_else(|| parse_f64_value(value.get("size")))
+            .unwrap_or(meta.size)
+            .max(meta.size);
+        let cancel = OrderCancelled {
+            ts_ms: now_ms(),
+            quote_id: meta.quote_id,
+            market: meta.market,
+            side: meta.side,
+            size,
+            reason: "user_ws_cancel".to_string(),
+            source: "polymarket_user_ws".to_string(),
+        };
+        send_msg(
+            sock,
+            &cfg.risk_socket(),
+            &WireMessage::OrderCancelled(cancel),
+        )?;
+        heartbeat(cfg, "order-gateway", "user ws cancel")?;
+        Ok(())
+    }
+
+    fn emit_user_fill(
+        cfg: &Config,
+        sock: &UnixDatagram,
+        order_map: &SharedOrderMap,
+        order_id: &str,
+        price: f64,
+        size: f64,
+    ) -> AppResult<()> {
+        let Some(meta) = reduce_order_map(order_map, order_id, size) else {
+            return Ok(());
+        };
+        let fill_size = if size > 0.0 {
+            size.min(meta.size)
+        } else {
+            meta.size
+        };
+        let fill_price = if price > 0.0 { price } else { meta.price };
+        if fill_size <= 0.001 {
+            return Ok(());
+        }
+        let fill = FillEvent {
+            quote_id: meta.quote_id,
+            ts_ms: now_ms(),
+            market: meta.market,
+            side: meta.side,
+            price: fill_price,
+            size: fill_size,
+            inventory_up: 0.0,
+            inventory_down: 0.0,
+            pnl_if_up: 0.0,
+            pnl_if_down: 0.0,
+            source: "polymarket_user_ws".to_string(),
+        };
+        send_msg(sock, &cfg.risk_socket(), &WireMessage::FillEvent(fill))?;
+        heartbeat(cfg, "order-gateway", "user ws fill")?;
+        Ok(())
+    }
+
+    fn reduce_order_map(
+        order_map: &SharedOrderMap,
+        order_id: &str,
+        reported_size: f64,
+    ) -> Option<QuoteMeta> {
+        let mut order_map = order_map.lock().unwrap();
+        let meta = order_map.get(order_id)?.clone();
+        let size = if reported_size > 0.0 {
+            reported_size.min(meta.size)
+        } else {
+            meta.size
+        };
+        let should_remove = if let Some(current) = order_map.get_mut(order_id) {
+            current.size = (current.size - size).max(0.0);
+            current.size <= 0.001
+        } else {
+            false
+        };
+        if should_remove {
+            order_map.remove(order_id);
+        }
+        Some(meta)
+    }
+
+    fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+        keys.iter().find_map(|key| value.get(*key)?.as_str())
     }
 
     fn prune_pending(pending: &mut Vec<PendingOrder>, now: u64) -> bool {

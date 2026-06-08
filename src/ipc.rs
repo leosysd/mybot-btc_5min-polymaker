@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::AppResult;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,6 +30,8 @@ pub struct QuoteIntent {
     pub quote_id: String,
     pub ts_ms: u64,
     pub market: String,
+    #[serde(default)]
+    pub condition_id: String,
     #[serde(default)]
     pub token_id: String,
     pub side: String,
@@ -163,16 +165,6 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
-    Ok(())
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {

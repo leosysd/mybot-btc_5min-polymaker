@@ -2,7 +2,7 @@
 
 这是一个 **Rust 多进程 BTC 5 分钟二元市场做市机器人骨架**。
 
-当前版本默认 **DRY_RUN 模拟模式**，不会真实下单。已经支持 `DATA_MODE=live` 自动发现当前 BTC 5 分钟 Polymarket Up/Down 市场、自动切换 CLOB token、读取真实盘口与 BTC 价格，也接入了官方 Rust CLOB SDK 的 post-only 买单/撤单路径。实单需要双重确认开关和小额限额。
+当前版本默认 **DRY_RUN 模拟模式**，不会真实下单。已经支持 `DATA_MODE=live` 自动发现当前 BTC 5 分钟 Polymarket Up/Down 市场、自动切换 CLOB token、事件驱动读取真实盘口与 BTC 价格，也接入了官方 Rust CLOB SDK 的 post-only 买单/撤单路径和 Polymarket user WS 成交/取消回报。实单需要双重确认开关和小额限额。
 
 ## 架构
 
@@ -15,9 +15,9 @@ collector      -> quote-engine -> order-gateway -> risk-ledger
 
 各进程职责：
 
-- `collector`：采集行情。`DATA_MODE=sim` 用本地模拟数据；`DATA_MODE=live` 自动发现当前 5 分钟市场，用 Polymarket market WS + BTC 价格源。
+- `collector`：采集行情。`DATA_MODE=sim` 用本地模拟数据；`DATA_MODE=live` 自动发现当前 5 分钟市场，用 Polymarket market WS + BTC 价格源。live 模式收到盘口或 BTC tick 后立即推给 `quote-engine`，不再靠 `MARKET_INTERVAL_MS` 轮询发帧。
 - `quote-engine`：计算 fair value、Up/Down 双边报价、库存偏移。
-- `order-gateway`：下单热路径。DRY_RUN 时走模拟撮合；实单时走官方 Rust CLOB SDK，发 post-only BUY limit，并按状态机撤旧换新。
+- `order-gateway`：下单热路径。DRY_RUN 时走模拟撮合；实单时走官方 Rust CLOB SDK 热连接，发 post-only BUY limit，并按状态机撤旧换新；填好 L2 API 后会连接 Polymarket user WS，把真实成交/取消即时回报给风控账本。
 - `risk-ledger`：记录成交、库存、两种结算情景下的 PnL，并把库存反馈给报价引擎；同时执行 kill switch。
 - `supervisor`：启动并守护上面 4 个进程。
 
@@ -29,7 +29,7 @@ run/sockets/order-gateway.sock
 run/sockets/risk-ledger.sock
 ```
 
-JSONL 文件只做审计日志，不做热路径通信。
+JSONL 文件只做审计日志，不做热路径通信；写入在后台线程异步完成，避免阻塞报价链路。
 
 ## VPS 安装
 
@@ -343,6 +343,7 @@ MARKET_WINDOW_SECS=300
 AUTO_DISCOVER_MARKET=0
 POLYMARKET_UP_TOKEN_ID=
 POLYMARKET_DOWN_TOKEN_ID=
+POLYMARKET_USER_WS_URL=wss://ws-subscriptions-clob.polymarket.com/ws/user
 PRICE_TO_BEAT=68000
 ```
 
@@ -362,7 +363,7 @@ POLY_SECRET=
 POLY_PASSPHRASE=
 ```
 
-不填 L2 凭证时，SDK 会用私钥创建或派生 API key。不要把 `.env` 或私钥提交到 GitHub。
+不填 L2 凭证时，SDK 会用私钥创建或派生 API key 来下单；但 Polymarket user WS 需要 `.env` 里有 `POLY_API_KEY`、`POLY_SECRET`、`POLY_PASSPHRASE` 才能订阅真实订单回报。不要把 `.env` 或私钥提交到 GitHub。
 
 菜单 2 的三个常用切换：
 
@@ -429,7 +430,7 @@ MAX_BID=0.62
 MARKET_INTERVAL_MS=120
 ```
 
-模拟 collector 产生行情的间隔。后面接真实 WS 后，这个参数会弱化。
+模拟 collector 产生行情的间隔。`DATA_MODE=live` 时行情由 Polymarket/BTC WS 事件触发，这个参数不再控制 live 报价节奏。
 
 ```text
 STALE_AFTER_MS=800
@@ -466,30 +467,26 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 ## 当前限制
 
-当前版本还没有接入：
-
-- 真实订单回报 user channel
-- 真实成交自动入账同步
-- Web dashboard 页面
+当前版本还没有接入 Web dashboard 页面；命令行 dashboard 已可用。
 
 已经接入/优化：
 
 - 自动发现当前 5 分钟 BTC Up/Down 市场，并自动切换 CLOB token。
-- `DATA_MODE=live` 真实 Polymarket market WS + Binance BTC WS 行情。
+- `DATA_MODE=live` 真实 Polymarket market WS + BTC WS 行情，盘口/BTC 更新后直接推给 `quote-engine`。
 - 官方 Rust CLOB SDK post-only 下单/撤单。
+- Polymarket user WS 真实订单成交/取消回报。
 - DRY_RUN/实单共用撤单/改单状态机。
 - pending 库存风控。
 - kill switch：最大亏损、最大库存、行情过期、WS 断流。
+- JSONL 后台异步写入。
 - CLI dashboard 对齐显示。
 
 ## 下一步建议
 
 优先顺序：
 
-1. 接 Polymarket user channel，拿真实订单成交/取消回报做自动入账。
-2. 把实单成交同步接入 `risk-ledger`，替换当前“pending + 撤单释放”的保守账本。
-3. 用 Chainlink Data Streams 或更贴近结算源的数据替换当前交易所 BTC 价格兜底。
-4. 做 Web dashboard 页面。
-5. 长时间小额验证后再考虑提高 `LIVE_ORDER_NOTIONAL_CAP`。
+1. 用 Chainlink Data Streams 或更贴近结算源的数据替换当前交易所 BTC 价格兜底。
+2. 做 Web dashboard 页面。
+3. 长时间小额验证后再考虑提高 `LIVE_ORDER_NOTIONAL_CAP`。
 
 不要把私钥写进仓库。真实私钥只放 VPS 的 `.env` 或系统 secret。
