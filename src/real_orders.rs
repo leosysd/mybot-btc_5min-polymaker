@@ -4,12 +4,14 @@ use crate::AppResult;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use polymarket_client_sdk_v2::auth::{Credentials, Uuid};
+use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
 use polymarket_client_sdk_v2::clob::types::{Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config as ClobConfig};
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 use polymarket_client_sdk_v2::POLYGON;
 use secrecy::ExposeSecret;
 use std::str::FromStr;
+use std::time::Instant;
 use tokio::runtime::Runtime;
 
 pub struct RealOrderClient {
@@ -30,6 +32,10 @@ struct RealOrderClientInner {
 pub struct RealOrderAck {
     pub order_id: String,
     pub status: String,
+    pub build_ms: u128,
+    pub sign_ms: u128,
+    pub post_ms: u128,
+    pub total_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +94,31 @@ impl RealOrderClient {
         self.runtime.block_on(self.inner.cancel_order(order_id))
     }
 
+    /// Cancel EVERY open order on the account (authoritative cleanup of orphans
+    /// that aren't in our local state). Returns how many were canceled.
+    pub fn cancel_all(&self) -> AppResult<usize> {
+        self.runtime.block_on(self.inner.cancel_all())
+    }
+
+    /// Fetch the order ids the exchange currently considers open for this
+    /// account. Used to reconcile against our local resting map.
+    pub fn open_order_ids(&self) -> AppResult<Vec<String>> {
+        self.runtime.block_on(self.inner.open_order_ids())
+    }
+
+    /// Keep one hot connection to the CLOB host alive (Cloudflare cuts idle
+    /// connections after ~90s), so the next order reuses it and skips the
+    /// TCP+TLS handshake. Best called shortly before a burst of orders.
+    pub fn prewarm(&self) {
+        self.runtime.block_on(self.inner.prewarm());
+    }
+
+    /// Warm the SDK metadata cache (tick_size / neg_risk / fee) for a token so
+    /// the first order's `build` hits cache instead of 3 cold serial API calls.
+    pub fn prime_token(&self, token_id: &str) {
+        self.runtime.block_on(self.inner.prime_token(token_id));
+    }
+
     pub fn user_ws_credentials(&self) -> UserWsCredentials {
         self.inner.user_ws_credentials()
     }
@@ -124,7 +155,12 @@ impl RealOrderClientInner {
         let token_id = U256::from_str(quote.token_id.trim())?;
         let price = Decimal::from_str(&format!("{:.2}", quote.price))?;
         let size = Decimal::from_str(&format!("{:.2}", quote.size))?;
-        let response = self
+
+        // Split into build → sign → post so each phase is timed independently.
+        // build hits the metadata cache (warm via prime_token), sign is local
+        // EIP-712, post is the round-trip to Polymarket (through Cloudflare).
+        let tb = Instant::now();
+        let order = self
             .client
             .limit_order()
             .token_id(token_id)
@@ -132,8 +168,19 @@ impl RealOrderClientInner {
             .price(price)
             .size(size)
             .post_only(true)
-            .build_sign_and_post(&self.signer)
+            .build()
             .await?;
+        let build_ms = tb.elapsed().as_millis();
+
+        let tsg = Instant::now();
+        let signed = self.client.sign(&self.signer, order).await?;
+        let sign_ms = tsg.elapsed().as_millis();
+
+        let tp = Instant::now();
+        let response = self.client.post_order(signed).await?;
+        let post_ms = tp.elapsed().as_millis();
+        let total_ms = build_ms + sign_ms + post_ms;
+        eprintln!("[ORDER_LAT] build={build_ms}ms sign={sign_ms}ms post={post_ms}ms 总={total_ms}ms");
 
         if !response.success {
             return Err(format!(
@@ -148,6 +195,10 @@ impl RealOrderClientInner {
         Ok(RealOrderAck {
             order_id: response.order_id,
             status: format!("{:?}", response.status),
+            build_ms,
+            sign_ms,
+            post_ms,
+            total_ms,
         })
     }
 
@@ -163,6 +214,49 @@ impl RealOrderClientInner {
             canceled: false,
             reason: response.not_canceled.get(order_id).cloned(),
         })
+    }
+
+    async fn cancel_all(&self) -> AppResult<usize> {
+        let response = self.client.cancel_all_orders().await?;
+        Ok(response.canceled.len())
+    }
+
+    async fn open_order_ids(&self) -> AppResult<Vec<String>> {
+        let request = OrdersRequest::builder().build();
+        let page = self.client.orders(&request, None).await?;
+        Ok(page.data.iter().map(|order| order.id.to_string()).collect())
+    }
+
+    async fn prewarm(&self) {
+        let t = Instant::now();
+        match self.client.ok().await {
+            Ok(_) => eprintln!("[ORDER_PREWARM] warm in {}ms", t.elapsed().as_millis()),
+            Err(err) => eprintln!("[ORDER_PREWARM] failed: {err}"),
+        }
+    }
+
+    async fn prime_token(&self, token_id: &str) {
+        let Ok(tid) = U256::from_str(token_id.trim()) else {
+            return;
+        };
+        let t = Instant::now();
+        // Serial (not concurrent): keep the pool to a single hot connection so
+        // warm and post share it; concurrent calls open extras that CF later
+        // cuts, causing random cold-connection latency spikes.
+        let s = Instant::now();
+        let _ = self.client.tick_size(tid).await;
+        let ts = s.elapsed().as_millis();
+        let s = Instant::now();
+        let _ = self.client.neg_risk(tid).await;
+        let nr = s.elapsed().as_millis();
+        let s = Instant::now();
+        let _ = self.client.fee_rate_bps(tid).await;
+        let fee = s.elapsed().as_millis();
+        let tail = &token_id[token_id.len().saturating_sub(8)..];
+        eprintln!(
+            "[CACHE_PREWARM] token=..{tail} tick_size={ts}ms neg_risk={nr}ms fee={fee}ms total={}ms",
+            t.elapsed().as_millis()
+        );
     }
 
     fn user_ws_credentials(&self) -> UserWsCredentials {

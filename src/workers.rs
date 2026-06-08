@@ -335,6 +335,22 @@ mod unix {
                     "startup_cleanup",
                 )?;
             }
+            // Authoritative sweep: cancel any order the exchange still has open
+            // that we don't know about locally (e.g. our state file was lost, or
+            // we crashed after placing but before persisting). Belt-and-suspenders
+            // against orphaned live orders.
+            match real_orders.cancel_all() {
+                Ok(n) => heartbeat(
+                    &cfg,
+                    "order-gateway",
+                    format!("startup exchange sweep canceled {n}"),
+                )?,
+                Err(err) => heartbeat(
+                    &cfg,
+                    "order-gateway",
+                    format!("startup exchange sweep failed: {err}"),
+                )?,
+            }
             start_user_channel(
                 &cfg,
                 real_orders.user_ws_credentials(),
@@ -342,6 +358,9 @@ mod unix {
             )?;
         }
 
+        let mut last_reconcile = Instant::now();
+        let mut last_prewarm = Instant::now();
+        let mut primed: HashSet<String> = HashSet::new();
         let loop_result = (|| -> AppResult<()> {
             while !should_stop(&cfg) {
                 let order_map_ref = real_orders.as_ref().map(|_| &order_map);
@@ -352,8 +371,39 @@ mod unix {
                     order_map_ref,
                     &mut resting,
                 )?;
+                if let Some(real_orders) = real_orders.as_ref() {
+                    // Periodic exchange reconciliation: cancel orphaned orders.
+                    if cfg.reconcile_interval_ms > 0
+                        && last_reconcile.elapsed()
+                            >= Duration::from_millis(cfg.reconcile_interval_ms)
+                    {
+                        reconcile_orphan_orders(&cfg, real_orders, &resting)?;
+                        last_reconcile = Instant::now();
+                    }
+                    // Keep the CLOB connection hot (Cloudflare cuts idle ~90s).
+                    if cfg.enable_prewarm
+                        && cfg.prewarm_interval_ms > 0
+                        && last_prewarm.elapsed()
+                            >= Duration::from_millis(cfg.prewarm_interval_ms)
+                    {
+                        real_orders.prewarm();
+                        last_prewarm = Instant::now();
+                    }
+                }
                 match recv_msg(&sock, &mut buf)? {
                     Some(WireMessage::QuoteIntent(quote)) => {
+                        // First time we see a new window's token: warm its metadata
+                        // cache + connection so the first order's build/post are fast.
+                        if let Some(real_orders) = real_orders.as_ref() {
+                            if cfg.enable_prewarm
+                                && !quote.token_id.trim().is_empty()
+                                && primed.insert(quote.token_id.clone())
+                            {
+                                real_orders.prime_token(&quote.token_id);
+                                real_orders.prewarm();
+                                last_prewarm = Instant::now();
+                            }
+                        }
                         if should_keep_resting(&cfg, resting.get(&quote.side), &quote) {
                             heartbeat(&cfg, "order-gateway", "kept resting quote")?;
                             continue;
@@ -601,6 +651,22 @@ mod unix {
     }
 
     pub fn clean_run_dir(cfg: &Config) -> AppResult<()> {
+        // Guard: never wipe the run dir while it still records live resting
+        // orders — that file is the recovery map used to cancel them on restart.
+        // Deleting it would orphan real orders on the exchange.
+        if let Ok(Some(active)) =
+            read_json::<HashMap<String, RestingOrder>>(&cfg.active_orders_path())
+        {
+            if !active.is_empty() {
+                return Err(format!(
+                    "检测到 {} 条活跃实盘挂单记录 ({})，拒绝清空。请先 `polymaker stop` \
+                     让网关撤单后再 clean。",
+                    active.len(),
+                    cfg.active_orders_path().display()
+                )
+                .into());
+            }
+        }
         if cfg.run_dir.exists() {
             std::fs::remove_dir_all(&cfg.run_dir)?;
         }
@@ -1725,7 +1791,10 @@ mod unix {
             heartbeat(
                 cfg,
                 "order-gateway",
-                format!("real order {} {}", ack.order_id, ack.status),
+                format!(
+                    "real order {} {} build={}ms sign={}ms post={}ms 总={}ms",
+                    ack.order_id, ack.status, ack.build_ms, ack.sign_ms, ack.post_ms, ack.total_ms
+                ),
             )?;
             if let Some(order_map) = order_map {
                 order_map.lock().unwrap().insert(
@@ -1825,6 +1894,53 @@ mod unix {
         send_cancel(cfg, sock, real_orders, order_map, order, reason)?;
         resting.remove(side);
         persist_active_orders_if_real(cfg, real_orders, resting)?;
+        Ok(())
+    }
+
+    /// Cancel any order the exchange reports as open that we don't track
+    /// locally. This catches orphans (state file lost, or placed-but-not-recorded
+    /// after a crash). We only cancel UNKNOWN ids — known ones are managed by the
+    /// normal resting/fill/expire flow, so there is no race with fresh orders.
+    fn reconcile_orphan_orders(
+        cfg: &Config,
+        real_orders: &RealOrderClient,
+        resting: &HashMap<String, RestingOrder>,
+    ) -> AppResult<()> {
+        let open = match real_orders.open_order_ids() {
+            Ok(ids) => ids,
+            Err(err) => {
+                heartbeat(cfg, "order-gateway", format!("reconcile fetch failed: {err}"))?;
+                return Ok(());
+            }
+        };
+        if open.is_empty() {
+            return Ok(());
+        }
+        let known: HashSet<&str> = resting
+            .values()
+            .filter_map(|order| order.exchange_order_id.as_deref())
+            .collect();
+        let mut orphans = 0usize;
+        for id in &open {
+            if known.contains(id.as_str()) {
+                continue;
+            }
+            match real_orders.cancel_order(id) {
+                Ok(_) => orphans += 1,
+                Err(err) => heartbeat(
+                    cfg,
+                    "order-gateway",
+                    format!("reconcile cancel {id} failed: {err}"),
+                )?,
+            }
+        }
+        if orphans > 0 {
+            heartbeat(
+                cfg,
+                "order-gateway",
+                format!("reconcile canceled {orphans} orphan order(s)"),
+            )?;
+        }
         Ok(())
     }
 
