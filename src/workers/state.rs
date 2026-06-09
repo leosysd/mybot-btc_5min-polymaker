@@ -115,6 +115,10 @@ pub struct QuoteMeta {
     pub side: String,
     pub price: f64,
     pub size: f64,
+    /// Set true when this order's fill was already credited to held via the
+    /// cancel-detected-fill path (a TTL/requote cancel found it already filled).
+    /// The async user-WS fill then skips re-crediting to avoid double-counting.
+    pub credited: bool,
 }
 
 /// Tracks exchange-order-id -> quote metadata for live orders, shared between
