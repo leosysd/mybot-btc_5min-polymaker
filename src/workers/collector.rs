@@ -589,12 +589,10 @@ fn live_polymarket_once(
                 }
                 if let Ok(value) = serde_json::from_str::<Value>(&raw) {
                     if apply_polymarket_message(state, &value) {
-                        if let Err(err) = push_live_frame(cfg, state, sink, "live polymarket event") {
-                            let _ = heartbeat(
-                                cfg,
-                                "collector",
-                                format!("engine channel wait: {err}"),
-                            );
+                        if let Err(err) = push_live_frame(cfg, state, sink, "live polymarket event")
+                        {
+                            let _ =
+                                heartbeat(cfg, "collector", format!("engine channel wait: {err}"));
                         }
                     }
                 }
@@ -667,15 +665,27 @@ fn live_btc_once(
     url: &str,
 ) -> AppResult<()> {
     let (mut socket, _) = connect(url)?;
-    let quiet_timeout = Duration::from_millis((cfg.stale_after_ms / 2).clamp(250, 2_000));
-    tune_ws_socket(&mut socket, quiet_timeout)?;
+    // Decouple two timeouts that used to be one over-aggressive value:
+    //  - read_timeout: how long each socket.read() blocks (short = responsive to
+    //    stop and to draining).
+    //  - dead_timeout: how long with NO price before we declare the socket dead
+    //    and reconnect/fall back. The old code used STALE_AFTER_MS/2 (~400ms) for
+    //    BOTH, so a routine ~300-400ms delivery gap on the high-latency, jittery
+    //    Dublin<->Binance(Asia) path tripped a reconnect every time → constant
+    //    flapping to REST. Brief gaps are NOT a dead connection. The downstream
+    //    staleness gates (engine skips stale frames, gateway rejects stale quotes)
+    //    already protect pricing, so the collector only needs to drop a GENUINELY
+    //    dead socket (several seconds of silence).
+    let read_timeout = Duration::from_millis(500);
+    let dead_timeout = Duration::from_millis((cfg.stale_after_ms * 5).clamp(2_500, 6_000));
+    tune_ws_socket(&mut socket, read_timeout)?;
     heartbeat(cfg, "collector", format!("btc ws subscribed {url}"))?;
     let mut last_event = Instant::now();
     while !stopping(stop, cfg) {
         let msg = match socket.read() {
             Ok(msg) => msg,
             Err(err) if is_ws_timeout(&err) => {
-                if last_event.elapsed() >= quiet_timeout {
+                if last_event.elapsed() >= dead_timeout {
                     return Err(format!("btc ws quiet for {:?}", last_event.elapsed()).into());
                 }
                 continue;
@@ -692,11 +702,8 @@ fn live_btc_once(
                             state.record_btc(price);
                         }
                         if let Err(err) = push_live_frame(cfg, state, sink, "live btc event") {
-                            let _ = heartbeat(
-                                cfg,
-                                "collector",
-                                format!("engine channel wait: {err}"),
-                            );
+                            let _ =
+                                heartbeat(cfg, "collector", format!("engine channel wait: {err}"));
                         }
                     }
                 }
@@ -776,7 +783,11 @@ fn apply_polymarket_message(state: &Arc<Mutex<LiveMarketState>>, value: &Value) 
     }
 }
 
-fn update_polymarket_ask(state: &Arc<Mutex<LiveMarketState>>, asset_id: &str, best_ask: f64) -> bool {
+fn update_polymarket_ask(
+    state: &Arc<Mutex<LiveMarketState>>,
+    asset_id: &str,
+    best_ask: f64,
+) -> bool {
     if !(0.0..=1.0).contains(&best_ask) || best_ask <= 0.0 {
         return false;
     }
