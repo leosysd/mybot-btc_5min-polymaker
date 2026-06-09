@@ -155,17 +155,6 @@ pub struct Heartbeat {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
-pub enum WireMessage {
-    MarketFrame(MarketFrame),
-    QuoteIntent(QuoteIntent),
-    OrderAccepted(OrderAccepted),
-    OrderCancelled(OrderCancelled),
-    FillEvent(FillEvent),
-    Inventory(Inventory),
-}
-
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
