@@ -343,18 +343,6 @@ impl Config {
         self.run_dir.join("sockets")
     }
 
-    pub fn engine_socket(&self) -> PathBuf {
-        self.socket_dir().join("quote-engine.sock")
-    }
-
-    pub fn gateway_socket(&self) -> PathBuf {
-        self.socket_dir().join("order-gateway.sock")
-    }
-
-    pub fn risk_socket(&self) -> PathBuf {
-        self.socket_dir().join("risk-ledger.sock")
-    }
-
     pub fn book_path(&self) -> PathBuf {
         self.run_dir.join("book.jsonl")
     }
