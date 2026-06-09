@@ -361,10 +361,16 @@ fn discover_current_market(
         return Ok(None);
     };
 
-    let price_to_beat = fetch_binance_start_price(cfg, start_s).or_else(|| {
-        let state = state.lock().unwrap();
-        (state.btc_price > 0.0).then_some(state.btc_price)
-    });
+    // Strike (price_to_beat) MUST come from the same venue as the live price feed
+    // (Coinbase) — a cross-venue basis (~$100+) would bias fair value near close.
+    // Coinbase 1-min candle open = exact window-open price; fall back to the live
+    // Coinbase price, then (last resort) Binance.
+    let price_to_beat = fetch_coinbase_start_price(start_s)
+        .or_else(|| {
+            let state = state.lock().unwrap();
+            (state.btc_price > 0.0).then_some(state.btc_price)
+        })
+        .or_else(|| fetch_binance_start_price(cfg, start_s));
     if let Some(price) = price_to_beat {
         identity.price_to_beat = price;
     }
@@ -429,6 +435,33 @@ fn fetch_gamma_market(
     }))
 }
 
+/// Exact window-open price from Coinbase, via the 1-min candle whose bucket
+/// starts at `window_start_s` (the 5-min window starts are minute-aligned, so the
+/// bucket exists). Candle row format: [time, low, high, OPEN(idx 3), close, vol].
+/// Same venue as the live feed → fair value's (S - P) carries no exchange basis.
+fn fetch_coinbase_start_price(window_start_s: u64) -> Option<f64> {
+    let end = window_start_s + 120;
+    let url = format!(
+        "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start={window_start_s}&end={end}"
+    );
+    let rows = http_json(&url)?;
+    let rows = rows.as_array()?;
+    for row in rows {
+        let Some(arr) = row.as_array() else {
+            continue;
+        };
+        let t = arr.first().and_then(Value::as_f64).unwrap_or(-1.0);
+        if (t - window_start_s as f64).abs() < 0.5 {
+            if let Some(open) = arr.get(3).and_then(Value::as_f64) {
+                if open > 0.0 {
+                    return Some(open);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn fetch_binance_start_price(cfg: &Config, window_start_s: u64) -> Option<f64> {
     let start_ms = window_start_s * 1000;
     let end_ms = start_ms + cfg.market_switch_grace_ms.max(1_000).min(30_000);
@@ -458,10 +491,12 @@ fn fetch_btc_rest_price(cfg: &Config) -> Option<f64> {
         "{}/api/v3/ticker/price?symbol=BTCUSDT",
         cfg.binance_rest_url.trim_end_matches('/')
     );
+    // Coinbase FIRST to stay same-venue as the live feed + strike (avoid basis);
+    // other venues only as deep last-resort if Coinbase is fully unreachable.
     for url in [
+        "https://api.coinbase.com/v2/prices/BTC-USD/spot",
         binance_url.as_str(),
         "https://api.binance.us/api/v3/ticker/price?symbol=BTCUSDT",
-        "https://api.coinbase.com/v2/prices/BTC-USD/spot",
         "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
     ] {
         let Some(value) = http_json(url) else {
@@ -679,6 +714,13 @@ fn live_btc_once(
     let read_timeout = Duration::from_millis(500);
     let dead_timeout = Duration::from_millis((cfg.stale_after_ms * 5).clamp(2_500, 6_000));
     tune_ws_socket(&mut socket, read_timeout)?;
+    // Coinbase needs an explicit subscribe to start streaming; its ticker message
+    // carries the last trade price in the "price" field (parsed by parse_btc_price).
+    if url.contains("coinbase") {
+        socket.send(Message::Text(
+            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channels":["ticker"]}"#.to_string(),
+        ))?;
+    }
     heartbeat(cfg, "collector", format!("btc ws subscribed {url}"))?;
     let mut last_event = Instant::now();
     while !stopping(stop, cfg) {
@@ -718,17 +760,16 @@ fn live_btc_once(
     Ok(())
 }
 
-fn btc_ws_urls(cfg: &Config) -> Vec<String> {
-    let mut urls = Vec::new();
-    let primary = cfg.binance_ws_url.trim();
-    if !primary.is_empty() {
-        urls.push(primary.to_string());
-    }
-    let us = "wss://stream.binance.us:9443/ws/btcusdt@trade";
-    if urls.iter().all(|url| url != us) {
-        urls.push(us.to_string());
-    }
-    urls
+fn btc_ws_urls(_cfg: &Config) -> Vec<String> {
+    // Coinbase ONLY. From the Dublin VPS it is ~70ms + datacenter-friendly +
+    // very stable, vs Binance (Asia) which is laggy/jittery/throttled. Crucially,
+    // the strike (price_to_beat) is ALSO sourced from Coinbase (see
+    // fetch_coinbase_start_price), so the live price S and strike P stay the SAME
+    // source — there is a ~$100+ basis between exchanges that would badly bias
+    // fair value near close if S and P came from different venues. If this WS
+    // drops, live_btc_loop falls back to Coinbase REST (still Coinbase) before any
+    // other venue, preserving that consistency.
+    vec!["wss://ws-feed.exchange.coinbase.com".to_string()]
 }
 
 fn apply_polymarket_message(state: &Arc<Mutex<LiveMarketState>>, value: &Value) -> bool {
