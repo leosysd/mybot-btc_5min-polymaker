@@ -425,16 +425,22 @@ mod unix {
                             )
                         };
                         let room = (cfg.max_side_inventory() - held).floor();
-                        if room < 1.0 {
+                        // Skip unless there's room for a FULL quote. Posting the
+                        // leftover (e.g. 2 shares when room=2) is below the exchange
+                        // minimum order size and gets rejected ("Size lower than
+                        // minimum: 5"), spamming the log and risking rate limits.
+                        // Staying a few shares under the cap is harmless; posting a
+                        // sub-minimum partial is not.
+                        if room < quote.size {
                             heartbeat(
                                 &cfg,
                                 "order-gateway",
-                                format!("side cap reached {} held={:.0}", quote.side, held),
+                                format!(
+                                    "side cap reached {} held={:.0} room={:.0} (need {:.0})",
+                                    quote.side, held, room, quote.size
+                                ),
                             )?;
                             continue;
-                        }
-                        if quote.size > room {
-                            quote.size = room;
                         }
                         // Gateway-authoritative cost-basis lock: cap THIS leg's
                         // price by the OPPOSITE side's real average fill (in-process
