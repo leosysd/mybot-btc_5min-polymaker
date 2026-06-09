@@ -57,6 +57,8 @@ fn run_bot(cfg: Config, seconds: Option<u64>) -> AppResult<()> {
     let inventory: SharedInventory = Arc::new(Mutex::new(inv));
 
     let stop: StopFlag = Arc::new(AtomicBool::new(false));
+    // Pauses gateway placement after an unmatched fill until risk reconciles.
+    let reconcile_gate: state::ReconcileGate = Arc::new(AtomicBool::new(false));
 
     // Channels: collector -> engine -> gateway -> risk.
     let (market_tx, market_rx) = mpsc::channel();
@@ -87,10 +89,11 @@ fn run_bot(cfg: Config, seconds: Option<u64>) -> AppResult<()> {
         let stop = Arc::clone(&stop);
         let inventory = Arc::clone(&inventory);
         let ledger_tx = ledger_tx.clone();
+        let reconcile_gate = Arc::clone(&reconcile_gate);
         handles.push((
             "order-gateway",
             thread::spawn(move || {
-                order_gateway::run(cfg, stop, inventory, quote_rx, ledger_tx)
+                order_gateway::run(cfg, stop, inventory, quote_rx, ledger_tx, reconcile_gate)
             }),
         ));
     }
@@ -98,9 +101,12 @@ fn run_bot(cfg: Config, seconds: Option<u64>) -> AppResult<()> {
         let cfg = cfg.clone();
         let stop = Arc::clone(&stop);
         let inventory = Arc::clone(&inventory);
+        let reconcile_gate = Arc::clone(&reconcile_gate);
         handles.push((
             "risk-ledger",
-            thread::spawn(move || risk_ledger::run(cfg, stop, inventory, ledger_rx)),
+            thread::spawn(move || {
+                risk_ledger::run(cfg, stop, inventory, ledger_rx, reconcile_gate)
+            }),
         ));
     }
     // Drop the orchestrator's spare ledger sender so the risk thread's channel
@@ -232,7 +238,8 @@ pub fn clean_run_dir(cfg: &Config) -> AppResult<()> {
     // Guard: never wipe the run dir while it still records live resting orders —
     // that file is the recovery map used to cancel them on restart. Deleting it
     // would orphan real orders on the exchange.
-    if let Ok(Some(active)) = read_json::<HashMap<String, RestingOrder>>(&cfg.active_orders_path()) {
+    if let Ok(Some(active)) = read_json::<HashMap<String, RestingOrder>>(&cfg.active_orders_path())
+    {
         if !active.is_empty() {
             return Err(format!(
                 "检测到 {} 条活跃实盘挂单记录 ({})，拒绝清空。请先 `polymaker stop` \
