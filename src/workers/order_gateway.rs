@@ -463,6 +463,7 @@ fn order_map_from_resting(resting: &HashMap<String, RestingOrder>) -> HashMap<St
                     side: order.side.clone(),
                     price: order.price,
                     size: order.size,
+                    credited: false,
                 },
             ))
         })
@@ -519,6 +520,7 @@ fn accept_resting_order(
                     side: quote.side.clone(),
                     price: quote.price,
                     size: quote.size,
+                    credited: false,
                 },
             );
         }
@@ -610,24 +612,38 @@ fn cancel_resting_side(
     // keep it counted (conservative for the cap) and DO NOT crash the loop. The
     // periodic orphan reconcile cancels any exchange-open order we lose track of.
     // Returns false so a requote skips placing a second order on this side.
-    let terminal = match send_cancel(cfg, real_orders, order_map, &order, ledger_tx, reason) {
-        Ok(t) => t,
+    match send_cancel(cfg, real_orders, order_map, &order, ledger_tx, reason) {
+        Ok(CancelOutcome::Cancelled) => {
+            // It did not fill — just release pending.
+            resting.remove(side);
+            persist_active_orders_if_real(cfg, real_orders, resting)?;
+            let mut inv = inventory.lock().unwrap();
+            recompute_pending_from_resting(&mut inv, resting);
+            Ok(true)
+        }
+        Ok(CancelOutcome::FilledOrGone) => {
+            // The order filled. Credit its shares to held NOW (before releasing
+            // pending) so held+pending never momentarily reads low — this is the
+            // fix for the live async over-accumulation. Dedup handled inside.
+            credit_filled_on_cancel(inventory, order_map, ledger_tx, &order)?;
+            resting.remove(side);
+            persist_active_orders_if_real(cfg, real_orders, resting)?;
+            let mut inv = inventory.lock().unwrap();
+            recompute_pending_from_resting(&mut inv, resting);
+            Ok(true)
+        }
         Err(err) => {
+            // Not confirmed terminal (rejected / transient I/O) — the order may
+            // still be live. Keep it counted (conservative for the cap) and do
+            // NOT crash the loop; the orphan reconcile cleans up if needed.
             heartbeat(
                 cfg,
                 "order-gateway",
                 format!("cancel {reason} unconfirmed, keeping {side} order counted: {err}"),
             )?;
-            false
+            Ok(false)
         }
-    };
-    if terminal {
-        resting.remove(side);
-        persist_active_orders_if_real(cfg, real_orders, resting)?;
-        let mut inv = inventory.lock().unwrap();
-        recompute_pending_from_resting(&mut inv, resting);
     }
-    Ok(terminal)
 }
 
 /// Cancel any order the exchange reports as open that we don't track locally.
@@ -723,6 +739,16 @@ fn cancel_all_resting_orders(
 /// Returns Ok(true) if the cancel reached a CONFIRMED-terminal state (canceled,
 /// already-gone, filled, etc.) so the caller may release the order's pending.
 /// Returns Err if the cancel was actively rejected (order may still be live).
+/// Result of attempting to cancel a resting order.
+enum CancelOutcome {
+    /// We confirmed the exchange cancelled it (it did NOT fill).
+    Cancelled,
+    /// The order is gone but NOT because we cancelled it (exchange reports
+    /// already filled / matched / not found) — treat it as FILLED. The caller
+    /// must credit its shares to held to keep held+pending consistent.
+    FilledOrGone,
+}
+
 fn send_cancel(
     cfg: &Config,
     real_orders: Option<&RealOrderClient>,
@@ -730,12 +756,15 @@ fn send_cancel(
     order: &RestingOrder,
     ledger_tx: &LedgerTx,
     reason: &str,
-) -> AppResult<bool> {
+) -> AppResult<CancelOutcome> {
+    let mut outcome = CancelOutcome::Cancelled;
     if let (Some(real_orders), Some(exchange_order_id)) =
         (real_orders, order.exchange_order_id.as_deref())
     {
         let ack = real_orders.cancel_order(exchange_order_id)?;
         if !ack.is_terminal_noop() {
+            // Not confirmed terminal — the order may still be live. Bubble up so
+            // the caller keeps it counted (conservative) and does not crash.
             return Err(format!(
                 "Polymarket cancel rejected for {exchange_order_id}: {}",
                 ack.reason
@@ -744,37 +773,123 @@ fn send_cancel(
             )
             .into());
         }
-        heartbeat(
-            cfg,
-            "order-gateway",
-            if ack.canceled {
-                format!("real cancel {exchange_order_id}")
-            } else {
+        if ack.canceled {
+            // Genuinely cancelled by us: it did not fill. Drop tracking.
+            heartbeat(
+                cfg,
+                "order-gateway",
+                format!("real cancel {exchange_order_id}"),
+            )?;
+            if let Some(order_map) = order_map {
+                order_map.lock().unwrap().remove(exchange_order_id);
+            }
+        } else {
+            // Gone but we did NOT cancel it => it filled (or vanished). Leave the
+            // order_map entry so the caller can credit it once and flag it for the
+            // user-WS dedup. This closes the async race where a TTL/requote cancel
+            // frees pending before the user-WS fill credits held.
+            heartbeat(
+                cfg,
+                "order-gateway",
                 format!(
-                    "real cancel noop {exchange_order_id}: {}",
+                    "cancel noop {exchange_order_id}: {} (treat as filled)",
                     ack.reason.unwrap_or_else(|| "not active".to_string())
-                )
-            },
-        )?;
-        if let Some(order_map) = order_map {
-            order_map.lock().unwrap().remove(exchange_order_id);
+                ),
+            )?;
+            outcome = CancelOutcome::FilledOrGone;
         }
     }
-    let cancel = OrderCancelled {
-        ts_ms: now_ms(),
-        quote_id: order.quote_id.clone(),
-        market: order.market.clone(),
-        side: order.side.clone(),
-        size: order.size,
-        reason: reason.to_string(),
-        source: if real_orders.is_some() {
-            "polymarket_clob".to_string()
-        } else {
-            "dry_run_gateway".to_string()
-        },
+    // Only record a Cancelled event for a genuine cancel; a FilledOrGone is
+    // recorded as a Fill by the caller (credit_filled_on_cancel).
+    if matches!(outcome, CancelOutcome::Cancelled) {
+        let cancel = OrderCancelled {
+            ts_ms: now_ms(),
+            quote_id: order.quote_id.clone(),
+            market: order.market.clone(),
+            side: order.side.clone(),
+            size: order.size,
+            reason: reason.to_string(),
+            source: if real_orders.is_some() {
+                "polymarket_clob".to_string()
+            } else {
+                "dry_run_gateway".to_string()
+            },
+        };
+        let _ = ledger_tx.send(LedgerEvent::Cancelled(cancel));
+    }
+    Ok(outcome)
+}
+
+/// Credit a fill discovered by the cancel path (the exchange said the order is
+/// already gone/filled). Credits the order's REMAINING (not-yet-WS-credited)
+/// shares to held under the lock, flags the order_map entry so the async
+/// user-WS fill won't double-count, and records the fill for jsonl/kill-switch.
+/// No-op if the order_map entry is already gone or already credited (the user-WS
+/// path handled it).
+fn credit_filled_on_cancel(
+    inventory: &SharedInventory,
+    order_map: Option<&SharedOrderMap>,
+    ledger_tx: &LedgerTx,
+    order: &RestingOrder,
+) -> AppResult<()> {
+    let Some(order_map) = order_map else {
+        return Ok(());
     };
-    let _ = ledger_tx.send(LedgerEvent::Cancelled(cancel));
-    Ok(true)
+    let Some(id) = order.exchange_order_id.as_deref() else {
+        return Ok(());
+    };
+    let (size, price, side, market) = {
+        let mut map = order_map.lock().unwrap();
+        match map.get_mut(id) {
+            Some(meta) if !meta.credited && meta.size > 0.001 => {
+                meta.credited = true;
+                (
+                    meta.size,
+                    meta.price,
+                    meta.side.clone(),
+                    meta.market.clone(),
+                )
+            }
+            // Gone or already credited => the user-WS path fully handled it.
+            _ => return Ok(()),
+        }
+    };
+    {
+        let mut inv = inventory.lock().unwrap();
+        // Don't wipe the current window's inventory with a stale-market credit.
+        if inv.market.is_empty() {
+            reset_inventory_for_market(&mut inv, &market);
+        }
+        if inv.market == market {
+            inv.add_fill(&market, &side, price, size);
+        }
+    }
+    let _ = ledger_tx.send(LedgerEvent::Filled(FillEvent {
+        quote_id: order.quote_id.clone(),
+        ts_ms: now_ms(),
+        market,
+        side,
+        price,
+        size,
+        inventory_up: 0.0,
+        inventory_down: 0.0,
+        pnl_if_up: 0.0,
+        pnl_if_down: 0.0,
+        source: "cancel_detected_fill".to_string(),
+    }));
+    Ok(())
+}
+
+/// True (and consumes the entry) if this order's fill was already credited via
+/// the cancel-detected-fill path. The user-WS fill path calls this first to
+/// avoid double-counting.
+fn consume_if_precredited(order_map: &SharedOrderMap, order_id: &str) -> bool {
+    let mut map = order_map.lock().unwrap();
+    if map.get(order_id).map(|m| m.credited).unwrap_or(false) {
+        map.remove(order_id);
+        return true;
+    }
+    false
 }
 
 fn apply_fill_to_resting_map(
@@ -1152,6 +1267,12 @@ fn emit_user_fill(
     price: f64,
     size: f64,
 ) -> AppResult<()> {
+    // Dedup vs the cancel-detected-fill path: if a TTL/requote cancel already
+    // found this order filled and credited it to held, the order_map entry is
+    // flagged. Consume it here without re-crediting (else we'd double-count).
+    if consume_if_precredited(order_map, order_id) {
+        return Ok(());
+    }
     let Some(meta) = reduce_order_map(order_map, order_id, size) else {
         // P2: an account fill we can't match to a known order. Could be a fill
         // that landed before order_map was written, or a restart/state gap.
@@ -1282,6 +1403,63 @@ mod tests {
             pnl_if_down: 0.0,
             source: "test".to_string(),
         }
+    }
+
+    #[test]
+    fn cancel_detected_fill_credited_once_not_double_counted() {
+        // Reproduces the live async race: a TTL/requote cancel finds the order
+        // already filled and credits held; the user-WS fill for the SAME order
+        // then arrives and must NOT double-credit (that race drove the live
+        // over-accumulation to 28 shares against a cap of 5).
+        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        }));
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
+        let order = resting_order("Up", "q1", 5.0);
+        let id = order.exchange_order_id.clone().unwrap();
+        order_map.lock().unwrap().insert(
+            id.clone(),
+            QuoteMeta {
+                quote_id: order.quote_id.clone(),
+                market: order.market.clone(),
+                condition_id: order.condition_id.clone(),
+                side: order.side.clone(),
+                price: order.price,
+                size: order.size,
+                credited: false,
+            },
+        );
+        let (ledger_tx, _rx) = std::sync::mpsc::channel();
+
+        // 1) cancel path discovers the fill and credits it once.
+        credit_filled_on_cancel(&inventory, Some(&order_map), &ledger_tx, &order).unwrap();
+        assert_eq!(inventory.lock().unwrap().up_shares, 5.0, "credited once");
+        assert!(order_map
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|m| m.credited)
+            .unwrap_or(false));
+
+        // 2) the async user-WS fill for the SAME order arrives — must dedup.
+        assert!(
+            consume_if_precredited(&order_map, &id),
+            "should be recognised as pre-credited"
+        );
+        assert_eq!(
+            inventory.lock().unwrap().up_shares,
+            5.0,
+            "must NOT be double-counted"
+        );
+        assert!(
+            order_map.lock().unwrap().get(&id).is_none(),
+            "entry consumed"
+        );
+
+        // 3) a stray second credit attempt is a no-op (entry gone).
+        credit_filled_on_cancel(&inventory, Some(&order_map), &ledger_tx, &order).unwrap();
+        assert_eq!(inventory.lock().unwrap().up_shares, 5.0, "still once");
     }
 
     #[test]
