@@ -36,7 +36,11 @@ pub fn run(cfg: Config, stop: StopFlag, inventory: SharedInventory, rx: LedgerRx
         match PositionReconciler::connect(&cfg) {
             Ok(r) => Some(r),
             Err(err) => {
-                heartbeat(&cfg, "risk-ledger", format!("position reconciler off: {err}"))?;
+                heartbeat(
+                    &cfg,
+                    "risk-ledger",
+                    format!("position reconciler off: {err}"),
+                )?;
                 None
             }
         }
@@ -44,42 +48,64 @@ pub fn run(cfg: Config, stop: StopFlag, inventory: SharedInventory, rx: LedgerRx
         None
     };
     let mut last_position_sync = Instant::now();
-    let mut up_token = cfg.polymarket_up_token_id.clone();
-    let mut down_token = cfg.polymarket_down_token_id.clone();
+    // P1: track the Up/Down token pair as an atomic group keyed by market. A
+    // window switch must never let us reconcile with a NEW Up token + a STALE
+    // Down token from the previous window. Cleared on market change; reconcile
+    // runs only when both tokens are known AND match the live inventory market.
+    let mut current_market = String::new();
+    let mut up_token = String::new();
+    let mut down_token = String::new();
+    // P2: set when the gateway reports an unmatched account fill — forces an
+    // immediate reconcile on the next loop, bypassing the interval timer.
+    let mut force_reconcile = false;
 
     while !stopping(&stop, &cfg) {
         // Periodic on-chain position reconciliation (real mode only).
         if let Some(reconciler) = &position_reconciler {
-            if cfg.reconcile_interval_ms > 0
-                && last_position_sync.elapsed() >= Duration::from_millis(cfg.reconcile_interval_ms)
-                && !up_token.trim().is_empty()
+            let interval_due = cfg.reconcile_interval_ms > 0
+                && last_position_sync.elapsed() >= Duration::from_millis(cfg.reconcile_interval_ms);
+            let pair_ready = !up_token.trim().is_empty()
                 && !down_token.trim().is_empty()
-            {
+                && !current_market.is_empty();
+            if (interval_due || force_reconcile) && pair_ready {
                 last_position_sync = Instant::now();
-                match reconciler.fetch(&up_token, &down_token) {
-                    Ok(snap) => {
-                        let corrected = {
-                            let mut inv = inventory.lock().unwrap();
-                            reconcile_inventory_with_chain(&cfg, &mut inv, &snap)?
-                        };
-                        if corrected {
-                            let inv = inventory.lock().unwrap();
-                            write_json(&cfg.inventory_path(), &*inv)?;
-                            check_kill_switch(&cfg, &stop, &inv)?;
+                // Only reconcile when BOTH tokens belong to the SAME market the
+                // shared inventory is currently on — never mix new/old windows.
+                let market_matches = { inventory.lock().unwrap().market == current_market };
+                if market_matches {
+                    force_reconcile = false;
+                    match reconciler.fetch(&up_token, &down_token) {
+                        Ok(snap) => {
+                            let corrected = {
+                                let mut inv = inventory.lock().unwrap();
+                                reconcile_inventory_with_chain(&cfg, &mut inv, &snap)?
+                            };
+                            if corrected {
+                                let inv = inventory.lock().unwrap();
+                                write_json(&cfg.inventory_path(), &*inv)?;
+                                check_kill_switch(&cfg, &stop, &inv)?;
+                            }
                         }
+                        Err(err) => heartbeat(
+                            &cfg,
+                            "risk-ledger",
+                            format!("position reconcile failed: {err}"),
+                        )?,
                     }
-                    Err(err) => heartbeat(
-                        &cfg,
-                        "risk-ledger",
-                        format!("position reconcile failed: {err}"),
-                    )?,
                 }
             }
         }
 
         match rx.recv_timeout(RECV_TIMEOUT) {
             Ok(LedgerEvent::Accepted(accepted)) => {
-                // Learn the current market's Up/Down token ids for reconcile.
+                // Learn the Up/Down token pair atomically. On a market switch,
+                // clear BOTH tokens first so we never reconcile a new Up token
+                // against a stale Down token from the previous window.
+                if accepted.quote.market != current_market {
+                    current_market = accepted.quote.market.clone();
+                    up_token.clear();
+                    down_token.clear();
+                }
                 if !accepted.quote.token_id.trim().is_empty() {
                     match accepted.quote.side.as_str() {
                         "Up" => up_token = accepted.quote.token_id.clone(),
@@ -123,6 +149,13 @@ pub fn run(cfg: Config, stop: StopFlag, inventory: SharedInventory, rx: LedgerRx
                 check_kill_switch(&cfg, &stop, &inv)?;
                 drop(inv);
                 heartbeat(&cfg, "risk-ledger", "fill accounted")?;
+            }
+            Ok(LedgerEvent::UnmatchedFill) => {
+                // Gateway saw an account fill it couldn't match to a known order.
+                // Force an immediate on-chain reconcile so the shared inventory is
+                // corrected now, not up to RECONCILE_INTERVAL_MS later.
+                force_reconcile = true;
+                heartbeat(&cfg, "risk-ledger", "unmatched fill -> forcing reconcile")?;
             }
             Err(RecvTimeoutError::Timeout) => {
                 heartbeat(&cfg, "risk-ledger", "waiting")?;

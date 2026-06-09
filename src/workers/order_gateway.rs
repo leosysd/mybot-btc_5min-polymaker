@@ -60,7 +60,11 @@ pub fn run(
 
     if let Some(real_orders) = &real_orders {
         if !resting.is_empty() {
-            heartbeat(&cfg, "order-gateway", "startup cancel previous active orders")?;
+            heartbeat(
+                &cfg,
+                "order-gateway",
+                "startup cancel previous active orders",
+            )?;
             cancel_all_resting_orders(
                 &cfg,
                 &inventory,
@@ -150,49 +154,77 @@ pub fn run(
             }
 
             match quote_rx.recv_timeout(RECV_TIMEOUT) {
-                Ok(mut quote) => {
-                    // First time we see a new window's token: warm its metadata
-                    // cache + connection so the first order's build/post are fast.
-                    if let Some(real_orders) = real_orders.as_ref() {
-                        if cfg.enable_prewarm
-                            && !quote.token_id.trim().is_empty()
-                            && primed.insert(quote.token_id.clone())
-                        {
-                            real_orders.prime_token(&quote.token_id);
-                            real_orders.prewarm();
-                            last_prewarm = Instant::now();
+                Ok(first) => {
+                    // P1: coalesce the UNBOUNDED queue to the FRESHEST quote per
+                    // side, and reject any that already went stale while queued.
+                    // Real order I/O (place/cancel/prewarm) can block for seconds
+                    // (we have seen post=2046ms), so old quotes pile up behind it;
+                    // acting on a 1s-old price in a 5-min BTC market is dangerous.
+                    let mut latest: HashMap<String, QuoteIntent> = HashMap::new();
+                    let mut queued = vec![first];
+                    while let Ok(q) = quote_rx.try_recv() {
+                        queued.push(q);
+                    }
+                    for q in queued {
+                        match latest.get(&q.side) {
+                            Some(p) if p.ts_ms >= q.ts_ms => {}
+                            _ => {
+                                latest.insert(q.side.clone(), q);
+                            }
                         }
                     }
+                    for (_qside, mut quote) in latest.into_iter() {
+                        let age = now_ms().saturating_sub(quote.ts_ms);
+                        if age > cfg.stale_after_ms {
+                            heartbeat(
+                                &cfg,
+                                "order-gateway",
+                                format!("skipped stale quote {} age={age}ms", quote.side),
+                            )?;
+                            continue;
+                        }
+                        // First time we see a new window's token: warm its metadata
+                        // cache + connection so the first order's build/post are fast.
+                        if let Some(real_orders) = real_orders.as_ref() {
+                            if cfg.enable_prewarm
+                                && !quote.token_id.trim().is_empty()
+                                && primed.insert(quote.token_id.clone())
+                            {
+                                real_orders.prime_token(&quote.token_id);
+                                real_orders.prewarm();
+                                last_prewarm = Instant::now();
+                            }
+                        }
 
-                    // New market window: reset the shared inventory for it so the
-                    // cap and cost-basis lock measure against the right book.
-                    {
-                        let mut inv = inventory.lock().unwrap();
-                        reset_inventory_for_market(&mut inv, &quote.market);
-                        recompute_pending_from_resting(&mut inv, &resting);
-                    }
+                        // New market window: reset the shared inventory for it so the
+                        // cap and cost-basis lock measure against the right book.
+                        {
+                            let mut inv = inventory.lock().unwrap();
+                            reset_inventory_for_market(&mut inv, &quote.market);
+                            recompute_pending_from_resting(&mut inv, &resting);
+                        }
 
-                    // Gateway-authoritative side cap: never let filled+pending on
-                    // this side exceed QUOTE_SIZE*INVENTORY_MULT. Because this
-                    // thread is the sole writer of pending/fills (synchronously),
-                    // held+pending is always current here — this is what stops the
-                    // over-accumulation runaway.
-                    let (held, pending, opp_avg) = {
-                        let inv = inventory.lock().unwrap();
-                        (
-                            held_shares(&inv, &quote.market, &quote.side),
-                            pending_shares(&inv, &quote.market, &quote.side),
-                            opposite_avg_cost(&inv, &quote.market, &quote.side),
-                        )
-                    };
-                    // Counts OUTSTANDING orders, so churn/lag cannot exceed the cap.
-                    let room = (cfg.max_side_inventory() - held - pending).floor();
-                    // Skip unless there's room for a FULL quote. Posting the
-                    // leftover (e.g. 2 shares when room=2) is below the exchange
-                    // minimum order size and gets rejected ("Size lower than
-                    // minimum: 5"), spamming the log and risking rate limits.
-                    if room < quote.size {
-                        heartbeat(
+                        // Gateway-authoritative side cap: never let filled+pending on
+                        // this side exceed QUOTE_SIZE*INVENTORY_MULT. Because this
+                        // thread is the sole writer of pending/fills (synchronously),
+                        // held+pending is always current here — this is what stops the
+                        // over-accumulation runaway.
+                        let (held, pending, opp_avg) = {
+                            let inv = inventory.lock().unwrap();
+                            (
+                                held_shares(&inv, &quote.market, &quote.side),
+                                pending_shares(&inv, &quote.market, &quote.side),
+                                opposite_avg_cost(&inv, &quote.market, &quote.side),
+                            )
+                        };
+                        // Counts OUTSTANDING orders, so churn/lag cannot exceed the cap.
+                        let room = (cfg.max_side_inventory() - held - pending).floor();
+                        // Skip unless there's room for a FULL quote. Posting the
+                        // leftover (e.g. 2 shares when room=2) is below the exchange
+                        // minimum order size and gets rejected ("Size lower than
+                        // minimum: 5"), spamming the log and risking rate limits.
+                        if room < quote.size {
+                            heartbeat(
                             &cfg,
                             "order-gateway",
                             format!(
@@ -200,92 +232,93 @@ pub fn run(
                                 quote.side, held, pending, room, quote.size
                             ),
                         )?;
-                        continue;
-                    }
+                            continue;
+                        }
 
-                    // Gateway-authoritative cost-basis lock: cap THIS leg's price
-                    // by the OPPOSITE side's real average fill, so completing a
-                    // pair can never breach 1 - MIN_LOCK_EDGE.
-                    if let Some(opp) = opp_avg {
-                        let cap = floor_to_tick(1.0 - cfg.min_lock_edge - opp, cfg.tick_size);
-                        if quote.price > cap {
-                            if cap < cfg.min_bid {
+                        // Gateway-authoritative cost-basis lock: cap THIS leg's price
+                        // by the OPPOSITE side's real average fill, so completing a
+                        // pair can never breach 1 - MIN_LOCK_EDGE.
+                        if let Some(opp) = opp_avg {
+                            let cap = floor_to_tick(1.0 - cfg.min_lock_edge - opp, cfg.tick_size);
+                            if quote.price > cap {
+                                if cap < cfg.min_bid {
+                                    heartbeat(
+                                        &cfg,
+                                        "order-gateway",
+                                        format!(
+                                            "lock blocks {} (opp avg {:.3}, cap {:.3} < min_bid)",
+                                            quote.side, opp, cap
+                                        ),
+                                    )?;
+                                    continue;
+                                }
                                 heartbeat(
                                     &cfg,
                                     "order-gateway",
                                     format!(
-                                        "lock blocks {} (opp avg {:.3}, cap {:.3} < min_bid)",
-                                        quote.side, opp, cap
+                                        "lock caps {} {:.3}->{:.3} (opp avg {:.3})",
+                                        quote.side, quote.price, cap, opp
                                     ),
                                 )?;
-                                continue;
+                                quote.price = cap;
                             }
-                            heartbeat(
-                                &cfg,
-                                "order-gateway",
-                                format!(
-                                    "lock caps {} {:.3}->{:.3} (opp avg {:.3})",
-                                    quote.side, quote.price, cap, opp
-                                ),
-                            )?;
-                            quote.price = cap;
                         }
-                    }
 
-                    // Backing off this side after a recent rejection.
-                    if reject_until
-                        .get(&quote.side)
-                        .is_some_and(|&until| now_ms() < until)
-                    {
-                        continue;
-                    }
-                    if should_keep_resting(&cfg, resting.get(&quote.side), &quote) {
-                        heartbeat(&cfg, "order-gateway", "kept resting quote")?;
-                        continue;
-                    }
-                    if resting.contains_key(&quote.side)
-                        && !cancel_resting_side(
+                        // Backing off this side after a recent rejection.
+                        if reject_until
+                            .get(&quote.side)
+                            .is_some_and(|&until| now_ms() < until)
+                        {
+                            continue;
+                        }
+                        if should_keep_resting(&cfg, resting.get(&quote.side), &quote) {
+                            heartbeat(&cfg, "order-gateway", "kept resting quote")?;
+                            continue;
+                        }
+                        if resting.contains_key(&quote.side)
+                            && !cancel_resting_side(
+                                &cfg,
+                                &inventory,
+                                real_orders.as_ref(),
+                                Some(&order_map),
+                                &mut resting,
+                                &ledger_tx,
+                                &quote.side,
+                                "requote",
+                            )?
+                        {
+                            // Old order not confirmed cancelled — it may still be live.
+                            // Don't place a second order on this side (would risk a
+                            // double-fill past the cap); retry on the next cycle.
+                            continue;
+                        }
+                        if !accept_resting_order(
                             &cfg,
                             &inventory,
                             real_orders.as_ref(),
                             Some(&order_map),
                             &mut resting,
                             &ledger_tx,
-                            &quote.side,
-                            "requote",
-                        )?
-                    {
-                        // Old order not confirmed cancelled — it may still be live.
-                        // Don't place a second order on this side (would risk a
-                        // double-fill past the cap); retry on the next cycle.
-                        continue;
-                    }
-                    if !accept_resting_order(
-                        &cfg,
-                        &inventory,
-                        real_orders.as_ref(),
-                        Some(&order_map),
-                        &mut resting,
-                        &ledger_tx,
-                        quote.clone(),
-                    )? {
-                        // Not placed (rejected / too small): cool this side down.
-                        if real_orders.is_some() && cfg.reject_backoff_ms > 0 {
-                            reject_until
-                                .insert(quote.side.clone(), now_ms() + cfg.reject_backoff_ms);
+                            quote.clone(),
+                        )? {
+                            // Not placed (rejected / too small): cool this side down.
+                            if real_orders.is_some() && cfg.reject_backoff_ms > 0 {
+                                reject_until
+                                    .insert(quote.side.clone(), now_ms() + cfg.reject_backoff_ms);
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    if real_orders.is_none() && rng.next_unit() <= cfg.sim_fill_chance {
-                        // Dry-run simulated fill: credit the shared inventory and
-                        // drop the resting order, then recompute pending.
-                        simulate_fill(&inventory, &mut resting, &ledger_tx, &quote)?;
-                        heartbeat(&cfg, "order-gateway", "simulated fill")?;
-                    } else if real_orders.is_some() {
-                        heartbeat(&cfg, "order-gateway", "real order resting")?;
-                    } else {
-                        heartbeat(&cfg, "order-gateway", "resting quote")?;
-                    }
+                        if real_orders.is_none() && rng.next_unit() <= cfg.sim_fill_chance {
+                            // Dry-run simulated fill: credit the shared inventory and
+                            // drop the resting order, then recompute pending.
+                            simulate_fill(&inventory, &mut resting, &ledger_tx, &quote)?;
+                            heartbeat(&cfg, "order-gateway", "simulated fill")?;
+                        } else if real_orders.is_some() {
+                            heartbeat(&cfg, "order-gateway", "real order resting")?;
+                        } else {
+                            heartbeat(&cfg, "order-gateway", "resting quote")?;
+                        }
+                    } // for each freshest-per-side quote
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     heartbeat(&cfg, "order-gateway", "waiting")?;
@@ -461,7 +494,10 @@ fn accept_resting_order(
             heartbeat(
                 cfg,
                 "order-gateway",
-                format!("order rejected, skipped {} @ {:.2}", quote.side, quote.price),
+                format!(
+                    "order rejected, skipped {} @ {:.2}",
+                    quote.side, quote.price
+                ),
             )?;
             return Ok(false);
         };
@@ -605,7 +641,11 @@ fn reconcile_orphan_orders(
     let open = match real_orders.open_order_ids() {
         Ok(ids) => ids,
         Err(err) => {
-            heartbeat(cfg, "order-gateway", format!("reconcile fetch failed: {err}"))?;
+            heartbeat(
+                cfg,
+                "order-gateway",
+                format!("reconcile fetch failed: {err}"),
+            )?;
             return Ok(());
         }
     };
@@ -664,7 +704,11 @@ fn cancel_all_resting_orders(
             reason,
         ) {
             let msg = err.to_string();
-            let _ = heartbeat(cfg, "order-gateway", format!("cancel {reason} failed: {msg}"));
+            let _ = heartbeat(
+                cfg,
+                "order-gateway",
+                format!("cancel {reason} failed: {msg}"),
+            );
             if first_error.is_none() {
                 first_error = Some(msg);
             }
@@ -694,7 +738,9 @@ fn send_cancel(
         if !ack.is_terminal_noop() {
             return Err(format!(
                 "Polymarket cancel rejected for {exchange_order_id}: {}",
-                ack.reason.clone().unwrap_or_else(|| "unknown reason".to_string())
+                ack.reason
+                    .clone()
+                    .unwrap_or_else(|| "unknown reason".to_string())
             )
             .into());
         }
@@ -731,12 +777,13 @@ fn send_cancel(
     Ok(true)
 }
 
-fn apply_fill_to_resting_map(resting: &mut HashMap<String, RestingOrder>, fill: &FillEvent) -> bool {
+fn apply_fill_to_resting_map(
+    resting: &mut HashMap<String, RestingOrder>,
+    fill: &FillEvent,
+) -> bool {
     let key = resting.iter().find_map(|(side, order)| {
         ((!fill.quote_id.is_empty() && order.quote_id == fill.quote_id)
-            || (fill.quote_id.is_empty()
-                && order.market == fill.market
-                && order.side == fill.side))
+            || (fill.quote_id.is_empty() && order.market == fill.market && order.side == fill.side))
             .then(|| side.clone())
     });
     let Some(key) = key else {
@@ -791,7 +838,15 @@ fn start_user_channel(
 ) -> AppResult<()> {
     let cfg = cfg.clone();
     thread::spawn(move || {
-        user_channel_loop(cfg, stop, credentials, inventory, order_map, gw_tx, ledger_tx)
+        user_channel_loop(
+            cfg,
+            stop,
+            credentials,
+            inventory,
+            order_map,
+            gw_tx,
+            ledger_tx,
+        )
     });
     Ok(())
 }
@@ -950,7 +1005,13 @@ fn apply_user_channel_message(
     if let Some(items) = value.as_array() {
         for item in items {
             apply_user_channel_message(
-                cfg, inventory, order_map, gw_tx, ledger_tx, seen_trades, item,
+                cfg,
+                inventory,
+                order_map,
+                gw_tx,
+                ledger_tx,
+                seen_trades,
+                item,
             )?;
         }
         return Ok(());
@@ -961,7 +1022,15 @@ fn apply_user_channel_message(
         .unwrap_or_default()
         .to_ascii_lowercase();
     if event_type == "trade" {
-        handle_user_trade(cfg, inventory, order_map, gw_tx, ledger_tx, seen_trades, value)?;
+        handle_user_trade(
+            cfg,
+            inventory,
+            order_map,
+            gw_tx,
+            ledger_tx,
+            seen_trades,
+            value,
+        )?;
     } else if event_type == "order" {
         handle_user_order(cfg, order_map, gw_tx, ledger_tx, value)?;
     }
@@ -1008,7 +1077,9 @@ fn handle_user_trade(
             let price = parse_f64_value(maker.get("price"))
                 .or_else(|| parse_f64_value(value.get("price")))
                 .unwrap_or(0.0);
-            emit_user_fill(cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size)?;
+            emit_user_fill(
+                cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size,
+            )?;
         }
         return Ok(());
     }
@@ -1023,7 +1094,9 @@ fn handle_user_trade(
         }
         let price = parse_f64_value(value.get("price")).unwrap_or(0.0);
         let size = parse_f64_value(value.get("size")).unwrap_or(0.0);
-        emit_user_fill(cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size)?;
+        emit_user_fill(
+            cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size,
+        )?;
     }
     Ok(())
 }
@@ -1080,6 +1153,20 @@ fn emit_user_fill(
     size: f64,
 ) -> AppResult<()> {
     let Some(meta) = reduce_order_map(order_map, order_id, size) else {
+        // P2: an account fill we can't match to a known order. Could be a fill
+        // that landed before order_map was written, or a restart/state gap.
+        // NEVER swallow it silently — that would under-count inventory and let
+        // the cap re-open. Log loud and force an immediate on-chain reconcile so
+        // risk corrects the shared inventory now, not up to RECONCILE_INTERVAL later.
+        eprintln!(
+            "[FILL_UNMATCHED] account fill for unknown order {order_id} size={size} price={price} — forcing reconcile"
+        );
+        let _ = heartbeat(
+            cfg,
+            "order-gateway",
+            format!("UNMATCHED fill {order_id} size={size} — forcing reconcile"),
+        );
+        let _ = ledger_tx.send(LedgerEvent::UnmatchedFill);
         return Ok(());
     };
     let fill_size = if size > 0.0 {
@@ -1199,7 +1286,8 @@ mod tests {
 
     #[test]
     fn user_fill_reduces_resting_size() {
-        let mut resting_orders = HashMap::from([("Up".to_string(), resting_order("Up", "q1", 5.0))]);
+        let mut resting_orders =
+            HashMap::from([("Up".to_string(), resting_order("Up", "q1", 5.0))]);
 
         assert!(apply_fill_to_resting_map(
             &mut resting_orders,
@@ -1224,7 +1312,8 @@ mod tests {
 
     #[test]
     fn user_cancel_removes_resting_order() {
-        let mut resting_orders = HashMap::from([("Up".to_string(), resting_order("Up", "q3", 5.0))]);
+        let mut resting_orders =
+            HashMap::from([("Up".to_string(), resting_order("Up", "q3", 5.0))]);
         let cancel = OrderCancelled {
             ts_ms: now_ms(),
             quote_id: "q3".to_string(),
@@ -1287,7 +1376,10 @@ mod tests {
             };
             let room = (cap - held - pending).floor();
             // The cap invariant: at every check, outstanding+filled <= cap.
-            assert!(held + pending <= cap + 1e-9, "cycle {cycle}: over cap before place");
+            assert!(
+                held + pending <= cap + 1e-9,
+                "cycle {cycle}: over cap before place"
+            );
             if room < size {
                 // No room for a full quote: skip (PR#17 rule). Then settle by
                 // pretending the resting order fills, to free pending.
@@ -1308,7 +1400,10 @@ mod tests {
                 recompute_pending_from_resting(&mut inv, &resting);
                 let total = held_shares(&inv, market, side) + pending_shares(&inv, market, side);
                 max_seen = max_seen.max(total);
-                assert!(total <= cap + 1e-9, "cycle {cycle}: filled+pending {total} over cap {cap}");
+                assert!(
+                    total <= cap + 1e-9,
+                    "cycle {cycle}: filled+pending {total} over cap {cap}"
+                );
             }
             // Now the order fills: pending -> filled. Total unchanged.
             if let Some(order) = resting.remove(side) {

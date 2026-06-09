@@ -5,7 +5,10 @@
 //! `std::sync::mpsc` channels replacing the old lossy Unix datagram sockets.
 
 use crate::config::Config;
-use crate::ipc::{now_ms, should_stop, FillEvent, Inventory, MarketFrame, OrderAccepted, OrderCancelled, QuoteIntent};
+use crate::ipc::{
+    now_ms, should_stop, FillEvent, Inventory, MarketFrame, OrderAccepted, OrderCancelled,
+    QuoteIntent,
+};
 use crate::AppResult;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -67,6 +70,10 @@ pub enum LedgerEvent {
     Accepted(OrderAccepted),
     Cancelled(OrderCancelled),
     Filled(FillEvent),
+    /// An account fill arrived that the gateway could not match to a known order
+    /// (pre-insert race or restart/state gap). Tells risk to force an immediate
+    /// on-chain position reconcile so the shared inventory is corrected at once.
+    UnmatchedFill,
 }
 
 pub type LedgerTx = mpsc::Sender<LedgerEvent>;
@@ -137,7 +144,10 @@ impl FastRng {
 /// Recompute pending_up / pending_down from the gateway's `resting` map and
 /// write them into the shared inventory under the lock. Called whenever
 /// `resting` changes so the cap counts outstanding orders, not just fills.
-pub fn recompute_pending_from_resting(inv: &mut Inventory, resting: &HashMap<String, RestingOrder>) {
+pub fn recompute_pending_from_resting(
+    inv: &mut Inventory,
+    resting: &HashMap<String, RestingOrder>,
+) {
     let mut pending_up = 0.0;
     let mut pending_down = 0.0;
     for order in resting.values() {
