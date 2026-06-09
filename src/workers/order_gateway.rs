@@ -16,6 +16,7 @@ use crate::real_orders::{RealOrderClient, UserWsCredentials};
 use crate::AppResult;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -26,11 +27,14 @@ use super::collector::parse_f64_value;
 use super::state::{
     held_shares, is_ws_timeout, opposite_avg_cost, pending_shares, recompute_pending_from_resting,
     reset_inventory_for_market, sleep_ms, stopping, tune_ws_socket, GatewayEvent, GatewayRx,
-    GatewayTx, LedgerEvent, LedgerTx, QuoteMeta, QuoteRx, RestingOrder, SharedInventory,
-    SharedOrderMap, StopFlag,
+    GatewayTx, LedgerEvent, LedgerTx, QuoteMeta, QuoteRx, ReconcileGate, RestingOrder,
+    SharedInventory, SharedOrderMap, StopFlag,
 };
 
 const RECV_TIMEOUT: Duration = Duration::from_millis(250);
+/// Max time placement stays paused awaiting reconcile before self-clearing, so a
+/// reconcile that can't run (e.g. tokens not yet learned) never deadlocks us.
+const RECONCILE_PAUSE_TIMEOUT: Duration = Duration::from_millis(5_000);
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -39,6 +43,7 @@ pub fn run(
     inventory: SharedInventory,
     quote_rx: QuoteRx,
     ledger_tx: LedgerTx,
+    reconcile_gate: ReconcileGate,
 ) -> AppResult<()> {
     let mut rng = super::state::FastRng::new(now_ms());
     let real_orders = if cfg.real_orders_enabled() {
@@ -116,6 +121,8 @@ pub fn run(
     // Per-side cooldown after a rejected order, so we don't spin and hammer the
     // exchange with crossing orders (and risk rate-limiting).
     let mut reject_until: HashMap<String, u64> = HashMap::new();
+    // When set, placement is paused (an unmatched fill is awaiting reconcile).
+    let mut reconcile_pause_since: Option<Instant> = None;
 
     let loop_result = (|| -> AppResult<()> {
         while !stopping(&stop, &cfg) {
@@ -153,6 +160,31 @@ pub fn run(
                 }
             }
 
+            // P1: placement pause after an unmatched fill, until risk reconciles
+            // (self-clearing after a timeout so it can never deadlock placement).
+            let placement_paused = if reconcile_gate.load(Ordering::Relaxed) {
+                match reconcile_pause_since {
+                    None => {
+                        reconcile_pause_since = Some(Instant::now());
+                        true
+                    }
+                    Some(t) if t.elapsed() < RECONCILE_PAUSE_TIMEOUT => true,
+                    Some(_) => {
+                        reconcile_gate.store(false, Ordering::Relaxed);
+                        reconcile_pause_since = None;
+                        heartbeat(
+                            &cfg,
+                            "order-gateway",
+                            "unmatched-fill pause timed out, resuming placement",
+                        )?;
+                        false
+                    }
+                }
+            } else {
+                reconcile_pause_since = None;
+                false
+            };
+
             match quote_rx.recv_timeout(RECV_TIMEOUT) {
                 Ok(first) => {
                     // P1: coalesce the UNBOUNDED queue to the FRESHEST quote per
@@ -172,6 +204,15 @@ pub fn run(
                                 latest.insert(q.side.clone(), q);
                             }
                         }
+                    }
+                    // Channel drained above (no backlog); if paused, place nothing.
+                    if placement_paused {
+                        heartbeat(
+                            &cfg,
+                            "order-gateway",
+                            "placement paused: awaiting reconcile after unmatched fill",
+                        )?;
+                        continue;
                     }
                     for (_qside, mut quote) in latest.into_iter() {
                         let age = now_ms().saturating_sub(quote.ts_ms);
@@ -880,18 +921,6 @@ fn credit_filled_on_cancel(
     Ok(())
 }
 
-/// True (and consumes the entry) if this order's fill was already credited via
-/// the cancel-detected-fill path. The user-WS fill path calls this first to
-/// avoid double-counting.
-fn consume_if_precredited(order_map: &SharedOrderMap, order_id: &str) -> bool {
-    let mut map = order_map.lock().unwrap();
-    if map.get(order_id).map(|m| m.credited).unwrap_or(false) {
-        map.remove(order_id);
-        return true;
-    }
-    false
-}
-
 fn apply_fill_to_resting_map(
     resting: &mut HashMap<String, RestingOrder>,
     fill: &FillEvent,
@@ -1270,25 +1299,28 @@ fn emit_user_fill(
     // Dedup vs the cancel-detected-fill path: if a TTL/requote cancel already
     // found this order filled and credited it to held, the order_map entry is
     // flagged. Consume it here without re-crediting (else we'd double-count).
-    if consume_if_precredited(order_map, order_id) {
-        return Ok(());
-    }
-    let Some(meta) = reduce_order_map(order_map, order_id, size) else {
-        // P2: an account fill we can't match to a known order. Could be a fill
-        // that landed before order_map was written, or a restart/state gap.
-        // NEVER swallow it silently — that would under-count inventory and let
-        // the cap re-open. Log loud and force an immediate on-chain reconcile so
-        // risk corrects the shared inventory now, not up to RECONCILE_INTERVAL later.
-        eprintln!(
-            "[FILL_UNMATCHED] account fill for unknown order {order_id} size={size} price={price} — forcing reconcile"
-        );
-        let _ = heartbeat(
-            cfg,
-            "order-gateway",
-            format!("UNMATCHED fill {order_id} size={size} — forcing reconcile"),
-        );
-        let _ = ledger_tx.send(LedgerEvent::UnmatchedFill);
-        return Ok(());
+    // Atomic match+dedup+reduce under one order_map lock (P0 fix).
+    let meta = match match_and_reduce_order(order_map, order_id, size) {
+        // Already credited by the cancel-detected-fill path — do NOT re-credit.
+        FillMatch::AlreadyCredited => return Ok(()),
+        FillMatch::Unknown => {
+            // P2: an account fill we can't match to a known order. Could be a fill
+            // that landed before order_map was written, or a restart/state gap.
+            // NEVER swallow it silently — that would under-count inventory and let
+            // the cap re-open. Log loud and force an immediate on-chain reconcile so
+            // risk corrects the shared inventory now, not up to RECONCILE_INTERVAL later.
+            eprintln!(
+                "[FILL_UNMATCHED] account fill for unknown order {order_id} size={size} price={price} — forcing reconcile"
+            );
+            let _ = heartbeat(
+                cfg,
+                "order-gateway",
+                format!("UNMATCHED fill {order_id} size={size} — forcing reconcile"),
+            );
+            let _ = ledger_tx.send(LedgerEvent::UnmatchedFill);
+            return Ok(());
+        }
+        FillMatch::Matched(meta) => meta,
     };
     let fill_size = if size > 0.0 {
         size.min(meta.size)
@@ -1336,28 +1368,46 @@ fn emit_user_fill(
     Ok(())
 }
 
-fn reduce_order_map(
+enum FillMatch {
+    /// The fill was already credited to held via the cancel-detected-fill path;
+    /// entry consumed, the caller must NOT credit again.
+    AlreadyCredited,
+    /// No matching order — an account fill we don't track.
+    Unknown,
+    /// Matched a live order; `QuoteMeta` is the pre-reduction snapshot.
+    Matched(QuoteMeta),
+}
+
+/// Look up + reduce an order_map entry for a user-WS fill, ATOMICALLY under one
+/// lock. Checking the `credited` flag and reducing the size in the same critical
+/// section closes the cross-thread race where `credit_filled_on_cancel` could
+/// flip `credited` between a separate check and a separate reduce, double-crediting.
+fn match_and_reduce_order(
     order_map: &SharedOrderMap,
     order_id: &str,
     reported_size: f64,
-) -> Option<QuoteMeta> {
-    let mut order_map = order_map.lock().unwrap();
-    let meta = order_map.get(order_id)?.clone();
+) -> FillMatch {
+    let mut map = order_map.lock().unwrap();
+    let Some(meta0) = map.get(order_id) else {
+        return FillMatch::Unknown;
+    };
+    if meta0.credited {
+        map.remove(order_id);
+        return FillMatch::AlreadyCredited;
+    }
+    let meta = meta0.clone();
     let size = if reported_size > 0.0 {
         reported_size.min(meta.size)
     } else {
         meta.size
     };
-    let should_remove = if let Some(current) = order_map.get_mut(order_id) {
+    if let Some(current) = map.get_mut(order_id) {
         current.size = (current.size - size).max(0.0);
-        current.size <= 0.001
-    } else {
-        false
-    };
-    if should_remove {
-        order_map.remove(order_id);
+        if current.size <= 0.001 {
+            map.remove(order_id);
+        }
     }
-    Some(meta)
+    FillMatch::Matched(meta)
 }
 
 fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -1442,9 +1492,13 @@ mod tests {
             .map(|m| m.credited)
             .unwrap_or(false));
 
-        // 2) the async user-WS fill for the SAME order arrives — must dedup.
+        // 2) the async user-WS fill for the SAME order arrives — the atomic
+        // match+dedup must report AlreadyCredited and NOT credit again.
         assert!(
-            consume_if_precredited(&order_map, &id),
+            matches!(
+                match_and_reduce_order(&order_map, &id, 5.0),
+                FillMatch::AlreadyCredited
+            ),
             "should be recognised as pre-credited"
         );
         assert_eq!(

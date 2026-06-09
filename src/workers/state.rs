@@ -32,6 +32,13 @@ pub type SharedInventory = Arc<Mutex<Inventory>>;
 /// on-disk STOP file) and checked by every worker loop.
 pub type StopFlag = Arc<AtomicBool>;
 
+/// Set TRUE by risk when the gateway reports an unmatched account fill, to pause
+/// the gateway's order placement until an on-chain reconcile confirms the true
+/// position (cleared by risk after a successful reconcile). The gateway also
+/// self-clears it after a timeout so a reconcile that can't run never deadlocks
+/// placement. Prevents placing into an under-counted `held` during the gap.
+pub type ReconcileGate = Arc<AtomicBool>;
+
 /// Returns true if the bot should stop: either the in-process flag is set OR the
 /// on-disk STOP file exists (so the CLI `polymaker stop` still works).
 pub fn stopping(stop: &StopFlag, cfg: &Config) -> bool {

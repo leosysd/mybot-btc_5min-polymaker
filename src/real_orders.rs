@@ -55,9 +55,12 @@ impl CancelOrderAck {
             return false;
         };
         let reason = reason.to_ascii_lowercase();
+        // Only SPECIFIC terminal phrases — not broad substrings like "already" or
+        // "cancel" that can appear in transient/retryable error messages and would
+        // make us mistake a still-live order for filled (then wrongly credit it).
+        // "canceled"/"cancelled" still cover genuine cancel acks; "already filled"
+        // matches via "filled", etc.
         [
-            "already",
-            "cancel",
             "canceled",
             "cancelled",
             "filled",
@@ -246,14 +249,19 @@ impl RealOrderClientInner {
         let post_result = self.client.post_order(signed).await;
         let post_ms = tp.elapsed().as_millis();
         let total_ms = build_ms + sign_ms + post_ms;
-        eprintln!("[ORDER_LAT] build={build_ms}ms sign={sign_ms}ms post={post_ms}ms 总={total_ms}ms");
+        eprintln!(
+            "[ORDER_LAT] build={build_ms}ms sign={sign_ms}ms post={post_ms}ms 总={total_ms}ms"
+        );
 
         // A failed POST (HTTP 4xx like "post-only crosses book", balance, etc.)
         // means this quote couldn't rest — skip it, keep the gateway alive.
         let response = match post_result {
             Ok(resp) => resp,
             Err(err) => {
-                eprintln!("[ORDER_REJECT] {} post failed (post={post_ms}ms): {err}", quote.side);
+                eprintln!(
+                    "[ORDER_REJECT] {} post failed (post={post_ms}ms): {err}",
+                    quote.side
+                );
                 return Ok(None);
             }
         };

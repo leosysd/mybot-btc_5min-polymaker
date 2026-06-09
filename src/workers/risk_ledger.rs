@@ -10,17 +10,24 @@ use crate::config::Config;
 use crate::ipc::{heartbeat, now_ms, write_json, FillEvent, Inventory};
 use crate::real_orders::{PositionReconciler, PositionSnapshot};
 use crate::AppResult;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use super::state::{
-    log_jsonl, request_stop, spawn_jsonl_writer, stopping, LedgerEvent, LedgerRx, SharedInventory,
-    StopFlag,
+    log_jsonl, request_stop, spawn_jsonl_writer, stopping, LedgerEvent, LedgerRx, ReconcileGate,
+    SharedInventory, StopFlag,
 };
 
 const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 
-pub fn run(cfg: Config, stop: StopFlag, inventory: SharedInventory, rx: LedgerRx) -> AppResult<()> {
+pub fn run(
+    cfg: Config,
+    stop: StopFlag,
+    inventory: SharedInventory,
+    rx: LedgerRx,
+    reconcile_gate: ReconcileGate,
+) -> AppResult<()> {
     // Persist a clean starting inventory (zero pending; pending is now derived
     // from the gateway's resting map and synced into the shared inventory).
     {
@@ -76,6 +83,9 @@ pub fn run(cfg: Config, stop: StopFlag, inventory: SharedInventory, rx: LedgerRx
                     force_reconcile = false;
                     match reconciler.fetch(&up_token, &down_token) {
                         Ok(snap) => {
+                            // Reconcile confirmed the on-chain position → release
+                            // any placement pause set by a prior unmatched fill.
+                            reconcile_gate.store(false, Ordering::Relaxed);
                             let corrected = {
                                 let mut inv = inventory.lock().unwrap();
                                 reconcile_inventory_with_chain(&cfg, &mut inv, &snap)?
@@ -152,10 +162,16 @@ pub fn run(cfg: Config, stop: StopFlag, inventory: SharedInventory, rx: LedgerRx
             }
             Ok(LedgerEvent::UnmatchedFill) => {
                 // Gateway saw an account fill it couldn't match to a known order.
-                // Force an immediate on-chain reconcile so the shared inventory is
-                // corrected now, not up to RECONCILE_INTERVAL_MS later.
+                // PAUSE gateway placement (the shared inventory under-counts the
+                // real position until we reconcile) and force an immediate
+                // on-chain reconcile; the gate is released once it succeeds.
+                reconcile_gate.store(true, Ordering::Relaxed);
                 force_reconcile = true;
-                heartbeat(&cfg, "risk-ledger", "unmatched fill -> forcing reconcile")?;
+                heartbeat(
+                    &cfg,
+                    "risk-ledger",
+                    "unmatched fill -> pausing placement + forcing reconcile",
+                )?;
             }
             Err(RecvTimeoutError::Timeout) => {
                 heartbeat(&cfg, "risk-ledger", "waiting")?;
@@ -167,34 +183,46 @@ pub fn run(cfg: Config, stop: StopFlag, inventory: SharedInventory, rx: LedgerRx
 }
 
 /// Overwrite locally-derived filled inventory with authoritative on-chain
-/// holdings when they diverge beyond tolerance. Cost basis comes from the Data
-/// API's initial_value, so PnL stays correct. Pending (resting) orders are NOT
-/// touched — they aren't on-chain yet. Returns true if a correction was applied.
+/// holdings when they exceed the local count (recover a MISSED fill). Cost basis
+/// comes from the Data API's initial_value, so PnL stays correct. Pending orders
+/// are NOT touched — they aren't on-chain yet. Returns true if a correction was
+/// applied.
+///
+/// P1 SAFETY: this only ever RAISES held, never lowers it. The bot is buy-only,
+/// so within a window the position can only grow; the Data API also lags
+/// indexing. Lowering held on a stale snapshot would re-open cap room
+/// (`room = cap - held - pending`) and let real over-accumulation through — the
+/// exact failure that snowballed to 28 shares. An over-stated held only freezes
+/// a side (safe); it is reset cleanly on the next window via reset_inventory.
 fn reconcile_inventory_with_chain(
     cfg: &Config,
     inventory: &mut Inventory,
     snap: &PositionSnapshot,
 ) -> AppResult<bool> {
     const TOL: f64 = 0.5;
-    let drift_up = (snap.up_shares - inventory.up_shares).abs();
-    let drift_down = (snap.down_shares - inventory.down_shares).abs();
-    if drift_up < TOL && drift_down < TOL {
-        return Ok(false);
+    let mut changed = false;
+    if snap.up_shares > inventory.up_shares + TOL {
+        inventory.up_shares = snap.up_shares;
+        inventory.up_cost = snap.up_cost;
+        changed = true;
     }
-    heartbeat(
-        cfg,
-        "risk-ledger",
-        format!(
-            "position reconcile: up {:.0}->{:.0} down {:.0}->{:.0}",
-            inventory.up_shares, snap.up_shares, inventory.down_shares, snap.down_shares
-        ),
-    )?;
-    inventory.up_shares = snap.up_shares;
-    inventory.up_cost = snap.up_cost;
-    inventory.down_shares = snap.down_shares;
-    inventory.down_cost = snap.down_cost;
-    inventory.ts_ms = now_ms();
-    Ok(true)
+    if snap.down_shares > inventory.down_shares + TOL {
+        inventory.down_shares = snap.down_shares;
+        inventory.down_cost = snap.down_cost;
+        changed = true;
+    }
+    if changed {
+        heartbeat(
+            cfg,
+            "risk-ledger",
+            format!(
+                "position reconcile (raise): up->{:.0} down->{:.0}",
+                inventory.up_shares, inventory.down_shares
+            ),
+        )?;
+        inventory.ts_ms = now_ms();
+    }
+    Ok(changed)
 }
 
 fn check_kill_switch(cfg: &Config, stop: &StopFlag, inventory: &Inventory) -> AppResult<()> {
