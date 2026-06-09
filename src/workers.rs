@@ -837,40 +837,33 @@ mod unix {
             min_lock_edge: cfg.min_lock_edge,
         });
 
-        // ── 4b. Asymmetric cost-basis lock: only cap the LOW-probability side,
-        // so we never pile the underdog into a balanced losing pair, while the
-        // HIGH-probability (favorite) side loads freely — directional
-        // favorite-weighting is the edge, and the combined avg is allowed to
-        // exceed 1 as long as the favorite is the larger position.
-        // Caveat: within a window the favorite can flip, so this can't fully
-        // prevent legging; it only stops piling the currently-cheap underdog.
-        let favorite_is_up = p_up >= 0.5;
-        let up_capped = if favorite_is_up {
-            model.up_bid
-        } else {
-            lock_capped_bid(
-                true,
-                model.up_bid,
-                inventory.up_shares,
-                inventory.up_cost,
-                inventory.down_shares,
-                inventory.down_cost,
-                cfg.min_lock_edge,
-            )
-        };
-        let down_capped = if favorite_is_up {
-            lock_capped_bid(
-                false,
-                model.down_bid,
-                inventory.up_shares,
-                inventory.up_cost,
-                inventory.down_shares,
-                inventory.down_cost,
-                cfg.min_lock_edge,
-            )
-        } else {
-            model.down_bid
-        };
+        // ── 4b. SYMMETRIC cost-basis lock: cap BOTH sides by the opposite side's
+        // average cost, so COMPLETING a pair can never exceed the lock budget
+        // (1 - MIN_LOCK_EDGE). This prevents legging into a combined-cost > 1
+        // pair (e.g. Down@0.53 then Up@0.50 = 1.03 guaranteed loss): once you
+        // hold Down@0.53, the Up bid is capped at (1-edge)-0.53, so the 0.50 Up
+        // buy is blocked. You stay directional on the side already held rather
+        // than completing a losing pair. Data showed combined>1 is the steady
+        // leak, so we cap both sides (the earlier asymmetric version let the
+        // favorite load uncapped and produced those losing pairs).
+        let up_capped = lock_capped_bid(
+            true,
+            model.up_bid,
+            inventory.up_shares,
+            inventory.up_cost,
+            inventory.down_shares,
+            inventory.down_cost,
+            cfg.min_lock_edge,
+        );
+        let down_capped = lock_capped_bid(
+            false,
+            model.down_bid,
+            inventory.up_shares,
+            inventory.up_cost,
+            inventory.down_shares,
+            inventory.down_cost,
+            cfg.min_lock_edge,
+        );
 
         // ── 5. Endgame protocol + min-probability gate: a side is only quoted
         // if its win probability >= MIN_FAIR_TO_QUOTE (skip deep longshots).
