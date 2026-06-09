@@ -244,6 +244,13 @@ pub fn run(
                             reset_inventory_for_market(&mut inv, &quote.market);
                             recompute_pending_from_resting(&mut inv, &resting);
                         }
+                        // Drop order_map entries from other windows (incl. spent
+                        // echo guards) so the map stays bounded and a stale-market
+                        // entry can't mislead fill matching.
+                        order_map
+                            .lock()
+                            .unwrap()
+                            .retain(|_, m| m.market == quote.market);
 
                         // Gateway-authoritative side cap: never let filled+pending on
                         // this side exceed QUOTE_SIZE*INVENTORY_MULT. Because this
@@ -505,6 +512,7 @@ fn order_map_from_resting(resting: &HashMap<String, RestingOrder>) -> HashMap<St
                     price: order.price,
                     size: order.size,
                     credited: false,
+                    done: false,
                 },
             ))
         })
@@ -562,6 +570,7 @@ fn accept_resting_order(
                     price: quote.price,
                     size: quote.size,
                     credited: false,
+                    done: false,
                 },
             );
         }
@@ -1391,8 +1400,10 @@ fn match_and_reduce_order(
     let Some(meta0) = map.get(order_id) else {
         return FillMatch::Unknown;
     };
-    if meta0.credited {
-        map.remove(order_id);
+    if meta0.credited || meta0.done {
+        // Fully accounted already — this is a trade-status echo or a WS-reconnect
+        // replay, NOT a missed fill. Benign: don't re-credit / reconcile / pause.
+        // Keep the entry as the echo guard (pruned per window on market change).
         return FillMatch::AlreadyCredited;
     }
     let meta = meta0.clone();
@@ -1404,7 +1415,9 @@ fn match_and_reduce_order(
     if let Some(current) = map.get_mut(order_id) {
         current.size = (current.size - size).max(0.0);
         if current.size <= 0.001 {
-            map.remove(order_id);
+            // Fully filled: KEEP the entry as an echo guard (don't remove), so a
+            // later status echo / replay is recognised as benign above.
+            current.done = true;
         }
     }
     FillMatch::Matched(meta)
@@ -1478,6 +1491,7 @@ mod tests {
                 price: order.price,
                 size: order.size,
                 credited: false,
+                done: false,
             },
         );
         let (ledger_tx, _rx) = std::sync::mpsc::channel();
@@ -1506,14 +1520,58 @@ mod tests {
             5.0,
             "must NOT be double-counted"
         );
+        // Entry is KEPT as an echo guard (credited), not removed — further echoes
+        // for it stay benign until the per-window prune.
         assert!(
-            order_map.lock().unwrap().get(&id).is_none(),
-            "entry consumed"
+            order_map
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|m| m.credited)
+                .unwrap_or(false),
+            "entry kept as echo guard"
         );
 
-        // 3) a stray second credit attempt is a no-op (entry gone).
+        // 3) a stray second credit attempt is a no-op (already credited).
         credit_filled_on_cancel(&inventory, Some(&order_map), &ledger_tx, &order).unwrap();
         assert_eq!(inventory.lock().unwrap().up_shares, 5.0, "still once");
+    }
+
+    #[test]
+    fn ws_full_fill_then_echo_is_benign_not_unknown() {
+        // After a full WS fill, a later trade-status echo / reconnect replay for
+        // the SAME order must be recognised as already-accounted (benign), NOT
+        // treated as an unknown fill (which would spam force-reconcile + pause).
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
+        order_map.lock().unwrap().insert(
+            "ex-x".to_string(),
+            QuoteMeta {
+                quote_id: "q1".to_string(),
+                market: "m".to_string(),
+                condition_id: String::new(),
+                side: "Up".to_string(),
+                price: 0.5,
+                size: 5.0,
+                credited: false,
+                done: false,
+            },
+        );
+        // First fill matches and fully consumes → entry kept, marked done.
+        assert!(matches!(
+            match_and_reduce_order(&order_map, "ex-x", 5.0),
+            FillMatch::Matched(_)
+        ));
+        assert!(order_map.lock().unwrap().get("ex-x").unwrap().done);
+        // Echo / replay of the same fill → benign (already accounted), NOT Unknown.
+        assert!(matches!(
+            match_and_reduce_order(&order_map, "ex-x", 5.0),
+            FillMatch::AlreadyCredited
+        ));
+        // A genuinely unknown order id → Unknown (still triggers reconcile path).
+        assert!(matches!(
+            match_and_reduce_order(&order_map, "never-seen", 5.0),
+            FillMatch::Unknown
+        ));
     }
 
     #[test]

@@ -126,6 +126,12 @@ pub struct QuoteMeta {
     /// cancel-detected-fill path (a TTL/requote cancel found it already filled).
     /// The async user-WS fill then skips re-crediting to avoid double-counting.
     pub credited: bool,
+    /// Set true once the order is FULLY filled via the user-WS. The entry is then
+    /// kept (not removed) as an "echo guard": later trade-status echoes / WS
+    /// reconnect replays for the same order are recognised as already-accounted
+    /// (benign) instead of "unknown fill" — which otherwise spams force-reconcile
+    /// + placement-pause. Pruned per window on market change.
+    pub done: bool,
 }
 
 /// Tracks exchange-order-id -> quote metadata for live orders, shared between
