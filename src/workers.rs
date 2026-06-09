@@ -6,7 +6,8 @@ mod unix {
         OrderAccepted, OrderCancelled, QuoteIntent, WireMessage,
     };
     use crate::pricing::{
-        digital_p_up, half_spread, lock_capped_bid, market_maker_bids, phase_for, post_only_bid,
+        digital_p_up, floor_to_tick, half_spread, lock_capped_bid, market_maker_bids, phase_for,
+        post_only_bid,
         price_sensitivity, side_allowed, time_boosted_skew, uncertainty_width, MmParams, Phase,
         SpreadInputs, ToxicityMonitor, VolEstimator,
     };
@@ -416,7 +417,13 @@ mod unix {
                         // count (shared tally, auto-resets per market) exceed
                         // QUOTE_SIZE*INVENTORY_MULT, no matter what the engine
                         // thinks. This is what stops the "30 shares" runaway.
-                        let held = filled.lock().unwrap().held(&quote.market, &quote.side);
+                        let (held, opp_avg) = {
+                            let f = filled.lock().unwrap();
+                            (
+                                f.held(&quote.market, &quote.side),
+                                f.opp_avg(&quote.market, &quote.side),
+                            )
+                        };
                         let room = (cfg.max_side_inventory() - held).floor();
                         if room < 1.0 {
                             heartbeat(
@@ -428,6 +435,39 @@ mod unix {
                         }
                         if quote.size > room {
                             quote.size = room;
+                        }
+                        // Gateway-authoritative cost-basis lock: cap THIS leg's
+                        // price by the OPPOSITE side's real average fill (in-process
+                        // tally), so completing a pair can never breach
+                        // 1 - MIN_LOCK_EDGE. The engine applies the same lock, but
+                        // its inventory feed lags/drops — so a leg like Down@0.75
+                        // can still land on a held Up@0.32 (combined 1.07). This
+                        // reliable backstop blocks/repricies that here, at the only
+                        // place that always knows the true position.
+                        if let Some(opp) = opp_avg {
+                            let cap = floor_to_tick(1.0 - cfg.min_lock_edge - opp, cfg.tick_size);
+                            if quote.price > cap {
+                                if cap < cfg.min_bid {
+                                    heartbeat(
+                                        &cfg,
+                                        "order-gateway",
+                                        format!(
+                                            "lock blocks {} (opp avg {:.3}, cap {:.3} < min_bid)",
+                                            quote.side, opp, cap
+                                        ),
+                                    )?;
+                                    continue;
+                                }
+                                heartbeat(
+                                    &cfg,
+                                    "order-gateway",
+                                    format!(
+                                        "lock caps {} {:.3}->{:.3} (opp avg {:.3})",
+                                        quote.side, quote.price, cap, opp
+                                    ),
+                                )?;
+                                quote.price = cap;
+                            }
                         }
                         // Backing off this side after a recent rejection: don't
                         // re-quote (avoids hammering the book with crossing orders).
@@ -485,7 +525,7 @@ mod unix {
                             filled
                                 .lock()
                                 .unwrap()
-                                .add(&quote.market, &quote.side, fill.size);
+                                .add(&quote.market, &quote.side, fill.size, fill.price);
                             let risk = WireMessage::FillEvent(fill);
                             send_msg(&sock, &cfg.risk_socket(), &risk)?;
                             resting.remove(&quote.side);
@@ -1917,18 +1957,28 @@ mod unix {
         market: String,
         up: f64,
         down: f64,
+        up_cost: f64,
+        down_cost: f64,
     }
 
     impl FilledTally {
-        fn add(&mut self, market: &str, side: &str, size: f64) {
+        fn add(&mut self, market: &str, side: &str, size: f64, price: f64) {
             if self.market != market {
                 self.market = market.to_string();
                 self.up = 0.0;
                 self.down = 0.0;
+                self.up_cost = 0.0;
+                self.down_cost = 0.0;
             }
             match side {
-                "Up" => self.up += size,
-                "Down" => self.down += size,
+                "Up" => {
+                    self.up += size;
+                    self.up_cost += size * price;
+                }
+                "Down" => {
+                    self.down += size;
+                    self.down_cost += size * price;
+                }
                 _ => {}
             }
         }
@@ -1941,6 +1991,26 @@ mod unix {
                 "Up" => self.up,
                 "Down" => self.down,
                 _ => 0.0,
+            }
+        }
+
+        /// Average fill price of the side OPPOSITE to `side` in `market`.
+        /// Returns None if no opposite inventory (nothing to lock against).
+        /// Used by the gateway to cost-basis-cap the completing leg using
+        /// reliable in-process fills, independent of the laggy engine feed.
+        fn opp_avg(&self, market: &str, side: &str) -> Option<f64> {
+            if self.market != market {
+                return None;
+            }
+            let (shares, cost) = match side {
+                "Up" => (self.down, self.down_cost),
+                "Down" => (self.up, self.up_cost),
+                _ => return None,
+            };
+            if shares > 0.0 {
+                Some(cost / shares)
+            } else {
+                None
             }
         }
     }
@@ -2700,7 +2770,7 @@ mod unix {
         filled
             .lock()
             .unwrap()
-            .add(&fill.market, &fill.side, fill.size);
+            .add(&fill.market, &fill.side, fill.size, fill.price);
         // Best-effort socket sync so the gateway can drop the resting order
         // (non-critical: cancel of a filled order is now idempotent anyway).
         if let Err(err) = send_msg(
