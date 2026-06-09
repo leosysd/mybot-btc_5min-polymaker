@@ -296,12 +296,21 @@ impl LiveMarketState {
     fn set_market(&mut self, next: LiveMarketIdentity) -> bool {
         let changed = self.market.as_ref().is_none_or(|old| old.slug != next.slug);
         if changed {
+            // New window: LATCH the open-price strike exactly once. Within a window
+            // the strike is FIXED (it's the settlement reference). It must NEVER be
+            // overwritten by later discoveries — those carry the LIVE price whenever
+            // the open-price fetch transiently fails, which would make the strike
+            // track spot → S-P≈0 → the model stuck at ~50/50 (blind to direction,
+            // bidding ~0.50 on both sides). That was THE bug behind "buys both
+            // sides / ignores that the market already moved".
             self.up_ask = 0.0;
             self.down_ask = 0.0;
             self.last_polymarket_ts = now_ms();
+            self.price_to_beat = next.price_to_beat;
+            self.market = Some(next);
         }
-        self.price_to_beat = next.price_to_beat;
-        self.market = Some(next);
+        // Same window: keep everything latched (especially price_to_beat). Do NOT
+        // overwrite — identity (slug/tokens/strike/window) is fixed for the window.
         changed
     }
 }
@@ -881,5 +890,41 @@ pub fn parse_f64_value(value: Option<&Value>) -> Option<f64> {
         Value::String(s) => s.parse::<f64>().ok(),
         Value::Number(n) => n.as_f64(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ident(slug: &str, strike: f64) -> LiveMarketIdentity {
+        LiveMarketIdentity {
+            slug: slug.to_string(),
+            condition_id: String::new(),
+            up_token_id: "u".to_string(),
+            down_token_id: "d".to_string(),
+            price_to_beat: strike,
+            window_end_s: 0,
+        }
+    }
+
+    #[test]
+    fn strike_latches_once_per_window() {
+        let cfg = Config::from_env().expect("config");
+        let mut s = LiveMarketState::new(&cfg);
+        // First discovery of window A latches the open strike (100).
+        assert!(s.set_market(ident("win-A", 100.0)));
+        assert_eq!(s.market.as_ref().unwrap().price_to_beat, 100.0);
+        // A later same-window discovery carrying the LIVE price (150, the bug
+        // source) must NOT move the strike.
+        assert!(!s.set_market(ident("win-A", 150.0)));
+        assert_eq!(
+            s.market.as_ref().unwrap().price_to_beat,
+            100.0,
+            "strike must stay latched within a window"
+        );
+        // A new window latches its own open strike.
+        assert!(s.set_market(ident("win-B", 200.0)));
+        assert_eq!(s.market.as_ref().unwrap().price_to_beat, 200.0);
     }
 }
