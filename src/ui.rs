@@ -713,6 +713,7 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("MARKET_INTERVAL_MS", "模拟行情间隔毫秒"),
         ("STALE_AFTER_MS", "行情过期毫秒"),
         ("WS_STALE_AFTER_MS", "live WS断流停止毫秒"),
+        ("FAVORITE_FIRST_FLAT", "空仓/已配平时只先挂胜率高的一边"),
     ];
     println!("直接回车表示不修改。");
     for (key, desc) in keys {
@@ -775,6 +776,7 @@ fn print_param_help() {
     println!("  ENDGAME_PULL_SECS      剩余秒数<该值撤掉所有单(纯抛硬币区)");
     println!("  INVENTORY_SKEW_TIME_BOOST 库存偏移随临近收盘加码倍数");
     println!("  TOX_*                  逆选择监控:被割就自动加宽价差");
+    println!("  FAVORITE_FIRST_FLAT    空仓/已配平时只先挂胜率高的一边，降低低胜率边先成交");
     println!("  ENABLE_DELTA_HEDGE     0=关。对冲为占位骨架，实单模式禁止开启");
 }
 
@@ -1313,6 +1315,12 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "POST_ONLY_MARGIN_TICKS", "2")?;
     upsert_env_if_missing(path, "REJECT_BACKOFF_MS", "500")?;
     upsert_env_if_missing(path, "MIN_FAIR_TO_QUOTE", "0")?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "FAVORITE_FIRST_FLAT",
+        "1",
+        "无库存/已配平时只先挂模型胜率高的一边，避免低胜率边先成交后单边暴露。1=开，0=恢复双边开仓。",
+    )?;
     upsert_env_if_missing(path, "ENABLE_DIRECTIONAL_EDGE", "0")?;
     upsert_env_if_missing(path, "MIN_DIRECTIONAL_EDGE", "0.04")?;
     upsert_env_if_missing(path, "DIRECTIONAL_INVENTORY_MULT", "2")?;
@@ -1339,6 +1347,18 @@ fn env_value(path: &Path, key: &str) -> Option<String> {
 fn upsert_env_if_missing(path: &Path, key: &str, value: &str) -> AppResult<()> {
     if env_value(path, key).is_none() {
         upsert_env(path, key, value)?;
+    }
+    Ok(())
+}
+
+fn upsert_env_if_missing_with_comment(
+    path: &Path,
+    key: &str,
+    value: &str,
+    comment: &str,
+) -> AppResult<()> {
+    if env_value(path, key).is_none() {
+        append_env_with_comment(path, key, value, comment)?;
     }
     Ok(())
 }
@@ -1379,6 +1399,19 @@ fn upsert_env(path: &Path, key: &str, value: &str) -> AppResult<()> {
     if !found {
         lines.push(format!("{key}={value}"));
     }
+    fs::write(path, lines.join("\n") + "\n")?;
+    secure_env_permissions(path)?;
+    Ok(())
+}
+
+fn append_env_with_comment(path: &Path, key: &str, value: &str, comment: &str) -> AppResult<()> {
+    let raw = fs::read_to_string(path).unwrap_or_default();
+    let mut lines = raw.lines().map(str::to_string).collect::<Vec<_>>();
+    if !lines.is_empty() && lines.last().is_some_and(|line| !line.trim().is_empty()) {
+        lines.push(String::new());
+    }
+    lines.push(format!("# {comment}"));
+    lines.push(format!("{key}={value}"));
     fs::write(path, lines.join("\n") + "\n")?;
     secure_env_permissions(path)?;
     Ok(())

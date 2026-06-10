@@ -310,7 +310,15 @@ fn handle_market_frame(
         (Phase::Normal, None) => {
             let up_px = up_pair_px.filter(|_| p_up >= cfg.min_fair_to_quote);
             let down_px = down_pair_px.filter(|_| (1.0 - p_up) >= cfg.min_fair_to_quote);
-            (up_px, down_px, "tov3_normal")
+            if cfg.favorite_first_flat {
+                if p_up >= 0.5 {
+                    (up_px, None, "tov3_favorite_first")
+                } else {
+                    (None, down_px, "tov3_favorite_first")
+                }
+            } else {
+                (up_px, down_px, "tov3_normal")
+            }
         }
         (Phase::ReduceOnly, _) => (up_pair_px, down_pair_px, "tov3_reduce_only"),
     };
@@ -393,6 +401,78 @@ mod tests {
         assert_eq!(rebalance_target_side(5.0, 0.0), Some(false));
         assert_eq!(rebalance_target_side(0.0, 5.0), Some(true));
         assert_eq!(rebalance_target_side(5.0, 5.0), None);
+    }
+
+    fn flat_quote_test_cfg() -> Config {
+        let mut cfg = Config::from_env().expect("config");
+        cfg.favorite_first_flat = true;
+        cfg.max_bid = 0.92;
+        cfg.min_bid = 0.05;
+        cfg.min_lock_edge = 0.02;
+        cfg.quote_size = 5.0;
+        cfg.inventory_mult = 2.0;
+        cfg.min_fair_to_quote = 0.0;
+        cfg.post_only_margin_ticks = 1.0;
+        cfg.tick_size = 0.01;
+        cfg.base_half_spread = 0.01;
+        cfg.min_half_spread = 0.0;
+        cfg.max_half_spread = 0.25;
+        cfg.latency_sec = 0.0;
+        cfg.k_adverse = 0.0;
+        cfg
+    }
+
+    fn flat_frame(btc_price: f64) -> MarketFrame {
+        MarketFrame {
+            ts_ms: now_ms(),
+            market: "btc-updown-5m-test".to_string(),
+            condition_id: "condition".to_string(),
+            up_token_id: "up".to_string(),
+            down_token_id: "down".to_string(),
+            up_ask: 0.90,
+            down_ask: 0.90,
+            btc_price,
+            price_to_beat: 100.0,
+            tau_seconds: 120.0,
+            vol_per_sqrt_sec: 1.5,
+            source: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn favorite_first_flat_quotes_only_higher_fair_side() {
+        let cfg = flat_quote_test_cfg();
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(110.0), &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("favorite quote");
+        assert_eq!(quote.side, "Up");
+        assert_eq!(quote.reason, "tov3_favorite_first");
+        assert!(rx.try_recv().is_err(), "underdog side should not be quoted");
+    }
+
+    #[test]
+    fn favorite_first_flat_can_choose_down() {
+        let cfg = flat_quote_test_cfg();
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(90.0), &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("favorite quote");
+        assert_eq!(quote.side, "Down");
+        assert_eq!(quote.reason, "tov3_favorite_first");
+        assert!(rx.try_recv().is_err(), "underdog side should not be quoted");
     }
 
     #[test]
