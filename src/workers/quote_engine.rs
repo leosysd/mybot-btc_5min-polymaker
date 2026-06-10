@@ -127,6 +127,56 @@ fn directional_edge_target_side(
     (fair - px >= min_edge).then_some(side_is_up)
 }
 
+fn pair_lock_mode(cfg: &Config) -> String {
+    cfg.pair_lock_mode.to_ascii_uppercase()
+}
+
+fn held_side_prob(pair_side_is_up: bool, p_up: f64) -> f64 {
+    if pair_side_is_up {
+        1.0 - p_up // buying Up means the existing unmatched side is Down
+    } else {
+        p_up // buying Down means the existing unmatched side is Up
+    }
+}
+
+fn pair_lock_profit(pair_side_is_up: bool, pair_px: f64, inventory: &Inventory) -> Option<f64> {
+    let opposite_avg = if pair_side_is_up {
+        (inventory.down_shares > 0.0).then_some(inventory.down_cost / inventory.down_shares)
+    } else {
+        (inventory.up_shares > 0.0).then_some(inventory.up_cost / inventory.up_shares)
+    }?;
+    Some(1.0 - opposite_avg - pair_px)
+}
+
+fn pair_lock_allows(
+    cfg: &Config,
+    pair_side_is_up: bool,
+    pair_px: f64,
+    inventory: &Inventory,
+    p_up: f64,
+    tau: f64,
+) -> bool {
+    match pair_lock_mode(cfg).as_str() {
+        "ALWAYS" => true,
+        "OFF" => false,
+        "EDGE_ONLY" => {
+            let Some(lock_profit) = pair_lock_profit(pair_side_is_up, pair_px, inventory) else {
+                return false;
+            };
+            if lock_profit + 1e-9 < cfg.pair_lock_min_profit {
+                return false;
+            }
+            let strong_threshold = if tau <= cfg.pair_lock_last_secs {
+                cfg.hybrid_endgame_min_prob
+            } else {
+                cfg.hybrid_trend_min_prob
+            };
+            held_side_prob(pair_side_is_up, p_up) < strong_threshold
+        }
+        _ => false,
+    }
+}
+
 fn use_hybrid_maker(cfg: &Config) -> bool {
     cfg.strategy_mode.eq_ignore_ascii_case("HYBRID_MAKER")
 }
@@ -419,8 +469,19 @@ fn handle_market_frame(
             None
         };
 
-    let rebalance_target = rebalance_target_side(inventory.up_shares, inventory.down_shares);
-    let directional_target = if cfg.enable_directional_edge && rebalance_target.is_some() {
+    let raw_rebalance_target = rebalance_target_side(inventory.up_shares, inventory.down_shares);
+    let rebalance_target = raw_rebalance_target.filter(|side_is_up| {
+        let pair_px = if *side_is_up {
+            up_pair_px
+        } else {
+            down_pair_px
+        };
+        pair_px
+            .map(|px| pair_lock_allows(cfg, *side_is_up, px, inventory, p_up, tau))
+            .unwrap_or(false)
+    });
+    let hold_unpaired = raw_rebalance_target.is_some() && rebalance_target.is_none();
+    let directional_target = if cfg.enable_directional_edge && raw_rebalance_target.is_some() {
         directional_edge_target_side(
             p_up,
             up_directional_px,
@@ -435,14 +496,17 @@ fn handle_market_frame(
         None
     };
     let (up_px, down_px, reason) = if use_hybrid_maker(cfg) {
-        match (phase, rebalance_target) {
-            (Phase::Pull, _) => (None, None, "tov3_pull"),
-            (_, Some(true)) if up_pair_px.is_some() => (up_pair_px, None, "tov3_hybrid_pair_lock"),
-            (_, Some(false)) if down_pair_px.is_some() => {
+        match (phase, hold_unpaired, rebalance_target) {
+            (Phase::Pull, _, _) => (None, None, "tov3_pull"),
+            (_, true, _) => (None, None, "tov3_hybrid_hold_single"),
+            (_, _, Some(true)) if up_pair_px.is_some() => {
+                (up_pair_px, None, "tov3_hybrid_pair_lock")
+            }
+            (_, _, Some(false)) if down_pair_px.is_some() => {
                 (None, down_pair_px, "tov3_hybrid_pair_lock")
             }
-            (_, Some(_)) => (None, None, "tov3_hybrid_wait_pair"),
-            (Phase::Normal | Phase::ReduceOnly, None) => hybrid_flat_quotes(
+            (_, _, Some(_)) => (None, None, "tov3_hybrid_wait_pair"),
+            (Phase::Normal | Phase::ReduceOnly, _, None) => hybrid_flat_quotes(
                 cfg,
                 frame,
                 phase,
@@ -454,20 +518,21 @@ fn handle_market_frame(
             ),
         }
     } else {
-        match (phase, rebalance_target) {
-            (Phase::Pull, _) => (None, None, "tov3_pull"),
-            (Phase::Normal, Some(true)) if up_pair_px.is_some() => {
+        match (phase, hold_unpaired, rebalance_target) {
+            (Phase::Pull, _, _) => (None, None, "tov3_pull"),
+            (_, true, _) => (None, None, "tov3_hold_single"),
+            (Phase::Normal, _, Some(true)) if up_pair_px.is_some() => {
                 (up_pair_px, None, "tov3_rebalance_lock")
             }
-            (Phase::Normal, Some(false)) if down_pair_px.is_some() => {
+            (Phase::Normal, _, Some(false)) if down_pair_px.is_some() => {
                 (None, down_pair_px, "tov3_rebalance_lock")
             }
-            (Phase::Normal, Some(_)) => match directional_target {
+            (Phase::Normal, _, Some(_)) => match directional_target {
                 Some(true) => (up_directional_px, None, "tov3_directional_edge"),
                 Some(false) => (None, down_directional_px, "tov3_directional_edge"),
                 None => (None, None, "tov3_wait_pair"),
             },
-            (Phase::Normal, None) => {
+            (Phase::Normal, _, None) => {
                 let up_px = up_pair_px.filter(|_| p_up >= cfg.min_fair_to_quote);
                 let down_px = down_pair_px.filter(|_| (1.0 - p_up) >= cfg.min_fair_to_quote);
                 if cfg.favorite_first_flat {
@@ -480,7 +545,7 @@ fn handle_market_frame(
                     (up_px, down_px, "tov3_normal")
                 }
             }
-            (Phase::ReduceOnly, _) => (up_pair_px, down_pair_px, "tov3_reduce_only"),
+            (Phase::ReduceOnly, _, _) => (up_pair_px, down_pair_px, "tov3_reduce_only"),
         }
     };
 
@@ -748,6 +813,58 @@ mod tests {
         assert_eq!(quote.side, "Down");
         assert_eq!(quote.reason, "tov3_hybrid_pair_lock");
         assert!(rx.try_recv().is_err(), "must not add more Up while long Up");
+    }
+
+    #[test]
+    fn edge_only_pair_lock_holds_when_existing_side_still_strong() {
+        let mut cfg = hybrid_quote_test_cfg();
+        cfg.pair_lock_mode = "EDGE_ONLY".to_string();
+        cfg.pair_lock_min_profit = 0.01;
+        let mut frame = flat_frame(101.0);
+        frame.vol_per_sqrt_sec = 0.17;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 5.0,
+            up_cost: 2.15,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "edge-only mode should hold a still-strong single-side position"
+        );
+    }
+
+    #[test]
+    fn edge_only_pair_lock_pairs_when_edge_fades_and_lock_profit_is_good() {
+        let mut cfg = hybrid_quote_test_cfg();
+        cfg.pair_lock_mode = "EDGE_ONLY".to_string();
+        cfg.pair_lock_min_profit = 0.01;
+        let mut frame = flat_frame(100.0);
+        frame.vol_per_sqrt_sec = 0.17;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 5.0,
+            up_cost: 2.15,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("edge-only pairing quote");
+        assert_eq!(quote.side, "Down");
+        assert_eq!(quote.reason, "tov3_hybrid_pair_lock");
+        assert!(
+            1.0 - 0.43 - quote.price >= cfg.pair_lock_min_profit - 1e-9,
+            "pairing must lock enough profit"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

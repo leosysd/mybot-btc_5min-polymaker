@@ -67,6 +67,9 @@ pub struct Config {
     pub min_fair_to_quote: f64,
     pub quote_warmup_secs: f64,
     pub rebalance_max_over_fair: f64,
+    pub pair_lock_mode: String,
+    pub pair_lock_min_profit: f64,
+    pub pair_lock_last_secs: f64,
     pub strategy_mode: String,
     pub hybrid_trend_min_prob: f64,
     pub hybrid_trend_min_market_edge: f64,
@@ -99,6 +102,11 @@ impl Config {
             run_dir_raw
         } else {
             base_dir.join(run_dir_raw)
+        };
+        let pair_lock_default = if get_bool(&file_env, "ENABLE_PAIR_LOCK", true) {
+            "ALWAYS"
+        } else {
+            "OFF"
         };
         let cfg = Self {
             base_dir,
@@ -179,6 +187,9 @@ impl Config {
             min_fair_to_quote: get_f64(&file_env, "MIN_FAIR_TO_QUOTE", 0.0),
             quote_warmup_secs: get_f64(&file_env, "QUOTE_WARMUP_SECS", 25.0),
             rebalance_max_over_fair: get_f64(&file_env, "REBALANCE_MAX_OVER_FAIR", 0.05),
+            pair_lock_mode: get(&file_env, "PAIR_LOCK_MODE", pair_lock_default),
+            pair_lock_min_profit: get_f64(&file_env, "PAIR_LOCK_MIN_PROFIT", 0.02),
+            pair_lock_last_secs: get_f64(&file_env, "PAIR_LOCK_LAST_SECS", 35.0),
             strategy_mode: get(&file_env, "STRATEGY_MODE", "HYBRID_MAKER"),
             hybrid_trend_min_prob: get_f64(&file_env, "HYBRID_TREND_MIN_PROB", 0.60),
             hybrid_trend_min_market_edge: get_f64(&file_env, "HYBRID_TREND_MIN_MARKET_EDGE", 0.02),
@@ -287,6 +298,19 @@ impl Config {
         let strategy_mode = self.strategy_mode.to_ascii_uppercase();
         if !matches!(strategy_mode.as_str(), "HYBRID_MAKER" | "LEGACY_V3") {
             return Err("STRATEGY_MODE must be HYBRID_MAKER or LEGACY_V3".into());
+        }
+        let pair_lock_mode = self.pair_lock_mode.to_ascii_uppercase();
+        if !matches!(pair_lock_mode.as_str(), "ALWAYS" | "EDGE_ONLY" | "OFF") {
+            return Err("PAIR_LOCK_MODE must be ALWAYS, EDGE_ONLY, or OFF".into());
+        }
+        if self.pair_lock_min_profit < 0.0
+            || self.pair_lock_min_profit >= 1.0
+            || !self.pair_lock_min_profit.is_finite()
+        {
+            return Err("PAIR_LOCK_MIN_PROFIT must be finite and in [0, 1)".into());
+        }
+        if self.pair_lock_last_secs < 0.0 || !self.pair_lock_last_secs.is_finite() {
+            return Err("PAIR_LOCK_LAST_SECS must be finite and non-negative".into());
         }
         if !(0.0..=1.0).contains(&self.hybrid_trend_min_prob)
             || !(0.0..=1.0).contains(&self.hybrid_range_max_prob)

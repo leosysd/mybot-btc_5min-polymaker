@@ -725,6 +725,12 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("STALE_AFTER_MS", "行情过期毫秒"),
         ("WS_STALE_AFTER_MS", "live WS断流停止毫秒"),
         ("STRATEGY_MODE", "HYBRID_MAKER新混合策略/LEGACY_V3旧逻辑"),
+        (
+            "PAIR_LOCK_MODE",
+            "单边成交后补对边模式:ALWAYS/EDGE_ONLY/OFF",
+        ),
+        ("PAIR_LOCK_MIN_PROFIT", "EDGE_ONLY补对边最低锁定利润"),
+        ("PAIR_LOCK_LAST_SECS", "EDGE_ONLY残局强边判断秒数"),
         ("HYBRID_TREND_MIN_PROB", "趋势开仓最低模型胜率"),
         (
             "HYBRID_TREND_MIN_MARKET_EDGE",
@@ -799,6 +805,11 @@ fn print_param_help() {
     println!("  INVENTORY_SKEW_TIME_BOOST 库存偏移随临近收盘加码倍数");
     println!("  TOX_*                  逆选择监控:被割就自动加宽价差");
     println!("  STRATEGY_MODE          HYBRID_MAKER=趋势强边+震荡锁仓; LEGACY_V3=旧逻辑");
+    println!(
+        "  PAIR_LOCK_MODE         ALWAYS=旧强配平; EDGE_ONLY=taker脑子maker挂单; OFF=不补对边"
+    );
+    println!("  PAIR_LOCK_MIN_PROFIT   EDGE_ONLY补对边至少锁多少每份利润");
+    println!("  PAIR_LOCK_LAST_SECS    剩余多少秒内用残局高门槛判断持仓是否仍强");
     println!("  HYBRID_TREND_*         趋势开仓阈值:模型胜率和相对盘口edge都要够");
     println!("  HYBRID_RANGE_MAX_PROB  最高胜率低于该值时按震荡处理,允许双边锁仓");
     println!("  HYBRID_ENTRY_*         趋势挂单的安全垫和相对买一价的maker抬价tick");
@@ -1585,6 +1596,24 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "MIN_FAIR_TO_QUOTE", "0")?;
     upsert_env_if_missing(path, "QUOTE_WARMUP_SECS", "25")?;
     upsert_env_if_missing(path, "REBALANCE_MAX_OVER_FAIR", "0.05")?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "PAIR_LOCK_MODE",
+        "ALWAYS",
+        "单边成交后的补对边模式：ALWAYS=旧强配平；EDGE_ONLY=taker脑子/maker挂单；OFF=完全不自动补对边。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "PAIR_LOCK_MIN_PROFIT",
+        "0.02",
+        "EDGE_ONLY 下补对边至少要锁出的每份利润。0.02=每份2美分。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "PAIR_LOCK_LAST_SECS",
+        "35",
+        "EDGE_ONLY 下剩余多少秒以内使用残局高胜率门槛判断持仓是否仍强。",
+    )?;
     upsert_env_if_missing_with_comment(
         path,
         "STRATEGY_MODE",

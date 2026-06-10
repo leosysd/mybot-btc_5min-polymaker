@@ -452,6 +452,12 @@ fn pair_only_block_reason(
         return None;
     }
     let pairing_side = pairing_side_for_held(inv.up_shares, inv.down_shares)?;
+    if cfg.pair_lock_mode.eq_ignore_ascii_case("OFF") {
+        return Some(format!(
+            "pair-lock disabled; holding single side, blocks {} while held up={:.0} down={:.0}",
+            quote.side, inv.up_shares, inv.down_shares
+        ));
+    }
     if quote.side == pairing_side {
         return None;
     }
@@ -1615,6 +1621,24 @@ mod tests {
             pair_only_block_reason(&cfg, &inventory, &quote("Up", "tov3_directional_edge"))
                 .is_none(),
             "explicit directional-edge quotes remain opt-in"
+        );
+    }
+
+    #[test]
+    fn pair_lock_off_blocks_pairing_side_too() {
+        let mut cfg = test_cfg();
+        cfg.pair_lock_mode = "OFF".to_string();
+        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 5.0,
+            up_cost: 2.5,
+            ..Default::default()
+        }));
+
+        assert!(
+            pair_only_block_reason(&cfg, &inventory, &quote("Down", "tov3_hybrid_pair_lock"))
+                .is_some(),
+            "pair-lock OFF should hold the single side instead of pairing"
         );
     }
 
