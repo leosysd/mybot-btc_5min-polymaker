@@ -511,8 +511,9 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 优先顺序：
 
-1. 用 Chainlink Data Streams 或更贴近结算源的数据替换当前交易所 BTC 价格兜底。
-2. 做 Web dashboard 页面。
-3. 长时间小额验证后再考虑提高 `LIVE_ORDER_NOTIONAL_CAP`。
+1. 按 [策略升级规划](STRATEGY_PLAN.md) 做盘口锚定、动量、订单流和历史校准；先影子模式记录，再小权重实盘启用。
+2. 用 Chainlink Data Streams 或更贴近结算源的数据替换当前交易所 BTC 价格兜底。
+3. 做 Web dashboard 页面。
+4. 长时间小额验证后再考虑提高 `LIVE_ORDER_NOTIONAL_CAP`。
 
 不要把私钥写进仓库。真实私钥只放 VPS 的 `.env` 或系统 secret。
