@@ -71,6 +71,9 @@ pub struct Config {
     pub enable_market_anchor: bool,
     pub market_anchor_shadow: bool,
     pub market_anchor_weight: f64,
+    pub market_anchor_weight_high: f64,
+    pub market_anchor_weight_low: f64,
+    pub market_anchor_low_side_below: f64,
     pub market_anchor_max_spread: f64,
     pub enable_real_orders: String,
     pub polymarket_clob_host: String,
@@ -93,6 +96,7 @@ impl Config {
         } else {
             base_dir.join(run_dir_raw)
         };
+        let market_anchor_weight = get_f64(&file_env, "MARKET_ANCHOR_WEIGHT", 0.30);
         let cfg = Self {
             base_dir,
             run_dir,
@@ -175,7 +179,18 @@ impl Config {
             value_min_fair: get_f64(&file_env, "VALUE_MIN_FAIR", 0.05),
             enable_market_anchor: get_bool(&file_env, "ENABLE_MARKET_ANCHOR", false),
             market_anchor_shadow: get_bool(&file_env, "MARKET_ANCHOR_SHADOW", true),
-            market_anchor_weight: get_f64(&file_env, "MARKET_ANCHOR_WEIGHT", 0.30),
+            market_anchor_weight,
+            market_anchor_weight_high: get_f64(
+                &file_env,
+                "MARKET_ANCHOR_WEIGHT_HIGH",
+                market_anchor_weight,
+            ),
+            market_anchor_weight_low: get_f64(
+                &file_env,
+                "MARKET_ANCHOR_WEIGHT_LOW",
+                market_anchor_weight,
+            ),
+            market_anchor_low_side_below: get_f64(&file_env, "MARKET_ANCHOR_LOW_SIDE_BELOW", 0.50),
             market_anchor_max_spread: get_f64(&file_env, "MARKET_ANCHOR_MAX_SPREAD", 0.12),
             enable_real_orders: get(&file_env, "ENABLE_REAL_ORDERS", ""),
             polymarket_clob_host: get(
@@ -283,6 +298,23 @@ impl Config {
             || !self.market_anchor_weight.is_finite()
         {
             return Err("MARKET_ANCHOR_WEIGHT must be a finite probability in [0, 1]".into());
+        }
+        if !(0.0..=1.0).contains(&self.market_anchor_weight_high)
+            || !self.market_anchor_weight_high.is_finite()
+        {
+            return Err("MARKET_ANCHOR_WEIGHT_HIGH must be a finite probability in [0, 1]".into());
+        }
+        if !(0.0..=1.0).contains(&self.market_anchor_weight_low)
+            || !self.market_anchor_weight_low.is_finite()
+        {
+            return Err("MARKET_ANCHOR_WEIGHT_LOW must be a finite probability in [0, 1]".into());
+        }
+        if !(0.0..=1.0).contains(&self.market_anchor_low_side_below)
+            || !self.market_anchor_low_side_below.is_finite()
+        {
+            return Err(
+                "MARKET_ANCHOR_LOW_SIDE_BELOW must be a finite probability in [0, 1]".into(),
+            );
         }
         if self.market_anchor_max_spread <= 0.0
             || self.market_anchor_max_spread > 1.0

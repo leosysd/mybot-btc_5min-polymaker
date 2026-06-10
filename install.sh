@@ -194,6 +194,19 @@ ensure_env_defaults() {
     append_env_line REJECT_BACKOFF_MS "# 同一边被拒后冷却毫秒数，避免空转刷 400 被限流。0=关。" "REJECT_BACKOFF_MS=500"
   fi
 
+  if section_has_missing ENABLE_MARKET_ANCHOR MARKET_ANCHOR_SHADOW MARKET_ANCHOR_WEIGHT \
+    MARKET_ANCHOR_WEIGHT_HIGH MARKET_ANCHOR_WEIGHT_LOW MARKET_ANCHOR_LOW_SIDE_BELOW \
+    MARKET_ANCHOR_MAX_SPREAD; then
+    append_section_header "# ── 盘口锚定胜率（install.sh 自动补齐）──────────────────────"
+    append_env_line ENABLE_MARKET_ANCHOR "# 1=真实报价使用盘口胜率修正模型。" "ENABLE_MARKET_ANCHOR=0"
+    append_env_line MARKET_ANCHOR_SHADOW "# 1=记录影子融合胜率，不改变报价。" "MARKET_ANCHOR_SHADOW=1"
+    append_env_line MARKET_ANCHOR_WEIGHT "# 兼容默认权重；HIGH/LOW 未设置时使用。" "MARKET_ANCHOR_WEIGHT=0.30"
+    append_env_line MARKET_ANCHOR_WEIGHT_HIGH "# 模型高胜率边盘口融合权重。" "MARKET_ANCHOR_WEIGHT_HIGH=0.30"
+    append_env_line MARKET_ANCHOR_WEIGHT_LOW "# 模型低胜率对边盘口融合权重。" "MARKET_ANCHOR_WEIGHT_LOW=0.60"
+    append_env_line MARKET_ANCHOR_LOW_SIDE_BELOW "# 低于该模型胜率的一边按 LOW 权重融合。" "MARKET_ANCHOR_LOW_SIDE_BELOW=0.50"
+    append_env_line MARKET_ANCHOR_MAX_SPREAD "# 盘口价差超过该值时锚定权重归零。" "MARKET_ANCHOR_MAX_SPREAD=0.12"
+  fi
+
   if section_has_missing MIN_FAIR_TO_QUOTE; then
     append_section_header "# ── 最低胜率门槛（install.sh 自动补齐）──────────────────────"
     append_env_line MIN_FAIR_TO_QUOTE "# 某边胜率低于此值就不报该边(不碰深度劣势方)。0=关;建议 0.25~0.35。" "MIN_FAIR_TO_QUOTE=0"

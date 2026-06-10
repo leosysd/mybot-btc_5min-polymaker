@@ -445,16 +445,20 @@ MAX_UNPAIRED_SHARES=19
 ENABLE_MARKET_ANCHOR=0
 MARKET_ANCHOR_SHADOW=1
 MARKET_ANCHOR_WEIGHT=0.30
+MARKET_ANCHOR_WEIGHT_HIGH=0.30
+MARKET_ANCHOR_WEIGHT_LOW=0.60
+MARKET_ANCHOR_LOW_SIDE_BELOW=0.50
 MARKET_ANCHOR_MAX_SPREAD=0.12
 ```
 
 盘口锚定胜率。默认只记录影子融合胜率，不改变实盘报价：
 
 ```text
-FinalUp = 模型Up * (1 - 权重) + 盘口Up * 权重
+Up边fair   = 模型Up   * (1 - Up边权重)   + 盘口Up   * Up边权重
+Down边fair = 模型Down * (1 - Down边权重) + 盘口Down * Down边权重
 ```
 
-实际权重会随盘口健康度变化；bid/ask 越窄，权重越接近 `MARKET_ANCHOR_WEIGHT`，价差超过 `MARKET_ANCHOR_MAX_SPREAD` 时权重归零。只有把 `ENABLE_MARKET_ANCHOR=1` 后，quote-engine 才会用 `FinalUp` 替代纯模型胜率参与真实报价。`polymaker model-market` 会显示 `FinalUp` 方便先观察。
+`MARKET_ANCHOR_WEIGHT_HIGH` 用在模型高胜率边，默认 0.30，保留模型自己的优势；`MARKET_ANCHOR_WEIGHT_LOW` 用在模型低胜率边，默认 0.60，让对边更多参考盘口，避免“盘口 25、模型只挂 5”这种差太远的报价。`MARKET_ANCHOR_LOW_SIDE_BELOW=0.50` 表示模型胜率低于 50% 的一边按 LOW 权重处理。实际权重会随盘口健康度变化；bid/ask 越窄，权重越接近 HIGH/LOW 设定，价差超过 `MARKET_ANCHOR_MAX_SPREAD` 时权重归零。只有把 `ENABLE_MARKET_ANCHOR=1` 后，quote-engine 才会用融合后的单边 fair 参与真实报价。`polymaker model-market` 会显示影子 `FinalUp` 方便先观察。
 
 ```text
 MIN_BID=0.05
@@ -495,7 +499,7 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 1. 用 BTC 相对开盘价的偏移估算 `p_up`。
 2. `p_down = 1 - p_up`。
-3. 当前只有一套 value-buy maker 策略：Up/Down 各自独立判断，只在买价低于 fair 至少 `VALUE_MIN_EDGE` 时挂 maker 买单。默认 fair 是 Binance 模型；如果启用 `ENABLE_MARKET_ANCHOR=1`，fair 会使用盘口锚定后的 `FinalUp`。
+3. 当前只有一套 value-buy maker 策略：Up/Down 各自独立判断，只在买价低于 fair 至少 `VALUE_MIN_EDGE` 时挂 maker 买单。默认 fair 是 Binance 模型；如果启用 `ENABLE_MARKET_ANCHOR=1`，Up/Down 会分别使用盘口锚定后的单边 fair。
 4. 新模式会参考当前买一价，最多抬高 `VALUE_AGGRESSION_TICKS` 个 tick，但仍然必须满足 post-only，且不能高于 `fair - VALUE_MIN_EDGE`。
 5. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
 6. 新模式不做中途卖出；`MAX_UNPAIRED_SHARES` 会限制单边差额，超过后只允许挂落后的一边。

@@ -126,16 +126,14 @@ fn market_up_mid_and_spread(frame: &MarketFrame) -> Option<(f64, f64)> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct FairSnapshot {
-    model_up: f64,
-    market_up: f64,
-    final_up_shadow: f64,
+struct SideFair {
+    shadow: f64,
+    quote: f64,
     anchor_weight: f64,
-    quote_up: f64,
     anchor_active: bool,
 }
 
-impl FairSnapshot {
+impl SideFair {
     fn fair_source(self) -> &'static str {
         if self.anchor_active {
             "market_anchor"
@@ -147,42 +145,111 @@ impl FairSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FairSnapshot {
+    model_up: f64,
+    market_up: f64,
+    up: SideFair,
+    down: SideFair,
+}
+
+impl FairSnapshot {
+    fn quote_up(self) -> f64 {
+        self.up.quote
+    }
+
+    fn quote_down(self) -> f64 {
+        self.down.quote
+    }
+
+    fn composite_up(self) -> f64 {
+        ((self.up.quote + (1.0 - self.down.quote)) / 2.0).clamp(0.0, 1.0)
+    }
+
+    fn final_up_shadow(self) -> f64 {
+        ((self.up.shadow + (1.0 - self.down.shadow)) / 2.0).clamp(0.0, 1.0)
+    }
+
+    fn side_anchor_weight(self, side: &str) -> f64 {
+        if side == "Up" {
+            self.up.anchor_weight
+        } else {
+            self.down.anchor_weight
+        }
+    }
+
+    fn fair_source(self, side: &str) -> &'static str {
+        if side == "Up" {
+            self.up.fair_source()
+        } else {
+            self.down.fair_source()
+        }
+    }
+}
+
+fn side_anchor_weight(cfg: &Config, side_model_fair: f64, spread: f64) -> f64 {
+    let max_weight = if side_model_fair < cfg.market_anchor_low_side_below {
+        cfg.market_anchor_weight_low
+    } else {
+        cfg.market_anchor_weight_high
+    };
+    market_anchor_weight(max_weight, spread, cfg.market_anchor_max_spread)
+}
+
 fn fair_snapshot(cfg: &Config, frame: &MarketFrame, model_up: f64) -> FairSnapshot {
     let anchor_enabled = cfg.enable_market_anchor || cfg.market_anchor_shadow;
-    let (market_up, anchor_weight) = if anchor_enabled {
-        market_up_mid_and_spread(frame)
-            .map(|(market_up, spread)| {
-                (
-                    market_up,
-                    market_anchor_weight(
-                        cfg.market_anchor_weight,
-                        spread,
-                        cfg.market_anchor_max_spread,
-                    ),
-                )
-            })
-            .unwrap_or((0.0, 0.0))
+    let model_down = 1.0 - model_up;
+    let (market_up, spread) = if anchor_enabled {
+        market_up_mid_and_spread(frame).unwrap_or((0.0, 1.0))
     } else {
-        (0.0, 0.0)
+        (0.0, 1.0)
     };
-    let final_up_shadow = if anchor_weight > 0.0 {
-        blend_market_anchor(model_up, market_up, anchor_weight)
+    let market_down = 1.0 - market_up;
+    let up_anchor_weight = if anchor_enabled {
+        side_anchor_weight(cfg, model_up, spread)
     } else {
-        model_up
+        0.0
     };
-    let anchor_active = cfg.enable_market_anchor && anchor_weight > 0.0;
-    let quote_up = if anchor_active {
-        final_up_shadow
+    let down_anchor_weight = if anchor_enabled {
+        side_anchor_weight(cfg, model_down, spread)
+    } else {
+        0.0
+    };
+    let up_shadow = if up_anchor_weight > 0.0 {
+        blend_market_anchor(model_up, market_up, up_anchor_weight)
     } else {
         model_up
     };
+    let down_shadow = if down_anchor_weight > 0.0 {
+        blend_market_anchor(model_down, market_down, down_anchor_weight)
+    } else {
+        model_down
+    };
+    let up_anchor_active = cfg.enable_market_anchor && up_anchor_weight > 0.0;
+    let down_anchor_active = cfg.enable_market_anchor && down_anchor_weight > 0.0;
     FairSnapshot {
         model_up,
         market_up,
-        final_up_shadow,
-        anchor_weight,
-        quote_up,
-        anchor_active,
+        up: SideFair {
+            shadow: up_shadow,
+            quote: if up_anchor_active {
+                up_shadow
+            } else {
+                model_up
+            },
+            anchor_weight: up_anchor_weight,
+            anchor_active: up_anchor_active,
+        },
+        down: SideFair {
+            shadow: down_shadow,
+            quote: if down_anchor_active {
+                down_shadow
+            } else {
+                model_down
+            },
+            anchor_weight: down_anchor_weight,
+            anchor_active: down_anchor_active,
+        },
     }
 }
 
@@ -223,14 +290,15 @@ fn value_buy_quotes(
     cfg: &Config,
     frame: &MarketFrame,
     phase: Phase,
-    p_up: f64,
+    up_fair: f64,
+    down_fair: f64,
     model: ModelQuote,
 ) -> (Option<f64>, Option<f64>, &'static str) {
     if phase == Phase::Pull {
         return (None, None, "value_buy_pull");
     }
-    let up_px = value_buy_px(cfg, frame, true, p_up, model.up_bid);
-    let down_px = value_buy_px(cfg, frame, false, 1.0 - p_up, model.down_bid);
+    let up_px = value_buy_px(cfg, frame, true, up_fair, model.up_bid);
+    let down_px = value_buy_px(cfg, frame, false, down_fair, model.down_bid);
     (up_px, down_px, "value_buy")
 }
 
@@ -283,7 +351,7 @@ fn handle_market_frame(
     let width = uncertainty_width(vol, tau, cfg.width_floor_usd);
     let p_model_up = digital_p_up(frame.btc_price, frame.price_to_beat, width);
     let fair = fair_snapshot(cfg, frame, p_model_up);
-    let p_up = fair.quote_up;
+    let p_up = fair.composite_up();
 
     // ── 2. Toxicity feedback: settle matured fills, get any extra widening.
     tox.on_fair(p_up, now_ms());
@@ -331,10 +399,19 @@ fn handle_market_frame(
     });
 
     let phase = phase_for(tau, cfg.endgame_pull_secs);
-    let (up_px, down_px, reason) = value_buy_quotes(cfg, frame, phase, p_up, model);
+    let (up_px, down_px, reason) =
+        value_buy_quotes(cfg, frame, phase, fair.quote_up(), fair.quote_down(), model);
     if let Some(px) = up_px {
         send_quote(
-            cfg, quote_tx, frame, "Up", px, p_up, inventory, reason, fair,
+            cfg,
+            quote_tx,
+            frame,
+            "Up",
+            px,
+            fair.quote_up(),
+            inventory,
+            reason,
+            fair,
         )?;
     }
     if let Some(px) = down_px {
@@ -344,7 +421,7 @@ fn handle_market_frame(
             frame,
             "Down",
             px,
-            1.0 - p_up,
+            fair.quote_down(),
             inventory,
             reason,
             fair,
@@ -394,9 +471,9 @@ fn send_quote(
         fair,
         model_up: fair_snapshot.model_up,
         market_up: fair_snapshot.market_up,
-        final_up_shadow: fair_snapshot.final_up_shadow,
-        market_anchor_weight: fair_snapshot.anchor_weight,
-        fair_source: fair_snapshot.fair_source().to_string(),
+        final_up_shadow: fair_snapshot.final_up_shadow(),
+        market_anchor_weight: fair_snapshot.side_anchor_weight(side),
+        fair_source: fair_snapshot.fair_source(side).to_string(),
         inventory_up: inventory.effective_up(),
         inventory_down: inventory.effective_down(),
         reason: reason.to_string(),
@@ -510,6 +587,37 @@ mod tests {
         assert!(q1.price <= q1.fair - cfg.value_min_edge + 1e-9);
         assert!(q2.price <= q2.fair - cfg.value_min_edge + 1e-9);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn market_anchor_can_weight_low_probability_side_more() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.enable_market_anchor = true;
+        cfg.market_anchor_weight_high = 0.30;
+        cfg.market_anchor_weight_low = 0.60;
+        cfg.market_anchor_low_side_below = 0.50;
+        cfg.market_anchor_max_spread = 0.12;
+
+        let mut frame = flat_frame(100.0);
+        frame.up_bid = 0.70;
+        frame.up_ask = 0.72;
+        frame.down_bid = 0.25;
+        frame.down_ask = 0.27;
+
+        let fair = fair_snapshot(&cfg, &frame, 0.80);
+
+        assert!(
+            fair.side_anchor_weight("Down") > fair.side_anchor_weight("Up"),
+            "low-probability side should use the larger LOW anchor weight"
+        );
+        assert!(
+            fair.quote_down() > 0.20,
+            "low-probability side should move toward the live market fair"
+        );
+        assert!(
+            fair.quote_up() > 0.70,
+            "favorite side still stays anchored above the market favorite fair"
+        );
     }
 
     #[test]

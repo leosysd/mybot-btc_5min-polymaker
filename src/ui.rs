@@ -735,7 +735,10 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("VALUE_MIN_FAIR", "价值买入最低模型胜率过滤"),
         ("ENABLE_MARKET_ANCHOR", "1=真实报价使用盘口锚定融合胜率"),
         ("MARKET_ANCHOR_SHADOW", "1=记录影子融合胜率,不改报价"),
-        ("MARKET_ANCHOR_WEIGHT", "盘口锚定最大权重"),
+        ("MARKET_ANCHOR_WEIGHT", "盘口锚定兼容默认权重"),
+        ("MARKET_ANCHOR_WEIGHT_HIGH", "模型高胜率边盘口锚定权重"),
+        ("MARKET_ANCHOR_WEIGHT_LOW", "模型低胜率边盘口锚定权重"),
+        ("MARKET_ANCHOR_LOW_SIDE_BELOW", "低胜率边判定阈值"),
         ("MARKET_ANCHOR_MAX_SPREAD", "盘口健康价差上限"),
     ];
     println!("直接回车表示不修改。");
@@ -804,7 +807,10 @@ fn print_param_help() {
     println!("  VALUE_MIN_FAIR         最低模型胜率过滤,低于则不挂这一边");
     println!("  ENABLE_MARKET_ANCHOR   1=真实报价使用盘口锚定融合胜率;默认0");
     println!("  MARKET_ANCHOR_SHADOW   1=只记录FinalUp影子胜率,不改变报价");
-    println!("  MARKET_ANCHOR_WEIGHT   盘口锚定最大权重,盘口越窄实际权重越高");
+    println!("  MARKET_ANCHOR_WEIGHT   兼容默认权重;HIGH/LOW未设置时使用它");
+    println!("  MARKET_ANCHOR_WEIGHT_HIGH 模型高胜率边盘口锚定权重");
+    println!("  MARKET_ANCHOR_WEIGHT_LOW  模型低胜率边盘口锚定权重");
+    println!("  MARKET_ANCHOR_LOW_SIDE_BELOW 低于该模型胜率的一边按LOW权重");
     println!("  MARKET_ANCHOR_MAX_SPREAD 盘口健康价差上限,超过则权重归零");
     println!("  ENABLE_DELTA_HEDGE     0=关。对冲为占位骨架，实单模式禁止开启");
 }
@@ -1736,19 +1742,10 @@ fn model_market_sample(cfg: &Config, frame: &MarketFrame) -> Option<ModelMarketS
     let model_up = digital_p_up(frame.btc_price, frame.price_to_beat, width);
     let (market_up, exact_book, book_spread) = market_up_mid(frame)?;
     let anchor_enabled = cfg.enable_market_anchor || cfg.market_anchor_shadow;
-    let anchor_weight = if anchor_enabled {
-        market_anchor_weight(
-            cfg.market_anchor_weight,
-            book_spread,
-            cfg.market_anchor_max_spread,
-        )
+    let (final_up_shadow, anchor_weight) = if anchor_enabled {
+        asymmetric_anchor_shadow_up(cfg, model_up, market_up, book_spread)
     } else {
-        0.0
-    };
-    let final_up_shadow = if anchor_weight > 0.0 {
-        blend_market_anchor(model_up, market_up, anchor_weight)
-    } else {
-        model_up
+        (model_up, 0.0)
     };
     Some(ModelMarketSample {
         ts_ms: frame.ts_ms,
@@ -1760,6 +1757,33 @@ fn model_market_sample(cfg: &Config, frame: &MarketFrame) -> Option<ModelMarketS
         anchor_weight,
         exact_book,
     })
+}
+
+fn asymmetric_anchor_shadow_up(
+    cfg: &Config,
+    model_up: f64,
+    market_up: f64,
+    book_spread: f64,
+) -> (f64, f64) {
+    let model_down = 1.0 - model_up;
+    let market_down = 1.0 - market_up;
+    let up_weight = side_market_anchor_weight(cfg, model_up, book_spread);
+    let down_weight = side_market_anchor_weight(cfg, model_down, book_spread);
+    let up_shadow = blend_market_anchor(model_up, market_up, up_weight);
+    let down_shadow = blend_market_anchor(model_down, market_down, down_weight);
+    (
+        ((up_shadow + (1.0 - down_shadow)) / 2.0).clamp(0.0, 1.0),
+        (up_weight + down_weight) / 2.0,
+    )
+}
+
+fn side_market_anchor_weight(cfg: &Config, side_model_fair: f64, book_spread: f64) -> f64 {
+    let max_weight = if side_model_fair < cfg.market_anchor_low_side_below {
+        cfg.market_anchor_weight_low
+    } else {
+        cfg.market_anchor_weight_high
+    };
+    market_anchor_weight(max_weight, book_spread, cfg.market_anchor_max_spread)
 }
 
 fn market_up_mid(frame: &MarketFrame) -> Option<(f64, bool, f64)> {
@@ -1960,7 +1984,25 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
         path,
         "MARKET_ANCHOR_WEIGHT",
         "0.30",
-        "盘口胜率最大融合权重；盘口越窄实际权重越接近该值。",
+        "盘口胜率兼容默认权重；HIGH/LOW未设置时使用该值。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "MARKET_ANCHOR_WEIGHT_HIGH",
+        "0.30",
+        "模型高胜率边盘口融合权重；低一些可保留模型优势。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "MARKET_ANCHOR_WEIGHT_LOW",
+        "0.60",
+        "模型低胜率对边盘口融合权重；高一些可避免低边挂价离谱。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "MARKET_ANCHOR_LOW_SIDE_BELOW",
+        "0.50",
+        "模型胜率低于该值的一边按 MARKET_ANCHOR_WEIGHT_LOW 融合。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
