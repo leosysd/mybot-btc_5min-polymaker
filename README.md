@@ -230,6 +230,12 @@ Down 买 5 份，价格 0.50
 polymaker stop
 ```
 
+紧急撤销 Polymarket 账户全部 open orders：
+
+```bash
+polymaker cancel-all
+```
+
 ## 常用命令
 
 查看帮助：

@@ -521,7 +521,7 @@ fn send_quote(
         inventory.effective_down()
     };
     let left = (cfg.max_side_inventory() - side_inventory).floor();
-    if left < 1.0 {
+    if left + 1e-9 < cfg.quote_size {
         return Ok(());
     }
     let quote = QuoteIntent {
@@ -536,7 +536,7 @@ fn send_quote(
         },
         side: side.to_string(),
         price,
-        size: cfg.quote_size.min(left).round().max(1.0),
+        size: cfg.quote_size.round().max(1.0),
         fair,
         inventory_up: inventory.effective_up(),
         inventory_down: inventory.effective_down(),

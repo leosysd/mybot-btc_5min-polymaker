@@ -9,7 +9,7 @@
 
 use crate::config::Config;
 use crate::ipc::{
-    heartbeat, now_ms, write_json, FillEvent, OrderAccepted, OrderCancelled, QuoteIntent,
+    heartbeat, now_ms, write_json, FillEvent, Inventory, OrderAccepted, OrderCancelled, QuoteIntent,
 };
 use crate::pricing::floor_to_tick;
 use crate::real_orders::{RealOrderClient, UserWsCredentials};
@@ -274,16 +274,21 @@ pub fn run(
                         // thread is the sole writer of pending/fills (synchronously),
                         // held+pending is always current here — this is what stops the
                         // over-accumulation runaway.
-                        let (held, pending, opp_avg) = {
+                        let (held, pending, opp_avg, pairing_room) = {
                             let inv = inventory.lock().unwrap();
                             (
                                 held_shares(&inv, &quote.market, &quote.side),
                                 pending_shares(&inv, &quote.market, &quote.side),
                                 opposite_avg_cost(&inv, &quote.market, &quote.side),
+                                pairing_shortfall_room(&inv, &quote.market, &quote.side),
                             )
                         };
                         // Counts OUTSTANDING orders, so churn/lag cannot exceed the cap.
-                        let room = (cfg.max_side_inventory() - held - pending).floor();
+                        let side_cap_room = cfg.max_side_inventory() - held - pending;
+                        let room = pairing_room
+                            .map(|pair| pair.min(side_cap_room))
+                            .unwrap_or(side_cap_room)
+                            .floor();
                         // Skip unless there's room for a FULL quote. Posting the
                         // leftover (e.g. 2 shares when room=2) is below the exchange
                         // minimum order size and gets rejected ("Size lower than
@@ -454,6 +459,24 @@ fn pair_only_block_reason(
         "pair-only blocks {} while held up={:.0} down={:.0}; pairing side={}",
         quote.side, inv.up_shares, inv.down_shares, pairing_side
     ))
+}
+
+fn pairing_shortfall_room(inv: &Inventory, market: &str, side: &str) -> Option<f64> {
+    const MIN_UNMATCHED_SHARES: f64 = 0.5;
+    if inv.market != market {
+        return None;
+    }
+    match side {
+        "Up" => {
+            let shortfall = inv.down_shares - inv.up_shares;
+            (shortfall > MIN_UNMATCHED_SHARES).then(|| (shortfall - inv.pending_up).max(0.0))
+        }
+        "Down" => {
+            let shortfall = inv.up_shares - inv.down_shares;
+            (shortfall > MIN_UNMATCHED_SHARES).then(|| (shortfall - inv.pending_down).max(0.0))
+        }
+        _ => None,
+    }
 }
 
 /// Apply an event from the user-WS child thread to the resting map. The shared
@@ -1585,6 +1608,34 @@ mod tests {
             pair_only_block_reason(&cfg, &inventory, &quote("Up", "tov3_directional_edge"))
                 .is_none(),
             "explicit directional-edge quotes remain opt-in"
+        );
+    }
+
+    #[test]
+    fn pairing_room_counts_pending_pair_leg() {
+        let market = "btc-updown-5m-test";
+        let inv = Inventory {
+            market: market.to_string(),
+            down_shares: 5.0,
+            down_cost: 3.15,
+            pending_up: 5.0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            pairing_shortfall_room(&inv, market, "Up"),
+            Some(0.0),
+            "pending Up already covers the Down shortfall"
+        );
+
+        let inv_without_pending = Inventory {
+            pending_up: 0.0,
+            ..inv
+        };
+        assert_eq!(
+            pairing_shortfall_room(&inv_without_pending, market, "Up"),
+            Some(5.0),
+            "without a pending pair leg there is room for exactly one full Up quote"
         );
     }
 

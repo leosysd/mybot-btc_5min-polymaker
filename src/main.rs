@@ -31,6 +31,12 @@ fn main() -> AppResult<()> {
         "risk-ledger" | "risk" => workers::run_risk(cfg),
         "stop" => workers::write_stop(&cfg),
         "restart" => workers::restart_background(&cfg),
+        "cancel-all" | "cancelall" => {
+            let real_orders = real_orders::RealOrderClient::connect(&cfg)?;
+            let canceled = real_orders.cancel_all()?;
+            println!("已请求撤销 Polymarket 账户全部 open orders: {canceled} 个");
+            Ok(())
+        }
         "status" => ui::print_status(&cfg),
         "stats" | "stat" => ui::print_trade_stats(&cfg),
         "model-market" | "market-edge" | "edge" => ui::print_model_market_stats(&cfg),
@@ -90,6 +96,7 @@ fn print_usage() {
   polymaker stats                     查看交易统计表(按盘口聚合)\n\
   polymaker model-market              查看模型胜率 vs Polymarket盘口胜率\n\
   polymaker stop                      通知所有进程停止\n\
+  polymaker cancel-all                撤销账户全部 Polymarket open orders\n\
   polymaker restart                   重启后台服务\n\
   polymaker init                      初始化 .env 配置\n\
   polymaker clean                     删除 run 运行目录\n"
