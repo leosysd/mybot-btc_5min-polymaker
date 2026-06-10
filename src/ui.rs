@@ -759,7 +759,7 @@ fn print_param_help() {
     println!("  DATA_MODE         sim=本地模拟；live=真实Polymarket/BTC WS行情");
     println!("  AUTO_DISCOVER_*   1=自动发现当前5分钟市场并自动切换token");
     println!("  POLYMARKET_*      手动覆盖时的当前市场Up/Down token id");
-    println!("  PRICE_TO_BEAT     手动覆盖时的判定价；自动模式会用开盘价/最新价兜底");
+    println!("  PRICE_TO_BEAT     手动覆盖时的判定价；自动模式会用Binance开盘价");
     println!("  QUOTE_SIZE        每次单边报价份数");
     println!("  QUOTE_SPREAD      毛价差，约束 up_bid + down_bid <= 1 - spread");
     println!("  QUOTE_TTL_MS      未成交报价 pending 保留多久，过期释放库存占用");

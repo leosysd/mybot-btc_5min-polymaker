@@ -1,5 +1,5 @@
 //! Market-data collector thread: produces `MarketFrame`s (simulated or live
-//! Polymarket/Coinbase WS + auto discovery) and sends them over the channel to
+//! Polymarket/Binance WS + auto discovery) and sends them over the channel to
 //! the quote engine. Logs every frame to book.jsonl.
 
 use crate::config::Config;
@@ -17,7 +17,7 @@ use super::state::{
     AsyncJsonlWriter, MarketTx, StopFlag,
 };
 
-const COINBASE_WS_OPEN_CAPTURE_GRACE_SECS: u64 = 5;
+const WS_OPEN_CAPTURE_GRACE_SECS: u64 = 5;
 
 /// Entry point for the collector thread. Picks sim vs live mode, retrying the
 /// live path until stopped (mirrors the old per-process retry loop).
@@ -242,7 +242,7 @@ impl LiveMarketState {
             let now_s = now / 1000;
             let window_start_s = (now_s / window) * window;
             let capture_grace_secs =
-                (cfg.market_switch_grace_ms / 1000).clamp(1, COINBASE_WS_OPEN_CAPTURE_GRACE_SECS);
+                (cfg.market_switch_grace_ms / 1000).clamp(1, WS_OPEN_CAPTURE_GRACE_SECS);
             if self.btc_open_window_start_s != window_start_s {
                 self.btc_open_window_start_s = window_start_s;
                 self.btc_open_price = 0.0;
@@ -417,13 +417,13 @@ fn discover_current_market(
     };
 
     // Strike (price_to_beat) MUST come from the same venue as the live price feed
-    // (Coinbase) — a cross-venue basis (~$100+) would bias fair value near close.
-    // Coinbase 1-min candle open = exact window-open price. In the first minute of
-    // a fresh window that candle can temporarily be unavailable, so we fall back
-    // ONLY to a Coinbase WS tick captured near the window boundary. We no longer
-    // lock the CURRENT live price as strike; that recreates the old "S-P≈0" bug
-    // and makes the model blind to direction.
-    let price_to_beat = fetch_coinbase_start_price(start_s).or_else(|| {
+    // (Binance) — a cross-venue basis would bias fair value near close. Binance
+    // 1-min kline open = exact window-open price. In the first minute of a fresh
+    // window that kline can temporarily be unavailable, so we fall back ONLY to a
+    // Binance WS tick captured near the window boundary. We no longer lock the
+    // CURRENT live price as strike; that recreates the old "S-P≈0" bug and makes
+    // the model blind to direction.
+    let price_to_beat = fetch_binance_start_price(cfg, start_s).or_else(|| {
         let state = state.lock().unwrap();
         state.btc_open_for_window(start_s)
     });
@@ -431,7 +431,7 @@ fn discover_current_market(
         let _ = heartbeat(
             cfg,
             "collector",
-            format!("waiting reliable Coinbase strike for {slug}"),
+            format!("waiting reliable Binance strike for {slug}"),
         );
         return Ok(None);
     };
@@ -497,38 +497,45 @@ fn fetch_gamma_market(
     }))
 }
 
-/// Exact window-open price from Coinbase, via the 1-min candle whose bucket
+/// Exact window-open price from Binance, via the 1-min kline whose bucket
 /// starts at `window_start_s` (the 5-min window starts are minute-aligned, so the
-/// bucket exists). Candle row format: [time, low, high, OPEN(idx 3), close, vol].
+/// bucket exists). Kline row format: [open_time_ms, OPEN(idx 1), high, low, ...].
 /// Same venue as the live feed → fair value's (S - P) carries no exchange basis.
-fn fetch_coinbase_start_price(window_start_s: u64) -> Option<f64> {
-    let end = window_start_s + 120;
+fn fetch_binance_start_price(cfg: &Config, window_start_s: u64) -> Option<f64> {
+    let base = cfg.binance_rest_url.trim_end_matches('/');
+    let start_ms = window_start_s.saturating_mul(1000);
+    let end_ms = start_ms.saturating_add(120_000);
     let url = format!(
-        "https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=60&start={window_start_s}&end={end}"
+        "{base}/api/v3/klines?symbol=BTCUSDT&interval=1m&startTime={start_ms}&endTime={end_ms}&limit=2"
     );
     let rows = http_json(&url)?;
+    parse_binance_kline_open(&rows, start_ms)
+}
+
+fn parse_binance_kline_open(rows: &Value, start_ms: u64) -> Option<f64> {
     let rows = rows.as_array()?;
     for row in rows {
         let Some(arr) = row.as_array() else {
             continue;
         };
         let t = arr.first().and_then(Value::as_f64).unwrap_or(-1.0);
-        if (t - window_start_s as f64).abs() < 0.5 {
-            if let Some(open) = arr.get(3).and_then(Value::as_f64) {
-                if open > 0.0 {
-                    return Some(open);
-                }
+        if (t - start_ms as f64).abs() < 1.0 {
+            if let Some(open) = parse_f64_value(arr.get(1)) {
+                return (open > 0.0).then_some(open);
             }
         }
     }
     None
 }
 
-fn fetch_coinbase_rest_price() -> Option<f64> {
-    // Live BTC price and strike must stay same-venue. If Coinbase is unavailable,
-    // do not silently substitute Binance/Kraken: their basis can be large enough
-    // to flip fair value near expiry. No fresh Coinbase price means no fresh quote.
-    let value = http_json("https://api.coinbase.com/v2/prices/BTC-USD/spot")?;
+fn fetch_binance_rest_price(cfg: &Config) -> Option<f64> {
+    // Live BTC price and strike must stay same-venue. If Binance is unavailable,
+    // do not silently substitute another venue: cross-venue basis can be large
+    // enough to flip fair value near expiry. No fresh Binance price means no
+    // fresh quote.
+    let base = cfg.binance_rest_url.trim_end_matches('/');
+    let url = format!("{base}/api/v3/ticker/price?symbol=BTCUSDT");
+    let value = http_json(&url)?;
     parse_btc_rest_price(&value)
 }
 
@@ -671,10 +678,10 @@ fn live_btc_loop(
     state: Arc<Mutex<LiveMarketState>>,
     sink: LiveFrameSink,
 ) {
-    if let Some(price) = fetch_coinbase_rest_price() {
+    if let Some(price) = fetch_binance_rest_price(&cfg) {
         {
             let mut state = state.lock().unwrap();
-            state.record_btc(&cfg, price, false, "coinbase_rest_seed");
+            state.record_btc(&cfg, price, false, "binance_rest_seed");
         }
         let _ = push_live_frame(&cfg, &state, &sink, "btc rest seed");
         let _ = heartbeat(&cfg, "collector", format!("btc rest seed {price:.2}"));
@@ -701,10 +708,10 @@ fn live_btc_loop(
             continue;
         }
 
-        if let Some(price) = fetch_coinbase_rest_price() {
+        if let Some(price) = fetch_binance_rest_price(&cfg) {
             {
                 let mut state = state.lock().unwrap();
-                state.record_btc(&cfg, price, false, "coinbase_rest_fallback");
+                state.record_btc(&cfg, price, false, "binance_rest_fallback");
             }
             let _ = push_live_frame(&cfg, &state, &sink, "btc rest fallback");
             let _ = heartbeat(&cfg, "collector", format!("btc rest fallback {price:.2}"));
@@ -737,13 +744,7 @@ fn live_btc_once(
     let read_timeout = Duration::from_millis(500);
     let dead_timeout = Duration::from_millis((cfg.stale_after_ms * 5).clamp(2_500, 6_000));
     tune_ws_socket(&mut socket, read_timeout)?;
-    // Coinbase needs an explicit subscribe to start streaming; its ticker message
-    // carries the last trade price in the "price" field (parsed by parse_btc_price).
-    if url.contains("coinbase") {
-        socket.send(Message::Text(
-            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channels":["ticker"]}"#.to_string(),
-        ))?;
-    }
+    // Binance trade streams start sending immediately and carry price in field "p".
     heartbeat(cfg, "collector", format!("btc ws subscribed {url}"))?;
     let mut last_event = Instant::now();
     while !stopping(stop, cfg) {
@@ -764,7 +765,7 @@ fn live_btc_once(
                         last_event = Instant::now();
                         {
                             let mut state = state.lock().unwrap();
-                            state.record_btc(cfg, price, true, "coinbase_ws");
+                            state.record_btc(cfg, price, true, "binance_ws");
                         }
                         if let Err(err) = push_live_frame(cfg, state, sink, "live btc event") {
                             let _ =
@@ -783,16 +784,12 @@ fn live_btc_once(
     Ok(())
 }
 
-fn btc_ws_urls(_cfg: &Config) -> Vec<String> {
-    // Coinbase ONLY. From the Dublin VPS it is ~70ms + datacenter-friendly +
-    // very stable, vs Binance (Asia) which is laggy/jittery/throttled. Crucially,
-    // the strike (price_to_beat) is ALSO sourced from Coinbase (see
-    // fetch_coinbase_start_price), so the live price S and strike P stay the SAME
-    // source — there is a ~$100+ basis between exchanges that would badly bias
-    // fair value near close if S and P came from different venues. If this WS
-    // drops, live_btc_loop falls back to Coinbase REST (still Coinbase) before any
-    // other venue, preserving that consistency.
-    vec!["wss://ws-feed.exchange.coinbase.com".to_string()]
+fn btc_ws_urls(cfg: &Config) -> Vec<String> {
+    // Binance ONLY for the BTC model input. The strike (price_to_beat) is also
+    // sourced from Binance (see fetch_binance_start_price), so live price S and
+    // strike P stay same-venue. If the WS drops, live_btc_loop falls back to
+    // Binance REST before reconnecting.
+    vec![cfg.binance_ws_url.clone()]
 }
 
 fn apply_polymarket_message(state: &Arc<Mutex<LiveMarketState>>, value: &Value) -> bool {
@@ -975,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn strike_fallback_requires_matching_captured_coinbase_open() {
+    fn strike_fallback_requires_matching_captured_ws_open() {
         let cfg = Config::from_env().expect("config");
         let mut s = LiveMarketState::new(&cfg);
         s.btc_price = 150.0;
@@ -988,6 +985,16 @@ mod tests {
             None,
             "current BTC price must not be reused as another window's strike"
         );
+    }
+
+    #[test]
+    fn binance_kline_open_parser_uses_window_open() {
+        let rows = serde_json::json!([
+            [1_000_000_u64, "101.25", "102.0", "100.0", "101.5", "3.0"],
+            [1_060_000_u64, "103.25", "104.0", "103.0", "103.5", "4.0"]
+        ]);
+        assert_eq!(parse_binance_kline_open(&rows, 1_000_000), Some(101.25));
+        assert_eq!(parse_binance_kline_open(&rows, 1_120_000), None);
     }
 
     #[test]
