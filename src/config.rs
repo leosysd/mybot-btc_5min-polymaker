@@ -127,7 +127,7 @@ impl Config {
             quote_spread: get_f64(&file_env, "QUOTE_SPREAD", 0.04),
             inventory_skew: get_f64(&file_env, "INVENTORY_SKEW", 0.03),
             inventory_mult: get_f64(&file_env, "INVENTORY_MULT", 2.0),
-            max_unpaired_shares: get_f64(&file_env, "MAX_UNPAIRED_SHARES", 5.0),
+            max_unpaired_shares: get_f64(&file_env, "MAX_UNPAIRED_SHARES", 19.0),
             min_bid: get_f64(&file_env, "MIN_BID", 0.05),
             max_bid: get_f64(&file_env, "MAX_BID", 0.62),
             dry_run: get_bool(&file_env, "DRY_RUN", true),

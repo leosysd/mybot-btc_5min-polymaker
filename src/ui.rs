@@ -1536,7 +1536,7 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "REQUOTE_THRESHOLD_TICKS", "1")?;
     upsert_env_if_missing(path, "INVENTORY_SKEW", "0.03")?;
     upsert_env_if_missing(path, "INVENTORY_MULT", "2")?;
-    upsert_env_if_missing(path, "MAX_UNPAIRED_SHARES", "5")?;
+    upsert_env_if_missing(path, "MAX_UNPAIRED_SHARES", "19")?;
     upsert_env_if_missing(path, "MIN_BID", "0.05")?;
     upsert_env_if_missing(path, "MAX_BID", "0.62")?;
     upsert_env_if_missing(path, "TICK_SIZE", "0.01")?;

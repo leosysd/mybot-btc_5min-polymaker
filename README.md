@@ -436,7 +436,7 @@ QUOTE_SIZE * INVENTORY_MULT
 例如 `QUOTE_SIZE=5`、`INVENTORY_MULT=2`，单边最多买 `10` 份。这里会同时计算已成交库存和 pending 未成交报价，避免连续报价把真实仓位打穿。
 
 ```text
-MAX_UNPAIRED_SHARES=5
+MAX_UNPAIRED_SHARES=19
 ```
 
 最大未配平差额，按 `abs((Up已成交+pending) - (Down已成交+pending))` 计算。达到上限后，机器人不再给领先的一边加仓，只允许继续挂落后的一边来缩小差额。`0` 表示关闭该限制。
