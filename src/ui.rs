@@ -915,16 +915,35 @@ fn short_market(slug: &str) -> String {
 /// Render that as a human-readable Beijing-time label "MM-DD HH:MM"; fall back
 /// to the trimmed slug if there is no plausible trailing timestamp.
 fn fmt_market_label(slug: &str) -> String {
-    if let Some(ts) = slug
-        .rsplit('-')
-        .next()
-        .and_then(|s| s.parse::<u64>().ok())
-    {
+    if let Some(ts) = market_start_secs(slug) {
         if (1_000_000_000..=4_000_000_000).contains(&ts) {
             return fmt_window_time(ts);
         }
     }
     short_market(slug)
+}
+
+fn market_start_secs(slug: &str) -> Option<u64> {
+    slug.rsplit('-')
+        .next()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ts| (1_000_000_000..=4_000_000_000).contains(ts))
+}
+
+fn is_settlement_frame(fr: &MarketFrame, window_secs: u64, now_ms: u64) -> bool {
+    const CLOSE_CAPTURE_GRACE_MS: u64 = 1_500;
+
+    if let Some(start_secs) = market_start_secs(&fr.market) {
+        let Some(end_secs) = start_secs.checked_add(window_secs) else {
+            return false;
+        };
+        let Some(end_ms) = end_secs.checked_mul(1_000) else {
+            return false;
+        };
+        return now_ms >= end_ms && fr.ts_ms.saturating_add(CLOSE_CAPTURE_GRACE_MS) >= end_ms;
+    }
+
+    fr.tau_seconds > 0.0 && fr.tau_seconds <= 1.0
 }
 
 /// Unix seconds -> "MM-DD HH:MM" in Beijing time (UTC+8), no external deps.
@@ -986,13 +1005,17 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         stat.fills += 1;
     }
 
-    // Settlement proxy: the latest book frame per market tells who won
-    // (BTC close vs 判定价). Inferred from our own feed, not Polymarket's
-    // official Chainlink resolution — usually agrees, may differ at the wire.
+    // Settlement proxy: only near-close frames after the scheduled end are
+    // eligible. Otherwise the still-live latest frame would make the current
+    // active market look settled.
     let mut won_up: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut close_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let stats_now_ms = now_ms();
     for fr in read_all_jsonl::<MarketFrame>(&cfg.book_path())? {
         if fr.btc_price <= 0.0 || fr.price_to_beat <= 0.0 {
+            continue;
+        }
+        if !is_settlement_frame(&fr, cfg.market_window_secs, stats_now_ms) {
             continue;
         }
         if close_ts.get(&fr.market).map_or(true, |&t| fr.ts_ms >= t) {
@@ -1024,10 +1047,22 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         (0.0_f64, 0u64, 0u64, 0u64, 0u64, 0u64);
     for market in &order {
         let s = &agg[market];
-        let up_avg = if s.up_shares > 0.0 { s.up_cost / s.up_shares } else { 0.0 };
-        let dn_avg = if s.down_shares > 0.0 { s.down_cost / s.down_shares } else { 0.0 };
+        let up_avg = if s.up_shares > 0.0 {
+            s.up_cost / s.up_shares
+        } else {
+            0.0
+        };
+        let dn_avg = if s.down_shares > 0.0 {
+            s.down_cost / s.down_shares
+        } else {
+            0.0
+        };
         let two_sided = s.up_shares > 0.0 && s.down_shares > 0.0;
-        let combined = if two_sided { up_avg + dn_avg } else { up_avg.max(dn_avg) };
+        let combined = if two_sided {
+            up_avg + dn_avg
+        } else {
+            up_avg.max(dn_avg)
+        };
         if two_sided {
             locked += 1;
             let pairs = s.up_shares.min(s.down_shares);
@@ -1044,8 +1079,16 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
                 settled += 1;
                 let realized = if up { s.pnl_if_up() } else { s.pnl_if_down() };
                 sum_realized += realized;
-                if realized > 0.0 { wins += 1 } else if realized < 0.0 { losses += 1 }
-                if up { up_wins += 1 } else { dn_wins += 1 }
+                if realized > 0.0 {
+                    wins += 1
+                } else if realized < 0.0 {
+                    losses += 1
+                }
+                if up {
+                    up_wins += 1
+                } else {
+                    dn_wins += 1
+                }
                 let label = if up {
                     format!("{C_GREEN}Up{C_RESET}")
                 } else {
@@ -1082,8 +1125,18 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     println!();
     println!(
         "  {}盘口{} {} 个   {}双边(已锁利){} {} / {}单边(方向暴露){} {}   {}总成交{} {}",
-        C_BOLD, C_RESET, order.len(), C_GREEN, C_RESET, locked, C_YELLOW, C_RESET, directional,
-        C_BOLD, C_RESET, total_fills
+        C_BOLD,
+        C_RESET,
+        order.len(),
+        C_GREEN,
+        C_RESET,
+        locked,
+        C_YELLOW,
+        C_RESET,
+        directional,
+        C_BOLD,
+        C_RESET,
+        total_fills
     );
     let edge_styled = if sum_locked_edge >= 0.0 {
         format!("{C_GREEN}{sum_locked_edge:+.2}{C_RESET}")
@@ -1095,7 +1148,10 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     } else {
         format!("{C_RED}{sum_worst:+.2}{C_RESET}")
     };
-    println!("  {}锁定毛利合计{} ≈ {}   {}最坏情景PnL合计{} {}", C_BOLD, C_RESET, edge_styled, C_BOLD, C_RESET, worst_styled);
+    println!(
+        "  {}锁定毛利合计{} ≈ {}   {}最坏情景PnL合计{} {}",
+        C_BOLD, C_RESET, edge_styled, C_BOLD, C_RESET, worst_styled
+    );
     let realized_styled = if sum_realized >= 0.0 {
         format!("{C_GREEN}{sum_realized:+.2}{C_RESET}")
     } else {
@@ -1108,17 +1164,62 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     };
     println!(
         "  {}已结算{} {} 盘 (Up赢 {} / Down赢 {})   {}盈/亏{} {}/{} 胜率 {}   {}实现PnL合计{} {}",
-        C_BOLD, C_RESET, settled, up_wins, dn_wins, C_BOLD, C_RESET, wins, losses, win_rate,
-        C_BOLD, C_RESET, realized_styled
+        C_BOLD,
+        C_RESET,
+        settled,
+        up_wins,
+        dn_wins,
+        C_BOLD,
+        C_RESET,
+        wins,
+        losses,
+        win_rate,
+        C_BOLD,
+        C_RESET,
+        realized_styled
     );
     println!();
     println!(
         "{}说明:结算列按本机 BTC 行情最后一档 vs 判定价推断(非 Polymarket 官方 \
-         Chainlink 结算,临界盘可能有偏差);实现PnL=按该结算方向的逐盘已实现盈亏。\
-         未结算的盘口结算列显示 ?。{}",
+         Chainlink 结算,临界盘可能有偏差);只有盘口已过结算点且捕获到临近收盘行情才显示 \
+         Up/Down;实现PnL=按该结算方向的逐盘已实现盈亏。未结算或缺少临近收盘行情的盘口显示 ?。{}",
         C_DIM, C_RESET
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(market: &str, ts_ms: u64, tau_seconds: f64) -> MarketFrame {
+        MarketFrame {
+            ts_ms,
+            market: market.to_string(),
+            condition_id: String::new(),
+            up_token_id: String::new(),
+            down_token_id: String::new(),
+            up_ask: 0.0,
+            down_ask: 0.0,
+            btc_price: 100.0,
+            price_to_beat: 99.0,
+            tau_seconds,
+            vol_per_sqrt_sec: 0.0,
+            source: String::new(),
+        }
+    }
+
+    #[test]
+    fn active_slugged_market_is_not_settled() {
+        let fr = frame("btc-updown-5m-1800000000", 1_800_000_285_000, 15.0);
+        assert!(!is_settlement_frame(&fr, 300, 1_800_000_285_000));
+    }
+
+    #[test]
+    fn near_close_frame_after_window_end_can_settle() {
+        let fr = frame("btc-updown-5m-1800000000", 1_800_000_299_300, 0.7);
+        assert!(is_settlement_frame(&fr, 300, 1_800_000_301_000));
+    }
 }
 
 fn read_dashboard_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
