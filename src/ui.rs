@@ -474,7 +474,8 @@ fn print_env_profile(cfg: &Config) -> AppResult<()> {
     let up = env_value(&path, "POLYMARKET_UP_TOKEN_ID").unwrap_or_default();
     let down = env_value(&path, "POLYMARKET_DOWN_TOKEN_ID").unwrap_or_default();
     let price = env_value(&path, "PRICE_TO_BEAT").unwrap_or_else(|| "68000".to_string());
-    let signature = env_value(&path, "POLY_SIGNATURE_TYPE").unwrap_or_else(|| "proxy".to_string());
+    let signature =
+        env_value(&path, "POLY_SIGNATURE_TYPE").unwrap_or_else(|| "poly1271".to_string());
 
     let mode = if dry_run == "0" && real_ready {
         format!("{C_RED}实单{C_RESET}")
@@ -551,7 +552,7 @@ fn switch_to_live_dry_run(cfg: &Config) -> AppResult<()> {
 
 fn switch_to_real_mode(cfg: &Config) -> AppResult<()> {
     ensure_cli_defaults(&cfg.env_file())?;
-    upsert_env(&cfg.env_file(), "POLY_SIGNATURE_TYPE", "proxy")?;
+    upsert_env(&cfg.env_file(), "POLY_SIGNATURE_TYPE", "poly1271")?;
     ensure_real_inputs_present(cfg)?;
     upsert_env(&cfg.env_file(), "DRY_RUN", "0")?;
     upsert_env(
@@ -588,11 +589,12 @@ fn ensure_real_inputs_present(cfg: &Config) -> AppResult<()> {
         }
     }
 
-    let signature = env_value(&path, "POLY_SIGNATURE_TYPE").unwrap_or_else(|| "proxy".to_string());
+    let signature =
+        env_value(&path, "POLY_SIGNATURE_TYPE").unwrap_or_else(|| "poly1271".to_string());
     if signature.trim() != "eoa"
         && env_value(&path, "POLY_FUNDER_ADDRESS").is_none_or(|v| v.trim().is_empty())
     {
-        missing.push("POLY_FUNDER_ADDRESS(proxy/funder地址)".to_string());
+        missing.push("POLY_FUNDER_ADDRESS(deposit wallet/funder地址)".to_string());
     }
 
     if missing.is_empty() {
@@ -605,7 +607,7 @@ fn ensure_real_inputs_present(cfg: &Config) -> AppResult<()> {
 fn configure_real_account(cfg: &Config) -> AppResult<()> {
     ensure_cli_defaults(&cfg.env_file())?;
     println!("直接回车表示保留原值；输入 CLEAR 表示清空该项。");
-    println!("私钥不会回显。Polymarket 网站账户通常用 signature type=proxy。");
+    println!("私钥不会回显。Polymarket deposit wallet 通常用 signature type=poly1271。");
 
     let private_key = prompt_secret(&format!(
         "POLY_PRIVATE_KEY 当前={}  钱包私钥",
@@ -614,20 +616,20 @@ fn configure_real_account(cfg: &Config) -> AppResult<()> {
     apply_optional_env(&cfg.env_file(), "POLY_PRIVATE_KEY", &private_key)?;
 
     let current_signature =
-        env_value(&cfg.env_file(), "POLY_SIGNATURE_TYPE").unwrap_or_else(|| "proxy".to_string());
+        env_value(&cfg.env_file(), "POLY_SIGNATURE_TYPE").unwrap_or_else(|| "poly1271".to_string());
     let signature = prompt(&format!(
-        "POLY_SIGNATURE_TYPE 当前={}  eoa/proxy/gnosis_safe/poly1271，Polymarket账户建议proxy",
+        "POLY_SIGNATURE_TYPE 当前={}  eoa/proxy/gnosis_safe/poly1271，deposit wallet建议poly1271",
         current_signature
     ))?;
     if signature.trim().is_empty() && current_signature.trim().is_empty() {
-        upsert_env(&cfg.env_file(), "POLY_SIGNATURE_TYPE", "proxy")?;
+        upsert_env(&cfg.env_file(), "POLY_SIGNATURE_TYPE", "poly1271")?;
     } else {
         apply_optional_env(&cfg.env_file(), "POLY_SIGNATURE_TYPE", &signature)?;
     }
 
     let funder_current = public_state(&cfg.env_file(), "POLY_FUNDER_ADDRESS");
     let funder = prompt(&format!(
-        "POLY_FUNDER_ADDRESS 当前={}  Polymarket代理钱包/funder地址",
+        "POLY_FUNDER_ADDRESS 当前={}  Polymarket deposit wallet/funder地址",
         funder_current
     ))?;
     apply_optional_env(&cfg.env_file(), "POLY_FUNDER_ADDRESS", &funder)?;
@@ -770,7 +772,7 @@ fn print_param_help() {
     println!("  MAX_TOTAL_*       Up+Down 已成交+pending 达到阈值就停止");
     println!("  ENABLE_REAL_*     实单确认串；菜单2切实单时会自动写入");
     println!("  POLY_PRIVATE_*    私钥；菜单2可隐藏输入，别提交到GitHub");
-    println!("  POLY_SIGNATURE_*  钱包签名类型；Polymarket账户通常是 proxy + funder");
+    println!("  POLY_SIGNATURE_*  钱包签名类型；deposit wallet 通常是 poly1271 + funder");
     println!("  MIN_BID/MAX_BID   最低/最高挂买价");
     println!("  STALE_AFTER_MS    行情过期阈值，超过则停止用旧行情报价");
     println!("  WS_STALE_AFTER_MS live WS断流阈值，超过则停止");
@@ -1523,7 +1525,7 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "POLY_API_KEY", "")?;
     upsert_env_if_missing(path, "POLY_SECRET", "")?;
     upsert_env_if_missing(path, "POLY_PASSPHRASE", "")?;
-    upsert_env_if_blank(path, "POLY_SIGNATURE_TYPE", "proxy")?;
+    upsert_env_if_blank(path, "POLY_SIGNATURE_TYPE", "poly1271")?;
     upsert_env_if_missing(path, "POLY_FUNDER_ADDRESS", "")?;
     upsert_env_if_missing(path, "PRICE_TO_BEAT", "68000")?;
     upsert_env_if_missing(path, "QUOTE_SIZE", "5")?;

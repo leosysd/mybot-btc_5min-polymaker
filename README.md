@@ -365,9 +365,11 @@ PRICE_TO_BEAT=68000
 
 ```text
 POLY_PRIVATE_KEY=
-POLY_SIGNATURE_TYPE=proxy
+POLY_SIGNATURE_TYPE=poly1271
 POLY_FUNDER_ADDRESS=
 ```
+
+`POLY_FUNDER_ADDRESS` 用 Polymarket deposit wallet/funder 地址；不要填设置页里 “仅供 API / signer address” 的地址。旧账户如果明确使用 proxy/gnosis/eoa，再把 `POLY_SIGNATURE_TYPE` 改成对应类型。
 
 如果你已经有 L2 API 凭证，也可以填：
 

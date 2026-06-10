@@ -177,7 +177,7 @@ impl Config {
             poly_api_key: get(&file_env, "POLY_API_KEY", ""),
             poly_secret: get(&file_env, "POLY_SECRET", ""),
             poly_passphrase: get(&file_env, "POLY_PASSPHRASE", ""),
-            poly_signature_type: get(&file_env, "POLY_SIGNATURE_TYPE", "proxy"),
+            poly_signature_type: get(&file_env, "POLY_SIGNATURE_TYPE", "poly1271"),
             poly_funder_address: get(&file_env, "POLY_FUNDER_ADDRESS", ""),
             poly_chain_id: get_u64(&file_env, "POLY_CHAIN_ID", 137),
         };
