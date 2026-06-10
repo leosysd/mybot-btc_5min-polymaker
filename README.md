@@ -334,7 +334,7 @@ POLYMARKET_GAMMA_API_URL=https://gamma-api.polymarket.com
 MARKET_WINDOW_SECS=300
 ```
 
-`collector` 会按 `btc-updown-5m-{窗口开始unix秒}` 查询 Gamma API，解析当前市场的 `clobTokenIds`，并把 token id 放进每条 quote。开盘价优先取交易所窗口开始附近成交价；如果 Binance 主站不可用，会 fallback 到 Binance.US、Coinbase、Kraken 的 BTC/USD 最新价。注意 Polymarket 结算源仍是 Chainlink BTC/USD Data Stream，外部交易所价格只是模型输入和兜底。
+`collector` 会按 `btc-updown-5m-{窗口开始unix秒}` 查询 Gamma API，解析当前市场的 `clobTokenIds`，并把 token id 放进每条 quote。自动发现时，判定价优先取 Coinbase 1 分钟 candle 的窗口开盘价；如果该 candle 还没生成，只接受窗口开始附近从 Coinbase WS 捕捉到的第一笔价格。拿不到可靠 Coinbase strike 时会等待，不会用当前价冒充开盘价。注意 Polymarket 结算源仍是 Chainlink BTC/USD Data Stream，外部交易所价格只是模型输入。
 
 如果你一定要手动覆盖，才设置：
 

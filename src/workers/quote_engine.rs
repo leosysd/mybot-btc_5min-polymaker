@@ -73,7 +73,9 @@ pub fn run(
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(ts) = last_market_ts {
                     let market_silence_ms = cfg.ws_stale_after_ms.max(cfg.stale_after_ms);
-                    if now_ms().saturating_sub(ts) > market_silence_ms {
+                    if !collector_owns_market_silence(&cfg)
+                        && now_ms().saturating_sub(ts) > market_silence_ms
+                    {
                         heartbeat(&cfg, "quote-engine", "kill switch: market stale")?;
                         request_stop(&stop, &cfg)?;
                         break;
@@ -85,6 +87,10 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+fn collector_owns_market_silence(cfg: &Config) -> bool {
+    cfg.data_mode == "live" && cfg.auto_discover_market
 }
 
 /// Compute the time-aware quotes for one market frame and emit them.
@@ -270,4 +276,24 @@ fn send_quote(
     // Best-effort: if the gateway is gone we're shutting down.
     let _ = quote_tx.send(quote);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_auto_discovery_waits_for_collector_liveness() {
+        let mut cfg = Config::from_env().expect("config");
+        cfg.data_mode = "live".to_string();
+        cfg.auto_discover_market = true;
+        assert!(collector_owns_market_silence(&cfg));
+
+        cfg.auto_discover_market = false;
+        assert!(!collector_owns_market_silence(&cfg));
+
+        cfg.data_mode = "sim".to_string();
+        cfg.auto_discover_market = true;
+        assert!(!collector_owns_market_silence(&cfg));
+    }
 }

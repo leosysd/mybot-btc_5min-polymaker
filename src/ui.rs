@@ -37,10 +37,12 @@ fn repair_env_config(cfg: &Config) -> AppResult<()> {
     let mut created = false;
     if !env_path.exists() {
         fs::copy(cfg.env_example_file(), &env_path)?;
+        secure_env_permissions(&env_path)?;
         created = true;
     }
 
     ensure_cli_defaults(&env_path)?;
+    secure_env_permissions(&env_path)?;
     if created {
         println!("已创建 {}，并补齐默认配置。", env_path.display());
     } else {
@@ -1274,6 +1276,19 @@ fn upsert_env(path: &Path, key: &str, value: &str) -> AppResult<()> {
         lines.push(format!("{key}={value}"));
     }
     fs::write(path, lines.join("\n") + "\n")?;
+    secure_env_permissions(path)?;
+    Ok(())
+}
+
+fn secure_env_permissions(path: &Path) -> AppResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(path, perms)?;
+    }
     Ok(())
 }
 

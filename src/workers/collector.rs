@@ -1,5 +1,5 @@
 //! Market-data collector thread: produces `MarketFrame`s (simulated or live
-//! Polymarket/Binance WS + auto discovery) and sends them over the channel to
+//! Polymarket/Coinbase WS + auto discovery) and sends them over the channel to
 //! the quote engine. Logs every frame to book.jsonl.
 
 use crate::config::Config;
@@ -16,6 +16,8 @@ use super::state::{
     is_ws_timeout, log_jsonl, request_stop, sleep_ms, spawn_jsonl_writer, stopping, tune_ws_socket,
     AsyncJsonlWriter, MarketTx, StopFlag,
 };
+
+const COINBASE_WS_OPEN_CAPTURE_GRACE_SECS: u64 = 5;
 
 /// Entry point for the collector thread. Picks sim vs live mode, retrying the
 /// live path until stopped (mirrors the old per-process retry loop).
@@ -142,8 +144,12 @@ fn run_live_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResu
         let now = now_ms();
         let stale = {
             let state = state.lock().unwrap();
+            let active_market = state
+                .market
+                .as_ref()
+                .is_some_and(|market| now / 1000 < market.window_end_s);
             state.started
-                && state.market.is_some()
+                && active_market
                 && (now.saturating_sub(state.last_polymarket_ts) > cfg.ws_stale_after_ms
                     || now.saturating_sub(state.last_btc_ts) > cfg.ws_stale_after_ms)
         };
@@ -205,6 +211,9 @@ struct LiveMarketState {
     market: Option<LiveMarketIdentity>,
     btc_price: f64,
     price_to_beat: f64,
+    btc_open_window_start_s: u64,
+    btc_open_price: f64,
+    btc_source: String,
     up_ask: f64,
     down_ask: f64,
     last_btc_ts: u64,
@@ -215,17 +224,39 @@ struct LiveMarketState {
 impl LiveMarketState {
     /// Record a fresh BTC price and update the volatility estimate using the
     /// real elapsed time since the previous tick.
-    fn record_btc(&mut self, price: f64) {
+    fn record_btc(&mut self, cfg: &Config, price: f64, can_capture_open: bool, source: &str) {
         let now = now_ms();
         let dt_sec = if self.last_btc_ts == 0 {
             1.0
         } else {
             (now.saturating_sub(self.last_btc_ts) as f64 / 1000.0).clamp(0.05, 30.0)
         };
+        if can_capture_open {
+            let window = cfg.market_window_secs.max(1);
+            let now_s = now / 1000;
+            let window_start_s = (now_s / window) * window;
+            let capture_grace_secs =
+                (cfg.market_switch_grace_ms / 1000).clamp(1, COINBASE_WS_OPEN_CAPTURE_GRACE_SECS);
+            if self.btc_open_window_start_s != window_start_s {
+                self.btc_open_window_start_s = window_start_s;
+                self.btc_open_price = 0.0;
+            }
+            if self.btc_open_price <= 0.0
+                && now_s.saturating_sub(window_start_s) <= capture_grace_secs
+            {
+                self.btc_open_price = price;
+            }
+        }
         self.vol.update(price, dt_sec);
         self.btc_price = price;
+        self.btc_source = source.to_string();
         self.last_btc_ts = now;
         self.started = true;
+    }
+
+    fn btc_open_for_window(&self, window_start_s: u64) -> Option<f64> {
+        (self.btc_open_window_start_s == window_start_s && self.btc_open_price > 0.0)
+            .then_some(self.btc_open_price)
     }
 
     fn new(cfg: &Config) -> Self {
@@ -245,6 +276,9 @@ impl LiveMarketState {
             market,
             btc_price: cfg.price_to_beat,
             price_to_beat: cfg.price_to_beat,
+            btc_open_window_start_s: 0,
+            btc_open_price: 0.0,
+            btc_source: String::new(),
             up_ask: 0.0,
             down_ask: 0.0,
             last_btc_ts: 0,
@@ -286,9 +320,9 @@ impl LiveMarketState {
             tau_seconds,
             vol_per_sqrt_sec: self.vol.current(),
             source: if cfg.auto_discover_market {
-                "auto_gamma_polymarket_binance_ws".to_string()
+                format!("auto_gamma_polymarket_{}", self.btc_source)
             } else {
-                "live_polymarket_binance_ws".to_string()
+                format!("live_polymarket_{}", self.btc_source)
             },
         })
     }
@@ -372,17 +406,24 @@ fn discover_current_market(
 
     // Strike (price_to_beat) MUST come from the same venue as the live price feed
     // (Coinbase) — a cross-venue basis (~$100+) would bias fair value near close.
-    // Coinbase 1-min candle open = exact window-open price; fall back to the live
-    // Coinbase price, then (last resort) Binance.
-    let price_to_beat = fetch_coinbase_start_price(start_s)
-        .or_else(|| {
-            let state = state.lock().unwrap();
-            (state.btc_price > 0.0).then_some(state.btc_price)
-        })
-        .or_else(|| fetch_binance_start_price(cfg, start_s));
-    if let Some(price) = price_to_beat {
-        identity.price_to_beat = price;
-    }
+    // Coinbase 1-min candle open = exact window-open price. In the first minute of
+    // a fresh window that candle can temporarily be unavailable, so we fall back
+    // ONLY to a Coinbase WS tick captured near the window boundary. We no longer
+    // lock the CURRENT live price as strike; that recreates the old "S-P≈0" bug
+    // and makes the model blind to direction.
+    let price_to_beat = fetch_coinbase_start_price(start_s).or_else(|| {
+        let state = state.lock().unwrap();
+        state.btc_open_for_window(start_s)
+    });
+    let Some(price) = price_to_beat else {
+        let _ = heartbeat(
+            cfg,
+            "collector",
+            format!("waiting reliable Coinbase strike for {slug}"),
+        );
+        return Ok(None);
+    };
+    identity.price_to_beat = price;
     Ok(Some(identity))
 }
 
@@ -471,51 +512,12 @@ fn fetch_coinbase_start_price(window_start_s: u64) -> Option<f64> {
     None
 }
 
-fn fetch_binance_start_price(cfg: &Config, window_start_s: u64) -> Option<f64> {
-    let start_ms = window_start_s * 1000;
-    let end_ms = start_ms + cfg.market_switch_grace_ms.max(1_000).min(30_000);
-    for base in [
-        cfg.binance_rest_url.trim_end_matches('/'),
-        "https://api.binance.us",
-    ] {
-        let url = format!(
-            "{base}/api/v3/aggTrades?symbol=BTCUSDT&startTime={start_ms}&endTime={end_ms}&limit=1"
-        );
-        let Some(value) = http_json(&url) else {
-            continue;
-        };
-        if let Some(price) = value
-            .as_array()
-            .and_then(|rows| rows.first())
-            .and_then(|row| parse_f64_value(row.get("p")))
-        {
-            return Some(price);
-        }
-    }
-    fetch_btc_rest_price(cfg)
-}
-
-fn fetch_btc_rest_price(cfg: &Config) -> Option<f64> {
-    let binance_url = format!(
-        "{}/api/v3/ticker/price?symbol=BTCUSDT",
-        cfg.binance_rest_url.trim_end_matches('/')
-    );
-    // Coinbase FIRST to stay same-venue as the live feed + strike (avoid basis);
-    // other venues only as deep last-resort if Coinbase is fully unreachable.
-    for url in [
-        "https://api.coinbase.com/v2/prices/BTC-USD/spot",
-        binance_url.as_str(),
-        "https://api.binance.us/api/v3/ticker/price?symbol=BTCUSDT",
-        "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
-    ] {
-        let Some(value) = http_json(url) else {
-            continue;
-        };
-        if let Some(price) = parse_btc_rest_price(&value) {
-            return Some(price);
-        }
-    }
-    None
+fn fetch_coinbase_rest_price() -> Option<f64> {
+    // Live BTC price and strike must stay same-venue. If Coinbase is unavailable,
+    // do not silently substitute Binance/Kraken: their basis can be large enough
+    // to flip fair value near expiry. No fresh Coinbase price means no fresh quote.
+    let value = http_json("https://api.coinbase.com/v2/prices/BTC-USD/spot")?;
+    parse_btc_rest_price(&value)
 }
 
 fn parse_btc_rest_price(value: &Value) -> Option<f64> {
@@ -657,10 +659,10 @@ fn live_btc_loop(
     state: Arc<Mutex<LiveMarketState>>,
     sink: LiveFrameSink,
 ) {
-    if let Some(price) = fetch_btc_rest_price(&cfg) {
+    if let Some(price) = fetch_coinbase_rest_price() {
         {
             let mut state = state.lock().unwrap();
-            state.record_btc(price);
+            state.record_btc(&cfg, price, false, "coinbase_rest_seed");
         }
         let _ = push_live_frame(&cfg, &state, &sink, "btc rest seed");
         let _ = heartbeat(&cfg, "collector", format!("btc rest seed {price:.2}"));
@@ -687,10 +689,10 @@ fn live_btc_loop(
             continue;
         }
 
-        if let Some(price) = fetch_btc_rest_price(&cfg) {
+        if let Some(price) = fetch_coinbase_rest_price() {
             {
                 let mut state = state.lock().unwrap();
-                state.record_btc(price);
+                state.record_btc(&cfg, price, false, "coinbase_rest_fallback");
             }
             let _ = push_live_frame(&cfg, &state, &sink, "btc rest fallback");
             let _ = heartbeat(&cfg, "collector", format!("btc rest fallback {price:.2}"));
@@ -750,7 +752,7 @@ fn live_btc_once(
                         last_event = Instant::now();
                         {
                             let mut state = state.lock().unwrap();
-                            state.record_btc(price);
+                            state.record_btc(cfg, price, true, "coinbase_ws");
                         }
                         if let Err(err) = push_live_frame(cfg, state, sink, "live btc event") {
                             let _ =
@@ -926,5 +928,21 @@ mod tests {
         // A new window latches its own open strike.
         assert!(s.set_market(ident("win-B", 200.0)));
         assert_eq!(s.market.as_ref().unwrap().price_to_beat, 200.0);
+    }
+
+    #[test]
+    fn strike_fallback_requires_matching_captured_coinbase_open() {
+        let cfg = Config::from_env().expect("config");
+        let mut s = LiveMarketState::new(&cfg);
+        s.btc_price = 150.0;
+        s.btc_open_window_start_s = 1_000;
+        s.btc_open_price = 100.0;
+
+        assert_eq!(s.btc_open_for_window(1_000), Some(100.0));
+        assert_eq!(
+            s.btc_open_for_window(1_300),
+            None,
+            "current BTC price must not be reused as another window's strike"
+        );
     }
 }
