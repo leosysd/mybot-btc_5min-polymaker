@@ -477,11 +477,11 @@ LIVE_ORDER_NOTIONAL_CAP=5
    - Up 库存多：降低 Up bid，提高 Down bid。
    - Down 库存多：降低 Down bid，提高 Up bid。
 5. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
-6. 默认 `STRATEGY_MODE=HYBRID_MAKER`：趋势明显时只挂胜率高且相对盘口有 edge 的一边；震荡时允许双边同时挂，目标是更快形成 `Up+Down <= 1 - MIN_LOCK_EDGE` 的锁仓组合。
+6. 默认 `STRATEGY_MODE=HYBRID_MAKER`：趋势明显时只挂胜率高且相对盘口有 edge 的一边；震荡时允许双边同时挂，目标是更快形成 `Up+Down <= 1 - MIN_LOCK_EDGE` 的锁仓组合。`STRATEGY_MODE=TAKER_BRAIN_MAKER` 会禁用震荡双边锁仓，只在强趋势且相对盘口有 edge 时挂强边。
 7. 趋势开仓必须同时满足 `HYBRID_TREND_MIN_PROB` 和 `HYBRID_TREND_MIN_MARKET_EDGE`，挂单价还会受 `HYBRID_ENTRY_MIN_EDGE` 限制，避免为了成交把模型安全垫吃光。
 8. 震荡锁仓由 `HYBRID_RANGE_MAX_PROB` 控制：最高胜率不超过该值时，按 range 处理，允许同时挂 Up/Down；一旦单边成交，再由 `PAIR_LOCK_MODE` 决定是否补对边。
 9. `PAIR_LOCK_MODE=ALWAYS` 是旧逻辑：如果已成交库存单边不平衡，先尝试买对边完成锁利配平；但补腿出价不会高于 `模型 fair + REBALANCE_MAX_OVER_FAIR`（默认 0.05）。
-10. `PAIR_LOCK_MODE=EDGE_ONLY` 是 taker brain/maker execution：单边持仓仍是模型强边时不补对边；只有模型优势变弱、且补完至少能锁出 `PAIR_LOCK_MIN_PROFIT` 的利润时，才用 maker 单补对边。
+10. `PAIR_LOCK_MODE=EDGE_ONLY` 是 taker brain/maker execution：中段不补对边；只在最后 `PAIR_LOCK_LAST_SECS` 秒内、持仓不再满足残局强边门槛、且补完至少能锁出 `PAIR_LOCK_MIN_PROFIT` 的利润时，才用 maker 单补对边。
 11. `PAIR_LOCK_MODE=OFF` 完全不自动补对边，单边成交后持有到结算。这个模式机会更大，单边错时亏损也更完整。
 12. 默认不主动加同边方向仓：如果对边不能锁利配平，就等待，不继续给已偏多的一边加仓。
 13. 如需回到旧逻辑，设置 `STRATEGY_MODE=LEGACY_V3`；旧逻辑下才继续使用 `FAVORITE_FIRST_FLAT` 和可选 `ENABLE_DIRECTIONAL_EDGE` 分支。

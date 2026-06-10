@@ -724,7 +724,7 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("MARKET_INTERVAL_MS", "模拟行情间隔毫秒"),
         ("STALE_AFTER_MS", "行情过期毫秒"),
         ("WS_STALE_AFTER_MS", "live WS断流停止毫秒"),
-        ("STRATEGY_MODE", "HYBRID_MAKER新混合策略/LEGACY_V3旧逻辑"),
+        ("STRATEGY_MODE", "TAKER_BRAIN_MAKER/HYBRID_MAKER/LEGACY_V3"),
         (
             "PAIR_LOCK_MODE",
             "单边成交后补对边模式:ALWAYS/EDGE_ONLY/OFF",
@@ -804,10 +804,8 @@ fn print_param_help() {
     println!("  ENDGAME_PULL_SECS      剩余秒数<该值撤掉所有单(纯抛硬币区)");
     println!("  INVENTORY_SKEW_TIME_BOOST 库存偏移随临近收盘加码倍数");
     println!("  TOX_*                  逆选择监控:被割就自动加宽价差");
-    println!("  STRATEGY_MODE          HYBRID_MAKER=趋势强边+震荡锁仓; LEGACY_V3=旧逻辑");
-    println!(
-        "  PAIR_LOCK_MODE         ALWAYS=旧强配平; EDGE_ONLY=taker脑子maker挂单; OFF=不补对边"
-    );
+    println!("  STRATEGY_MODE          TAKER_BRAIN_MAKER=只做强趋势; HYBRID_MAKER=趋势+震荡锁仓");
+    println!("  PAIR_LOCK_MODE         ALWAYS=旧强配平; EDGE_ONLY=最后阶段择优补; OFF=不补对边");
     println!("  PAIR_LOCK_MIN_PROFIT   EDGE_ONLY补对边至少锁多少每份利润");
     println!("  PAIR_LOCK_LAST_SECS    剩余多少秒内用残局高门槛判断持仓是否仍强");
     println!("  HYBRID_TREND_*         趋势开仓阈值:模型胜率和相对盘口edge都要够");
@@ -1600,13 +1598,13 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
         path,
         "PAIR_LOCK_MODE",
         "ALWAYS",
-        "单边成交后的补对边模式：ALWAYS=旧强配平；EDGE_ONLY=taker脑子/maker挂单；OFF=完全不自动补对边。",
+        "单边成交后的补对边模式：ALWAYS=旧强配平；EDGE_ONLY=中段不补,最后阶段择优补；OFF=完全不自动补对边。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
         "PAIR_LOCK_MIN_PROFIT",
         "0.02",
-        "EDGE_ONLY 下补对边至少要锁出的每份利润。0.02=每份2美分。",
+        "EDGE_ONLY 下最后阶段补对边至少要锁出的每份利润。0.02=每份2美分。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
@@ -1618,7 +1616,7 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
         path,
         "STRATEGY_MODE",
         "HYBRID_MAKER",
-        "策略模式：HYBRID_MAKER=趋势用maker追强边、震荡双边快速锁仓；LEGACY_V3=旧v3逻辑。",
+        "策略模式：TAKER_BRAIN_MAKER=只做强趋势,震荡等待；HYBRID_MAKER=趋势强边+震荡双边锁仓；LEGACY_V3=旧逻辑。",
     )?;
     upsert_env_if_missing_with_comment(
         path,

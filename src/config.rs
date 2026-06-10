@@ -296,8 +296,13 @@ impl Config {
             return Err("DIRECTIONAL_INVENTORY_MULT must be finite and non-negative".into());
         }
         let strategy_mode = self.strategy_mode.to_ascii_uppercase();
-        if !matches!(strategy_mode.as_str(), "HYBRID_MAKER" | "LEGACY_V3") {
-            return Err("STRATEGY_MODE must be HYBRID_MAKER or LEGACY_V3".into());
+        if !matches!(
+            strategy_mode.as_str(),
+            "HYBRID_MAKER" | "TAKER_BRAIN_MAKER" | "LEGACY_V3"
+        ) {
+            return Err(
+                "STRATEGY_MODE must be HYBRID_MAKER, TAKER_BRAIN_MAKER, or LEGACY_V3".into(),
+            );
         }
         let pair_lock_mode = self.pair_lock_mode.to_ascii_uppercase();
         if !matches!(pair_lock_mode.as_str(), "ALWAYS" | "EDGE_ONLY" | "OFF") {

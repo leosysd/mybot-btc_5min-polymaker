@@ -160,18 +160,16 @@ fn pair_lock_allows(
         "ALWAYS" => true,
         "OFF" => false,
         "EDGE_ONLY" => {
+            if tau > cfg.pair_lock_last_secs {
+                return false;
+            }
             let Some(lock_profit) = pair_lock_profit(pair_side_is_up, pair_px, inventory) else {
                 return false;
             };
             if lock_profit + 1e-9 < cfg.pair_lock_min_profit {
                 return false;
             }
-            let strong_threshold = if tau <= cfg.pair_lock_last_secs {
-                cfg.hybrid_endgame_min_prob
-            } else {
-                cfg.hybrid_trend_min_prob
-            };
-            held_side_prob(pair_side_is_up, p_up) < strong_threshold
+            held_side_prob(pair_side_is_up, p_up) < cfg.hybrid_endgame_min_prob
         }
         _ => false,
     }
@@ -179,6 +177,11 @@ fn pair_lock_allows(
 
 fn use_hybrid_maker(cfg: &Config) -> bool {
     cfg.strategy_mode.eq_ignore_ascii_case("HYBRID_MAKER")
+        || cfg.strategy_mode.eq_ignore_ascii_case("TAKER_BRAIN_MAKER")
+}
+
+fn use_taker_brain_maker(cfg: &Config) -> bool {
+    cfg.strategy_mode.eq_ignore_ascii_case("TAKER_BRAIN_MAKER")
 }
 
 fn valid_market_px(px: f64) -> bool {
@@ -255,6 +258,7 @@ fn hybrid_flat_quotes(
     model: ModelQuote,
     up_pair_px: Option<f64>,
     down_pair_px: Option<f64>,
+    allow_range_lock: bool,
 ) -> (Option<f64>, Option<f64>, &'static str) {
     let favorite_is_up = p_up >= 0.5;
     let favorite_prob = if favorite_is_up { p_up } else { 1.0 - p_up };
@@ -289,7 +293,7 @@ fn hybrid_flat_quotes(
         };
     }
 
-    if phase == Phase::Normal && favorite_prob <= cfg.hybrid_range_max_prob {
+    if allow_range_lock && phase == Phase::Normal && favorite_prob <= cfg.hybrid_range_max_prob {
         if let (Some(up), Some(down)) = (up_pair_px, down_pair_px) {
             if up + down <= 1.0 - cfg.min_lock_edge + 1e-9 {
                 return (Some(up), Some(down), "tov3_hybrid_range_lock");
@@ -515,6 +519,7 @@ fn handle_market_frame(
                 model,
                 up_pair_px,
                 down_pair_px,
+                !use_taker_brain_maker(cfg),
             ),
         }
     } else {
@@ -748,6 +753,49 @@ mod tests {
     }
 
     #[test]
+    fn taker_brain_waits_in_chop_instead_of_range_locking() {
+        let mut cfg = hybrid_quote_test_cfg();
+        cfg.strategy_mode = "TAKER_BRAIN_MAKER".to_string();
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(100.0), &inventory, &mut tox).expect("quote");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "taker brain should not double-quote a choppy market"
+        );
+    }
+
+    #[test]
+    fn taker_brain_still_quotes_favorite_when_trend_has_edge() {
+        let mut cfg = hybrid_quote_test_cfg();
+        cfg.strategy_mode = "TAKER_BRAIN_MAKER".to_string();
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let mut frame = flat_frame(105.0);
+        frame.up_bid = 0.50;
+        frame.up_ask = 0.54;
+        frame.down_bid = 0.44;
+        frame.down_ask = 0.48;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("trend quote");
+        assert_eq!(quote.side, "Up");
+        assert_eq!(quote.reason, "tov3_hybrid_trend");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn hybrid_trend_quotes_only_favorite_with_market_edge() {
         let cfg = hybrid_quote_test_cfg();
         let inventory = Inventory {
@@ -840,11 +888,37 @@ mod tests {
     }
 
     #[test]
+    fn edge_only_pair_lock_does_not_pair_in_the_middle() {
+        let mut cfg = hybrid_quote_test_cfg();
+        cfg.pair_lock_mode = "EDGE_ONLY".to_string();
+        cfg.pair_lock_min_profit = 0.01;
+        let mut frame = flat_frame(100.0);
+        frame.tau_seconds = 120.0;
+        frame.vol_per_sqrt_sec = 0.17;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 5.0,
+            up_cost: 2.15,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "edge-only mode should not force a middle-window pair"
+        );
+    }
+
+    #[test]
     fn edge_only_pair_lock_pairs_when_edge_fades_and_lock_profit_is_good() {
         let mut cfg = hybrid_quote_test_cfg();
         cfg.pair_lock_mode = "EDGE_ONLY".to_string();
         cfg.pair_lock_min_profit = 0.01;
         let mut frame = flat_frame(100.0);
+        frame.tau_seconds = 20.0;
         frame.vol_per_sqrt_sec = 0.17;
         let inventory = Inventory {
             market: "btc-updown-5m-test".to_string(),
