@@ -280,7 +280,7 @@ fn handle_market_frame(
     };
 
     let rebalance_target = rebalance_target_side(inventory.up_shares, inventory.down_shares);
-    let directional_target = if rebalance_target.is_some() {
+    let directional_target = if cfg.enable_directional_edge && rebalance_target.is_some() {
         directional_edge_target_side(
             p_up,
             up_directional_px,
@@ -305,7 +305,7 @@ fn handle_market_frame(
         (Phase::Normal, Some(_)) => match directional_target {
             Some(true) => (up_directional_px, None, "tov3_directional_edge"),
             Some(false) => (None, down_directional_px, "tov3_directional_edge"),
-            None => (None, None, "tov3_wait_edge"),
+            None => (None, None, "tov3_wait_pair"),
         },
         (Phase::Normal, None) => {
             let up_px = up_pair_px.filter(|_| p_up >= cfg.min_fair_to_quote);
@@ -393,6 +393,51 @@ mod tests {
         assert_eq!(rebalance_target_side(5.0, 0.0), Some(false));
         assert_eq!(rebalance_target_side(0.0, 5.0), Some(true));
         assert_eq!(rebalance_target_side(5.0, 5.0), None);
+    }
+
+    #[test]
+    fn directional_edge_is_opt_in_when_pairing_unavailable() {
+        let mut cfg = Config::from_env().expect("config");
+        cfg.enable_directional_edge = false;
+        cfg.max_bid = 0.62;
+        cfg.min_bid = 0.05;
+        cfg.min_lock_edge = 0.02;
+        cfg.quote_size = 5.0;
+        cfg.inventory_mult = 2.0;
+        cfg.directional_inventory_mult = 2.0;
+        cfg.min_directional_edge = 0.04;
+        cfg.min_fair_to_quote = 0.0;
+        cfg.post_only_margin_ticks = 1.0;
+        cfg.tick_size = 0.01;
+
+        let frame = MarketFrame {
+            ts_ms: now_ms(),
+            market: "btc-updown-5m-test".to_string(),
+            condition_id: "condition".to_string(),
+            up_token_id: "up".to_string(),
+            down_token_id: "down".to_string(),
+            up_ask: 0.90,
+            down_ask: 0.01,
+            btc_price: 101.0,
+            price_to_beat: 100.0,
+            tau_seconds: 20.0,
+            vol_per_sqrt_sec: 0.1,
+            source: "test".to_string(),
+        };
+        let inventory = Inventory {
+            market: frame.market.clone(),
+            up_shares: 5.0,
+            up_cost: 3.20,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+        assert!(
+            rx.try_recv().is_err(),
+            "default should wait for pair instead of adding directional inventory"
+        );
     }
 
     #[test]
