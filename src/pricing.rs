@@ -210,38 +210,6 @@ pub fn market_maker_bids(p: &MmParams) -> ModelQuote {
     ModelQuote { up_bid, down_bid }
 }
 
-/// Cost-basis lock: the per-quote `enforce_binary_edge` only bounds the two
-/// *simultaneous* quotes. It can't stop "legging in" — filling Up and Down at
-/// different times when each was the expensive side, so the *accumulated* avg
-/// pair cost exceeds 1 and locks a guaranteed loss.
-///
-/// This caps the bid for `side` by what we've ALREADY paid for the opposite
-/// side: if we hold the other side at average cost `C`, completing a pair must
-/// keep `bid + C <= 1 - min_lock_edge`. So `bid <= 1 - min_lock_edge - C`.
-/// Returns the (possibly lowered) bid; the caller's post-only/min-bid checks
-/// then suppress the quote entirely if it falls below the floor.
-#[allow(clippy::too_many_arguments)]
-pub fn lock_capped_bid(
-    side_is_up: bool,
-    bid: f64,
-    up_shares: f64,
-    up_cost: f64,
-    down_shares: f64,
-    down_cost: f64,
-    min_lock_edge: f64,
-) -> f64 {
-    let budget = (1.0 - min_lock_edge).clamp(0.02, 0.999);
-    let opposite_avg = if side_is_up {
-        (down_shares > 0.0).then(|| down_cost / down_shares)
-    } else {
-        (up_shares > 0.0).then(|| up_cost / up_shares)
-    };
-    match opposite_avg {
-        Some(avg) => bid.min((budget - avg).max(0.0)),
-        None => bid, // flat on the opposite side -> no pair to complete, no cap
-    }
-}
-
 /// Post-only buy: never cross the spread. Sits at least `margin_ticks` below
 /// the best ask so a small ask move between quoting and order arrival doesn't
 /// turn it into a crossing (rejected) order. Floors to tick. Returns None if
@@ -302,62 +270,23 @@ pub fn in_warmup(tau_sec: f64, window_sec: f64, warmup_secs: f64) -> bool {
     (window_sec - tau_sec) < warmup_secs
 }
 
-/// Cap a *pairing* bid by `fair + max_over_fair`. The cost-basis lock alone
-/// lets the pairing bid ride up to (1-edge)-avg even when the opposite side is
-/// nearly worthless — e.g. holding Up@0.43 with p_up=0.999, it would bid 0.55
-/// for a token worth 0.001. Such a bid only fills when filling is bad for us:
-/// the counterparty happily dumps the dead side, swapping our near-certain win
-/// for a tiny locked edge. Never pay more than fair plus a small premium.
-pub fn fair_capped_bid(bid: f64, fair: f64, max_over_fair: f64) -> f64 {
-    bid.min((fair + max_over_fair.max(0.0)).max(0.0))
-}
-
 // ─────────────────────────────────────────────────────────────────────────
 // 5. Endgame protocol + inventory-skew time boost
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
-    /// Plenty of time: quote both sides normally.
+    /// Plenty of time: value-buy quotes may be sent.
     Normal,
-    /// Last minute-ish: only quote the side that REDUCES unmatched inventory.
-    ReduceOnly,
     /// Final seconds: pull everything. Pure coin-flip / max gamma zone.
     Pull,
 }
 
-pub fn phase_for(tau_sec: f64, reduce_secs: f64, pull_secs: f64) -> Phase {
+pub fn phase_for(tau_sec: f64, pull_secs: f64) -> Phase {
     if tau_sec <= pull_secs {
         Phase::Pull
-    } else if tau_sec <= reduce_secs {
-        Phase::ReduceOnly
     } else {
         Phase::Normal
-    }
-}
-
-/// Whether a given side may be quoted given the current phase and inventory.
-/// In ReduceOnly we only allow the side that brings unmatched inventory toward
-/// zero (i.e. the currently-short side).
-pub fn side_allowed(
-    side_is_up: bool,
-    phase: Phase,
-    up_inventory: f64,
-    down_inventory: f64,
-) -> bool {
-    match phase {
-        Phase::Normal => true,
-        Phase::Pull => false,
-        Phase::ReduceOnly => {
-            let unmatched = up_inventory - down_inventory; // >0 means long Up
-            if unmatched.abs() < 0.5 {
-                false // already balanced; don't open fresh risk near the close
-            } else if unmatched > 0.0 {
-                !side_is_up // long Up -> only allow buying Down
-            } else {
-                side_is_up // long Down -> only allow buying Up
-            }
-        }
     }
 }
 
@@ -545,24 +474,6 @@ mod tests {
     }
 
     #[test]
-    fn lock_cap_blocks_losing_pair_completion() {
-        // Already hold Down at avg 0.54. With lock 0.02 the Up bid must not
-        // exceed 1 - 0.02 - 0.54 = 0.44, so a 0.52 Up bid gets capped to 0.44
-        // (which the caller's min_bid check then likely suppresses).
-        let capped = lock_capped_bid(true, 0.52, 0.0, 0.0, 25.0, 25.0 * 0.54, 0.02);
-        assert!((capped - 0.44).abs() < 1e-9, "got {capped}");
-        // Flat on the opposite side -> no cap.
-        let free = lock_capped_bid(true, 0.52, 0.0, 0.0, 0.0, 0.0, 0.02);
-        assert!((free - 0.52).abs() < 1e-9);
-        // Cheap existing side leaves room to complete profitably.
-        let ok = lock_capped_bid(false, 0.40, 25.0, 25.0 * 0.45, 0.0, 0.0, 0.02);
-        assert!(
-            (ok - 0.40).abs() < 1e-9,
-            "0.45+0.40=0.85<0.98, no cap; got {ok}"
-        );
-    }
-
-    #[test]
     fn post_only_bid_stays_below_ask() {
         // margin 1 tick -> 0.52; margin 3 ticks -> 0.50; both strictly below ask.
         let px1 = post_only_bid(0.55, 0.53, 0.01, 0.05, 0.62, 1.0).unwrap();
@@ -583,17 +494,6 @@ mod tests {
     }
 
     #[test]
-    fn fair_cap_blocks_overpaying_for_dead_side() {
-        // Lock cap says 0.55 but the side is worth 0.001: cap to ~0.051,
-        // which the caller's min_bid floor then suppresses.
-        assert!((fair_capped_bid(0.55, 0.001, 0.05) - 0.051).abs() < 1e-9);
-        // Bid already below fair+premium: untouched.
-        assert!((fair_capped_bid(0.40, 0.45, 0.05) - 0.40).abs() < 1e-9);
-        // Negative premium is treated as zero, never negative price.
-        assert!(fair_capped_bid(0.30, 0.10, -1.0) >= 0.0);
-    }
-
-    #[test]
     fn time_boost_increases_skew_toward_close() {
         let early = time_boosted_skew(0.03, 300.0, 300.0, 2.0);
         let late = time_boosted_skew(0.03, 10.0, 300.0, 2.0);
@@ -603,14 +503,9 @@ mod tests {
 
     #[test]
     fn endgame_phases_and_side_gating() {
-        assert_eq!(phase_for(200.0, 60.0, 12.0), Phase::Normal);
-        assert_eq!(phase_for(30.0, 60.0, 12.0), Phase::ReduceOnly);
-        assert_eq!(phase_for(5.0, 60.0, 12.0), Phase::Pull);
-
-        assert!(!side_allowed(true, Phase::Pull, 5.0, 0.0));
-        assert!(!side_allowed(true, Phase::ReduceOnly, 5.0, 0.0));
-        assert!(side_allowed(false, Phase::ReduceOnly, 5.0, 0.0));
-        assert!(!side_allowed(true, Phase::ReduceOnly, 2.0, 2.0));
+        assert_eq!(phase_for(200.0, 12.0), Phase::Normal);
+        assert_eq!(phase_for(30.0, 12.0), Phase::Normal);
+        assert_eq!(phase_for(5.0, 12.0), Phase::Pull);
     }
 
     #[test]

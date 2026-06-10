@@ -724,30 +724,9 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("MARKET_INTERVAL_MS", "模拟行情间隔毫秒"),
         ("STALE_AFTER_MS", "行情过期毫秒"),
         ("WS_STALE_AFTER_MS", "live WS断流停止毫秒"),
-        (
-            "STRATEGY_MODE",
-            "VALUE_BUY_MAKER/TAKER_BRAIN_MAKER/HYBRID_MAKER/LEGACY_V3",
-        ),
         ("VALUE_MIN_EDGE", "价值买入最低安全垫: fair - bid"),
         ("VALUE_AGGRESSION_TICKS", "价值买入相对买一抬高多少tick"),
         ("VALUE_MIN_FAIR", "价值买入最低模型胜率过滤"),
-        (
-            "PAIR_LOCK_MODE",
-            "单边成交后补对边模式:ALWAYS/EDGE_ONLY/OFF",
-        ),
-        ("PAIR_LOCK_MIN_PROFIT", "EDGE_ONLY补对边最低锁定利润"),
-        ("PAIR_LOCK_LAST_SECS", "EDGE_ONLY残局强边判断秒数"),
-        ("HYBRID_TREND_MIN_PROB", "趋势开仓最低模型胜率"),
-        (
-            "HYBRID_TREND_MIN_MARKET_EDGE",
-            "模型胜率需高于盘口隐含胜率多少",
-        ),
-        ("HYBRID_RANGE_MAX_PROB", "震荡锁仓最高胜率阈值"),
-        ("HYBRID_ENTRY_MIN_EDGE", "趋势挂单保留的模型安全垫"),
-        ("HYBRID_ENTRY_AGGRESSION_TICKS", "趋势挂单抬高多少tick"),
-        ("HYBRID_ENDGAME_SECS", "残局高门槛开始秒数"),
-        ("HYBRID_ENDGAME_MIN_PROB", "残局开仓最低模型胜率"),
-        ("FAVORITE_FIRST_FLAT", "空仓/已配平时只先挂胜率高的一边"),
     ];
     println!("直接回车表示不修改。");
     for (key, desc) in keys {
@@ -806,22 +785,12 @@ fn print_param_help() {
     println!("  LATENCY_SEC            你的撤改单延迟，越大逆选择溢价越高");
     println!("  K_ADVERSE              逆选择价差强度;ATM临近收盘会自动拉宽");
     println!("  MIN/MAX_HALF_SPREAD    半价差上下限钳制");
-    println!("  ENDGAME_REDUCE_SECS    剩余秒数<该值只挂减仓单");
     println!("  ENDGAME_PULL_SECS      剩余秒数<该值撤掉所有单(纯抛硬币区)");
     println!("  INVENTORY_SKEW_TIME_BOOST 库存偏移随临近收盘加码倍数");
     println!("  TOX_*                  逆选择监控:被割就自动加宽价差");
-    println!("  STRATEGY_MODE          VALUE_BUY_MAKER=独立买便宜边; TAKER/HYBRID/LEGACY为旧模式");
-    println!("  VALUE_MIN_EDGE         VALUE模式最低安全垫: 买价必须 <= 模型fair-该值");
-    println!("  VALUE_AGGRESSION_TICKS VALUE模式相对当前买一抬高多少tick,仍受安全垫限制");
-    println!("  VALUE_MIN_FAIR         VALUE模式最低模型胜率过滤,低于则不挂这一边");
-    println!("  PAIR_LOCK_MODE         ALWAYS=旧强配平; EDGE_ONLY=最后阶段择优补; OFF=不补对边");
-    println!("  PAIR_LOCK_MIN_PROFIT   EDGE_ONLY补对边至少锁多少每份利润");
-    println!("  PAIR_LOCK_LAST_SECS    剩余多少秒内用残局高门槛判断持仓是否仍强");
-    println!("  HYBRID_TREND_*         趋势开仓阈值:模型胜率和相对盘口edge都要够");
-    println!("  HYBRID_RANGE_MAX_PROB  最高胜率低于该值时按震荡处理,允许双边锁仓");
-    println!("  HYBRID_ENTRY_*         趋势挂单的安全垫和相对买一价的maker抬价tick");
-    println!("  HYBRID_ENDGAME_*       残局开新仓使用更高胜率门槛");
-    println!("  FAVORITE_FIRST_FLAT    空仓/已配平时只先挂胜率高的一边，降低低胜率边先成交");
+    println!("  VALUE_MIN_EDGE         最低安全垫: 买价必须 <= 模型fair-该值");
+    println!("  VALUE_AGGRESSION_TICKS 相对当前买一抬高多少tick,仍受安全垫限制");
+    println!("  VALUE_MIN_FAIR         最低模型胜率过滤,低于则不挂这一边");
     println!("  ENABLE_DELTA_HEDGE     0=关。对冲为占位骨架，实单模式禁止开启");
 }
 
@@ -1586,7 +1555,6 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "K_ADVERSE", "1")?;
     upsert_env_if_missing(path, "MIN_HALF_SPREAD", "0.005")?;
     upsert_env_if_missing(path, "MAX_HALF_SPREAD", "0.25")?;
-    upsert_env_if_missing(path, "ENDGAME_REDUCE_SECS", "60")?;
     upsert_env_if_missing(path, "ENDGAME_PULL_SECS", "12")?;
     upsert_env_if_missing(path, "INVENTORY_SKEW_TIME_BOOST", "2")?;
     upsert_env_if_missing(path, "TOX_HORIZON_MS", "2500")?;
@@ -1600,102 +1568,25 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "PREWARM_INTERVAL_MS", "60000")?;
     upsert_env_if_missing(path, "POST_ONLY_MARGIN_TICKS", "2")?;
     upsert_env_if_missing(path, "REJECT_BACKOFF_MS", "500")?;
-    upsert_env_if_missing(path, "MIN_FAIR_TO_QUOTE", "0")?;
     upsert_env_if_missing(path, "QUOTE_WARMUP_SECS", "25")?;
-    upsert_env_if_missing(path, "REBALANCE_MAX_OVER_FAIR", "0.05")?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "PAIR_LOCK_MODE",
-        "OFF",
-        "旧策略的补对边模式。VALUE_BUY_MAKER 不使用强制补对边；切回旧策略时才看这个值。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "PAIR_LOCK_MIN_PROFIT",
-        "0.02",
-        "EDGE_ONLY 下最后阶段补对边至少要锁出的每份利润。0.02=每份2美分。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "PAIR_LOCK_LAST_SECS",
-        "35",
-        "EDGE_ONLY 下剩余多少秒以内使用残局高胜率门槛判断持仓是否仍强。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "STRATEGY_MODE",
-        "VALUE_BUY_MAKER",
-        "策略模式：VALUE_BUY_MAKER=JetFadil式独立价值买入；TAKER/HYBRID/LEGACY为旧逻辑。",
-    )?;
     upsert_env_if_missing_with_comment(
         path,
         "VALUE_MIN_EDGE",
         "0.03",
-        "VALUE模式最低安全垫：买价必须 <= 模型fair - 该值。0.03=至少3美分edge。",
+        "最低安全垫：买价必须 <= 模型fair - 该值。0.03=至少3美分edge。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
         "VALUE_AGGRESSION_TICKS",
         "1",
-        "VALUE模式相对当前买一价抬高多少tick；仍受post-only和VALUE_MIN_EDGE限制。",
+        "相对当前买一价抬高多少tick；仍受post-only和VALUE_MIN_EDGE限制。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
         "VALUE_MIN_FAIR",
         "0.05",
-        "VALUE模式最低模型胜率过滤：低于这个fair的一边不挂单。",
+        "最低模型胜率过滤：低于这个fair的一边不挂单。",
     )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "HYBRID_TREND_MIN_PROB",
-        "0.60",
-        "趋势开仓最低模型胜率。低于这个值不追方向，避免 0.52/0.48 这种震荡假信号。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "HYBRID_TREND_MIN_MARKET_EDGE",
-        "0.02",
-        "趋势开仓要求：模型胜率必须比 Polymarket 盘口隐含胜率至少高多少。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "HYBRID_RANGE_MAX_PROB",
-        "0.58",
-        "震荡锁仓区间：最高胜率不超过该值时，允许同时挂 Up/Down 争取快速配对锁住。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "HYBRID_ENTRY_MIN_EDGE",
-        "0.02",
-        "趋势挂单至少保留多少模型安全垫：挂买价 <= 模型胜率 - 该值。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "HYBRID_ENTRY_AGGRESSION_TICKS",
-        "1",
-        "趋势挂单相对当前买一价抬高多少 tick，仍然受 post-only 和安全垫限制。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "HYBRID_ENDGAME_SECS",
-        "45",
-        "剩余多少秒以内算残局，开新方向仓必须达到更高胜率。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "HYBRID_ENDGAME_MIN_PROB",
-        "0.70",
-        "残局开仓最低模型胜率。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "FAVORITE_FIRST_FLAT",
-        "1",
-        "无库存/已配平时只先挂模型胜率高的一边，避免低胜率边先成交后单边暴露。1=开，0=恢复双边开仓。",
-    )?;
-    upsert_env_if_missing(path, "ENABLE_DIRECTIONAL_EDGE", "0")?;
-    upsert_env_if_missing(path, "MIN_DIRECTIONAL_EDGE", "0.04")?;
-    upsert_env_if_missing(path, "DIRECTIONAL_INVENTORY_MULT", "2")?;
     Ok(())
 }
 

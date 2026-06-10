@@ -50,7 +50,6 @@ pub struct Config {
     pub k_adverse: f64,
     pub min_half_spread: f64,
     pub max_half_spread: f64,
-    pub endgame_reduce_secs: f64,
     pub endgame_pull_secs: f64,
     pub inventory_skew_time_boost: f64,
     pub tox_horizon_ms: u64,
@@ -64,27 +63,10 @@ pub struct Config {
     pub prewarm_interval_ms: u64,
     pub post_only_margin_ticks: f64,
     pub reject_backoff_ms: u64,
-    pub min_fair_to_quote: f64,
     pub quote_warmup_secs: f64,
-    pub rebalance_max_over_fair: f64,
-    pub pair_lock_mode: String,
-    pub pair_lock_min_profit: f64,
-    pub pair_lock_last_secs: f64,
-    pub strategy_mode: String,
-    pub hybrid_trend_min_prob: f64,
-    pub hybrid_trend_min_market_edge: f64,
-    pub hybrid_range_max_prob: f64,
-    pub hybrid_entry_min_edge: f64,
-    pub hybrid_entry_aggression_ticks: f64,
-    pub hybrid_endgame_secs: f64,
-    pub hybrid_endgame_min_prob: f64,
     pub value_min_edge: f64,
     pub value_aggression_ticks: f64,
     pub value_min_fair: f64,
-    pub favorite_first_flat: bool,
-    pub enable_directional_edge: bool,
-    pub min_directional_edge: f64,
-    pub directional_inventory_mult: f64,
     pub enable_real_orders: String,
     pub polymarket_clob_host: String,
     pub poly_private_key: String,
@@ -105,11 +87,6 @@ impl Config {
             run_dir_raw
         } else {
             base_dir.join(run_dir_raw)
-        };
-        let pair_lock_default = if get_bool(&file_env, "ENABLE_PAIR_LOCK", true) {
-            "ALWAYS"
-        } else {
-            "OFF"
         };
         let cfg = Self {
             base_dir,
@@ -173,7 +150,6 @@ impl Config {
             k_adverse: get_f64(&file_env, "K_ADVERSE", 1.0),
             min_half_spread: get_f64(&file_env, "MIN_HALF_SPREAD", 0.005),
             max_half_spread: get_f64(&file_env, "MAX_HALF_SPREAD", 0.25),
-            endgame_reduce_secs: get_f64(&file_env, "ENDGAME_REDUCE_SECS", 60.0),
             endgame_pull_secs: get_f64(&file_env, "ENDGAME_PULL_SECS", 12.0),
             inventory_skew_time_boost: get_f64(&file_env, "INVENTORY_SKEW_TIME_BOOST", 2.0),
             tox_horizon_ms: get_u64(&file_env, "TOX_HORIZON_MS", 2500),
@@ -187,27 +163,10 @@ impl Config {
             prewarm_interval_ms: get_u64(&file_env, "PREWARM_INTERVAL_MS", 60_000),
             post_only_margin_ticks: get_f64(&file_env, "POST_ONLY_MARGIN_TICKS", 2.0),
             reject_backoff_ms: get_u64(&file_env, "REJECT_BACKOFF_MS", 500),
-            min_fair_to_quote: get_f64(&file_env, "MIN_FAIR_TO_QUOTE", 0.0),
             quote_warmup_secs: get_f64(&file_env, "QUOTE_WARMUP_SECS", 25.0),
-            rebalance_max_over_fair: get_f64(&file_env, "REBALANCE_MAX_OVER_FAIR", 0.05),
-            pair_lock_mode: get(&file_env, "PAIR_LOCK_MODE", pair_lock_default),
-            pair_lock_min_profit: get_f64(&file_env, "PAIR_LOCK_MIN_PROFIT", 0.02),
-            pair_lock_last_secs: get_f64(&file_env, "PAIR_LOCK_LAST_SECS", 35.0),
-            strategy_mode: get(&file_env, "STRATEGY_MODE", "VALUE_BUY_MAKER"),
-            hybrid_trend_min_prob: get_f64(&file_env, "HYBRID_TREND_MIN_PROB", 0.60),
-            hybrid_trend_min_market_edge: get_f64(&file_env, "HYBRID_TREND_MIN_MARKET_EDGE", 0.02),
-            hybrid_range_max_prob: get_f64(&file_env, "HYBRID_RANGE_MAX_PROB", 0.58),
-            hybrid_entry_min_edge: get_f64(&file_env, "HYBRID_ENTRY_MIN_EDGE", 0.02),
-            hybrid_entry_aggression_ticks: get_f64(&file_env, "HYBRID_ENTRY_AGGRESSION_TICKS", 1.0),
-            hybrid_endgame_secs: get_f64(&file_env, "HYBRID_ENDGAME_SECS", 45.0),
-            hybrid_endgame_min_prob: get_f64(&file_env, "HYBRID_ENDGAME_MIN_PROB", 0.70),
             value_min_edge: get_f64(&file_env, "VALUE_MIN_EDGE", 0.03),
             value_aggression_ticks: get_f64(&file_env, "VALUE_AGGRESSION_TICKS", 1.0),
             value_min_fair: get_f64(&file_env, "VALUE_MIN_FAIR", 0.05),
-            favorite_first_flat: get_bool(&file_env, "FAVORITE_FIRST_FLAT", true),
-            enable_directional_edge: get_bool(&file_env, "ENABLE_DIRECTIONAL_EDGE", false),
-            min_directional_edge: get_f64(&file_env, "MIN_DIRECTIONAL_EDGE", 0.04),
-            directional_inventory_mult: get_f64(&file_env, "DIRECTIONAL_INVENTORY_MULT", 2.0),
             enable_real_orders: get(&file_env, "ENABLE_REAL_ORDERS", ""),
             polymarket_clob_host: get(
                 &file_env,
@@ -292,58 +251,8 @@ impl Config {
         if self.latency_sec < 0.0 || !self.latency_sec.is_finite() {
             return Err("LATENCY_SEC must be finite and non-negative".into());
         }
-        if self.endgame_pull_secs < 0.0 || self.endgame_reduce_secs < self.endgame_pull_secs {
-            return Err("ENDGAME_REDUCE_SECS must be >= ENDGAME_PULL_SECS >= 0".into());
-        }
-        if self.min_directional_edge < 0.0 || !self.min_directional_edge.is_finite() {
-            return Err("MIN_DIRECTIONAL_EDGE must be finite and non-negative".into());
-        }
-        if self.directional_inventory_mult < 0.0 || !self.directional_inventory_mult.is_finite() {
-            return Err("DIRECTIONAL_INVENTORY_MULT must be finite and non-negative".into());
-        }
-        let strategy_mode = self.strategy_mode.to_ascii_uppercase();
-        if !matches!(
-            strategy_mode.as_str(),
-            "VALUE_BUY_MAKER" | "HYBRID_MAKER" | "TAKER_BRAIN_MAKER" | "LEGACY_V3"
-        ) {
-            return Err(
-                "STRATEGY_MODE must be VALUE_BUY_MAKER, HYBRID_MAKER, TAKER_BRAIN_MAKER, or LEGACY_V3"
-                    .into(),
-            );
-        }
-        let pair_lock_mode = self.pair_lock_mode.to_ascii_uppercase();
-        if !matches!(pair_lock_mode.as_str(), "ALWAYS" | "EDGE_ONLY" | "OFF") {
-            return Err("PAIR_LOCK_MODE must be ALWAYS, EDGE_ONLY, or OFF".into());
-        }
-        if self.pair_lock_min_profit < 0.0
-            || self.pair_lock_min_profit >= 1.0
-            || !self.pair_lock_min_profit.is_finite()
-        {
-            return Err("PAIR_LOCK_MIN_PROFIT must be finite and in [0, 1)".into());
-        }
-        if self.pair_lock_last_secs < 0.0 || !self.pair_lock_last_secs.is_finite() {
-            return Err("PAIR_LOCK_LAST_SECS must be finite and non-negative".into());
-        }
-        if !(0.0..=1.0).contains(&self.hybrid_trend_min_prob)
-            || !(0.0..=1.0).contains(&self.hybrid_range_max_prob)
-            || !(0.0..=1.0).contains(&self.hybrid_endgame_min_prob)
-        {
-            return Err("HYBRID_*_PROB settings must be finite probabilities in [0, 1]".into());
-        }
-        if self.hybrid_trend_min_market_edge < 0.0
-            || !self.hybrid_trend_min_market_edge.is_finite()
-            || self.hybrid_entry_min_edge < 0.0
-            || !self.hybrid_entry_min_edge.is_finite()
-        {
-            return Err("HYBRID_*_EDGE settings must be finite and non-negative".into());
-        }
-        if self.hybrid_entry_aggression_ticks < 0.0
-            || !self.hybrid_entry_aggression_ticks.is_finite()
-        {
-            return Err("HYBRID_ENTRY_AGGRESSION_TICKS must be finite and non-negative".into());
-        }
-        if self.hybrid_endgame_secs < 0.0 || !self.hybrid_endgame_secs.is_finite() {
-            return Err("HYBRID_ENDGAME_SECS must be finite and non-negative".into());
+        if self.endgame_pull_secs < 0.0 || !self.endgame_pull_secs.is_finite() {
+            return Err("ENDGAME_PULL_SECS must be finite and non-negative".into());
         }
         if self.value_min_edge < 0.0
             || self.value_min_edge >= 1.0
@@ -472,13 +381,6 @@ impl Config {
 
     pub fn max_side_inventory(&self) -> f64 {
         (self.quote_size * self.inventory_mult).round().max(0.0)
-    }
-
-    pub fn max_directional_inventory(&self) -> f64 {
-        (self.quote_size * self.directional_inventory_mult)
-            .round()
-            .max(0.0)
-            .min(self.max_side_inventory())
     }
 }
 

@@ -472,7 +472,7 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 1. 用 BTC 相对开盘价的偏移估算 `p_up`。
 2. `p_down = 1 - p_up`。
-3. 默认 `STRATEGY_MODE=VALUE_BUY_MAKER`：Up/Down 各自独立判断，只在买价低于模型 fair 至少 `VALUE_MIN_EDGE` 时挂 maker 买单。
+3. 当前只有一套 value-buy maker 策略：Up/Down 各自独立判断，只在买价低于模型 fair 至少 `VALUE_MIN_EDGE` 时挂 maker 买单。
 4. 新模式会参考当前买一价，最多抬高 `VALUE_AGGRESSION_TICKS` 个 tick，但仍然必须满足 post-only，且不能高于 `fair - VALUE_MIN_EDGE`。
 5. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
 6. 新模式不做中途卖出，不做强制补对边；如果另一边之后也变得便宜，会按同样规则自己挂买单。
@@ -481,7 +481,6 @@ LIVE_ORDER_NOTIONAL_CAP=5
 9. 如果同时持有 Up/Down，网关仍保留成本锁：补成一对时不会允许 `Up成本 + Down成本 > 1 - MIN_LOCK_EDGE`。
 10. 剩余 `ENDGAME_PULL_SECS` 秒进入 Pull，不再发新报价，等已有挂单过期/撤掉。
 11. 报价不能吃单，必须低于当前 ask 至少 `POST_ONLY_MARGIN_TICKS` 个 tick。
-12. 旧模式仍可回退：`TAKER_BRAIN_MAKER`、`HYBRID_MAKER`、`LEGACY_V3` 保留在代码里；这些模式才继续使用 `PAIR_LOCK_MODE`、`HYBRID_*`、`FAVORITE_FIRST_FLAT`。
 
 ## 当前限制
 

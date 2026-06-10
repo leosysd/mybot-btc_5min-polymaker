@@ -9,7 +9,7 @@
 
 use crate::config::Config;
 use crate::ipc::{
-    heartbeat, now_ms, write_json, FillEvent, Inventory, OrderAccepted, OrderCancelled, QuoteIntent,
+    heartbeat, now_ms, write_json, FillEvent, OrderAccepted, OrderCancelled, QuoteIntent,
 };
 use crate::pricing::floor_to_tick;
 use crate::real_orders::{RealOrderClient, UserWsCredentials};
@@ -252,40 +252,22 @@ pub fn run(
                             .unwrap()
                             .retain(|_, m| m.market == quote.market);
 
-                        if let Some(msg) = pair_only_block_reason(&cfg, &inventory, &quote) {
-                            heartbeat(&cfg, "order-gateway", msg)?;
-                            if resting.contains_key(&quote.side) {
-                                let _ = cancel_resting_side(
-                                    &cfg,
-                                    &inventory,
-                                    real_orders.as_ref(),
-                                    Some(&order_map),
-                                    &mut resting,
-                                    &ledger_tx,
-                                    &quote.side,
-                                    "pair_only_block",
-                                )?;
-                            }
-                            continue;
-                        }
-
                         // Gateway-authoritative side cap: never let filled+pending on
                         // this side exceed QUOTE_SIZE*INVENTORY_MULT. Because this
                         // thread is the sole writer of pending/fills (synchronously),
                         // held+pending is always current here — this is what stops the
                         // over-accumulation runaway.
-                        let (held, pending, opp_avg, pairing_room) = {
+                        let (held, pending, opp_avg) = {
                             let inv = inventory.lock().unwrap();
                             (
                                 held_shares(&inv, &quote.market, &quote.side),
                                 pending_shares(&inv, &quote.market, &quote.side),
                                 opposite_avg_cost(&inv, &quote.market, &quote.side),
-                                pairing_shortfall_room(&inv, &quote.market, &quote.side),
                             )
                         };
                         // Counts OUTSTANDING orders, so churn/lag cannot exceed the cap.
                         let side_cap_room = cfg.max_side_inventory() - held - pending;
-                        let room = quote_room(side_cap_room, pairing_room, &quote.reason).floor();
+                        let room = side_cap_room.floor();
                         // Skip unless there's room for a FULL quote. Posting the
                         // leftover (e.g. 2 shares when room=2) is below the exchange
                         // minimum order size and gets rejected ("Size lower than
@@ -359,14 +341,6 @@ pub fn run(
                             // double-fill past the cap); retry on the next cycle.
                             continue;
                         }
-                        // A cancel can discover that the old order actually filled.
-                        // Re-check the pair-only rule before placing the replacement,
-                        // otherwise a just-filled Up can immediately be followed by
-                        // another Up while the bot is now trying to pair Down.
-                        if let Some(msg) = pair_only_block_reason(&cfg, &inventory, &quote) {
-                            heartbeat(&cfg, "order-gateway", msg)?;
-                            continue;
-                        }
                         if !accept_resting_order(
                             &cfg,
                             &inventory,
@@ -421,80 +395,6 @@ pub fn run(
         (Err(err), _) => Err(err),
         (Ok(()), Err(err)) => Err(err),
         (Ok(()), Ok(())) => Ok(()),
-    }
-}
-
-fn pairing_side_for_held(up_shares: f64, down_shares: f64) -> Option<&'static str> {
-    const MIN_UNMATCHED_SHARES: f64 = 0.5;
-    let unmatched = up_shares - down_shares;
-    if unmatched > MIN_UNMATCHED_SHARES {
-        Some("Down")
-    } else if unmatched < -MIN_UNMATCHED_SHARES {
-        Some("Up")
-    } else {
-        None
-    }
-}
-
-fn pair_only_block_reason(
-    cfg: &Config,
-    inventory: &SharedInventory,
-    quote: &QuoteIntent,
-) -> Option<String> {
-    if is_value_buy_quote(&quote.reason) {
-        return None;
-    }
-    if cfg.enable_directional_edge && quote.reason == "tov3_directional_edge" {
-        return None;
-    }
-    let inv = inventory.lock().unwrap();
-    if inv.market != quote.market {
-        return None;
-    }
-    let pairing_side = pairing_side_for_held(inv.up_shares, inv.down_shares)?;
-    if cfg.pair_lock_mode.eq_ignore_ascii_case("OFF") {
-        return Some(format!(
-            "pair-lock disabled; holding single side, blocks {} while held up={:.0} down={:.0}",
-            quote.side, inv.up_shares, inv.down_shares
-        ));
-    }
-    if quote.side == pairing_side {
-        return None;
-    }
-    Some(format!(
-        "pair-only blocks {} while held up={:.0} down={:.0}; pairing side={}",
-        quote.side, inv.up_shares, inv.down_shares, pairing_side
-    ))
-}
-
-fn is_value_buy_quote(reason: &str) -> bool {
-    reason == "value_buy"
-}
-
-fn quote_room(side_cap_room: f64, pairing_room: Option<f64>, reason: &str) -> f64 {
-    if is_value_buy_quote(reason) {
-        return side_cap_room;
-    }
-    pairing_room
-        .map(|pair| pair.min(side_cap_room))
-        .unwrap_or(side_cap_room)
-}
-
-fn pairing_shortfall_room(inv: &Inventory, market: &str, side: &str) -> Option<f64> {
-    const MIN_UNMATCHED_SHARES: f64 = 0.5;
-    if inv.market != market {
-        return None;
-    }
-    match side {
-        "Up" => {
-            let shortfall = inv.down_shares - inv.up_shares;
-            (shortfall > MIN_UNMATCHED_SHARES).then(|| (shortfall - inv.pending_up).max(0.0))
-        }
-        "Down" => {
-            let shortfall = inv.up_shares - inv.down_shares;
-            (shortfall > MIN_UNMATCHED_SHARES).then(|| (shortfall - inv.pending_down).max(0.0))
-        }
-        _ => None,
     }
 }
 
@@ -1574,181 +1474,6 @@ mod tests {
             pnl_if_down: 0.0,
             source: "test".to_string(),
         }
-    }
-
-    fn quote(side: &str, reason: &str) -> QuoteIntent {
-        QuoteIntent {
-            quote_id: format!("quote-{side}"),
-            ts_ms: now_ms(),
-            market: "btc-updown-5m-test".to_string(),
-            condition_id: "condition".to_string(),
-            token_id: format!("token-{side}"),
-            side: side.to_string(),
-            price: 0.42,
-            size: 5.0,
-            fair: 0.5,
-            inventory_up: 0.0,
-            inventory_down: 0.0,
-            reason: reason.to_string(),
-        }
-    }
-
-    #[test]
-    fn pair_only_blocks_same_side_after_filled_imbalance() {
-        let mut cfg = test_cfg();
-        cfg.enable_directional_edge = false;
-        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
-            market: "btc-updown-5m-test".to_string(),
-            up_shares: 5.0,
-            up_cost: 2.5,
-            ..Default::default()
-        }));
-
-        assert!(
-            pair_only_block_reason(&cfg, &inventory, &quote("Up", "tov3_normal")).is_some(),
-            "long Up should not place another Up"
-        );
-        assert!(
-            pair_only_block_reason(&cfg, &inventory, &quote("Down", "tov3_rebalance_lock"))
-                .is_none(),
-            "long Up may place Down to pair"
-        );
-    }
-
-    #[test]
-    fn directional_edge_quote_can_opt_in_to_same_side() {
-        let mut cfg = test_cfg();
-        cfg.enable_directional_edge = true;
-        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
-            market: "btc-updown-5m-test".to_string(),
-            up_shares: 5.0,
-            up_cost: 2.5,
-            ..Default::default()
-        }));
-
-        assert!(
-            pair_only_block_reason(&cfg, &inventory, &quote("Up", "tov3_normal")).is_some(),
-            "ordinary stale same-side quotes still stay blocked"
-        );
-        assert!(
-            pair_only_block_reason(&cfg, &inventory, &quote("Up", "tov3_directional_edge"))
-                .is_none(),
-            "explicit directional-edge quotes remain opt-in"
-        );
-    }
-
-    #[test]
-    fn value_buy_quote_bypasses_pair_only_block() {
-        let cfg = test_cfg();
-        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
-            market: "btc-updown-5m-test".to_string(),
-            up_shares: 5.0,
-            up_cost: 2.5,
-            ..Default::default()
-        }));
-
-        assert!(
-            pair_only_block_reason(&cfg, &inventory, &quote("Up", "tov3_normal")).is_some(),
-            "legacy quote should still be blocked while long Up"
-        );
-        assert!(
-            pair_only_block_reason(&cfg, &inventory, &quote("Up", "value_buy")).is_none(),
-            "value-buy quotes are independently risk-capped, not pair-only gated"
-        );
-    }
-
-    #[test]
-    fn value_buy_room_uses_side_cap_not_pair_shortfall() {
-        assert_eq!(
-            quote_room(20.0, Some(5.0), "tov3_hybrid_pair_lock"),
-            5.0,
-            "legacy pairing quote is limited to the unmatched shortfall"
-        );
-        assert_eq!(
-            quote_room(20.0, Some(5.0), "value_buy"),
-            20.0,
-            "value-buy quote can use the full side cap"
-        );
-    }
-
-    #[test]
-    fn pair_lock_off_blocks_pairing_side_too() {
-        let mut cfg = test_cfg();
-        cfg.pair_lock_mode = "OFF".to_string();
-        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
-            market: "btc-updown-5m-test".to_string(),
-            up_shares: 5.0,
-            up_cost: 2.5,
-            ..Default::default()
-        }));
-
-        assert!(
-            pair_only_block_reason(&cfg, &inventory, &quote("Down", "tov3_hybrid_pair_lock"))
-                .is_some(),
-            "pair-lock OFF should hold the single side instead of pairing"
-        );
-    }
-
-    #[test]
-    fn pairing_room_counts_pending_pair_leg() {
-        let market = "btc-updown-5m-test";
-        let inv = Inventory {
-            market: market.to_string(),
-            down_shares: 5.0,
-            down_cost: 3.15,
-            pending_up: 5.0,
-            ..Default::default()
-        };
-
-        assert_eq!(
-            pairing_shortfall_room(&inv, market, "Up"),
-            Some(0.0),
-            "pending Up already covers the Down shortfall"
-        );
-
-        let inv_without_pending = Inventory {
-            pending_up: 0.0,
-            ..inv
-        };
-        assert_eq!(
-            pairing_shortfall_room(&inv_without_pending, market, "Up"),
-            Some(5.0),
-            "without a pending pair leg there is room for exactly one full Up quote"
-        );
-    }
-
-    #[test]
-    fn cancel_detected_fill_recheck_blocks_replacement_same_side() {
-        let mut cfg = test_cfg();
-        cfg.enable_directional_edge = false;
-        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
-            market: "btc-updown-5m-test".to_string(),
-            ..Default::default()
-        }));
-        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
-        let order = resting_order("Up", "q-pair-only", 5.0);
-        let id = order.exchange_order_id.clone().unwrap();
-        order_map.lock().unwrap().insert(
-            id,
-            QuoteMeta {
-                quote_id: order.quote_id.clone(),
-                market: order.market.clone(),
-                condition_id: order.condition_id.clone(),
-                side: order.side.clone(),
-                price: order.price,
-                size: order.size,
-                credited: false,
-                done: false,
-            },
-        );
-        let (ledger_tx, _rx) = std::sync::mpsc::channel();
-
-        assert!(pair_only_block_reason(&cfg, &inventory, &quote("Up", "tov3_normal")).is_none());
-        credit_filled_on_cancel(&inventory, Some(&order_map), &ledger_tx, &order).unwrap();
-        assert!(
-            pair_only_block_reason(&cfg, &inventory, &quote("Up", "tov3_normal")).is_some(),
-            "after cancel discovers a fill, replacing the same side must be blocked"
-        );
     }
 
     #[test]
