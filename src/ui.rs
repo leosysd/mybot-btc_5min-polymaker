@@ -37,10 +37,12 @@ fn repair_env_config(cfg: &Config) -> AppResult<()> {
     let mut created = false;
     if !env_path.exists() {
         fs::copy(cfg.env_example_file(), &env_path)?;
+        secure_env_permissions(&env_path)?;
         created = true;
     }
 
     ensure_cli_defaults(&env_path)?;
+    secure_env_permissions(&env_path)?;
     if created {
         println!("已创建 {}，并补齐默认配置。", env_path.display());
     } else {
@@ -1210,6 +1212,8 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "POST_ONLY_MARGIN_TICKS", "2")?;
     upsert_env_if_missing(path, "REJECT_BACKOFF_MS", "500")?;
     upsert_env_if_missing(path, "MIN_FAIR_TO_QUOTE", "0")?;
+    upsert_env_if_missing(path, "MIN_DIRECTIONAL_EDGE", "0.04")?;
+    upsert_env_if_missing(path, "DIRECTIONAL_INVENTORY_MULT", "2")?;
     Ok(())
 }
 
@@ -1274,6 +1278,19 @@ fn upsert_env(path: &Path, key: &str, value: &str) -> AppResult<()> {
         lines.push(format!("{key}={value}"));
     }
     fs::write(path, lines.join("\n") + "\n")?;
+    secure_env_permissions(path)?;
+    Ok(())
+}
+
+fn secure_env_permissions(path: &Path) -> AppResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut perms = fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(path, perms)?;
+    }
     Ok(())
 }
 

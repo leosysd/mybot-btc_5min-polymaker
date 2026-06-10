@@ -65,6 +65,8 @@ pub struct Config {
     pub post_only_margin_ticks: f64,
     pub reject_backoff_ms: u64,
     pub min_fair_to_quote: f64,
+    pub min_directional_edge: f64,
+    pub directional_inventory_mult: f64,
     pub enable_real_orders: String,
     pub polymarket_clob_host: String,
     pub poly_private_key: String,
@@ -163,6 +165,8 @@ impl Config {
             post_only_margin_ticks: get_f64(&file_env, "POST_ONLY_MARGIN_TICKS", 2.0),
             reject_backoff_ms: get_u64(&file_env, "REJECT_BACKOFF_MS", 500),
             min_fair_to_quote: get_f64(&file_env, "MIN_FAIR_TO_QUOTE", 0.0),
+            min_directional_edge: get_f64(&file_env, "MIN_DIRECTIONAL_EDGE", 0.04),
+            directional_inventory_mult: get_f64(&file_env, "DIRECTIONAL_INVENTORY_MULT", 2.0),
             enable_real_orders: get(&file_env, "ENABLE_REAL_ORDERS", ""),
             polymarket_clob_host: get(
                 &file_env,
@@ -249,6 +253,12 @@ impl Config {
         }
         if self.endgame_pull_secs < 0.0 || self.endgame_reduce_secs < self.endgame_pull_secs {
             return Err("ENDGAME_REDUCE_SECS must be >= ENDGAME_PULL_SECS >= 0".into());
+        }
+        if self.min_directional_edge < 0.0 || !self.min_directional_edge.is_finite() {
+            return Err("MIN_DIRECTIONAL_EDGE must be finite and non-negative".into());
+        }
+        if self.directional_inventory_mult < 0.0 || !self.directional_inventory_mult.is_finite() {
+            return Err("DIRECTIONAL_INVENTORY_MULT must be finite and non-negative".into());
         }
         Ok(())
     }
@@ -365,6 +375,13 @@ impl Config {
 
     pub fn max_side_inventory(&self) -> f64 {
         (self.quote_size * self.inventory_mult).round().max(0.0)
+    }
+
+    pub fn max_directional_inventory(&self) -> f64 {
+        (self.quote_size * self.directional_inventory_mult)
+            .round()
+            .max(0.0)
+            .min(self.max_side_inventory())
     }
 }
 

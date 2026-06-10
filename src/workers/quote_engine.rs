@@ -73,7 +73,9 @@ pub fn run(
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(ts) = last_market_ts {
                     let market_silence_ms = cfg.ws_stale_after_ms.max(cfg.stale_after_ms);
-                    if now_ms().saturating_sub(ts) > market_silence_ms {
+                    if !collector_owns_market_silence(&cfg)
+                        && now_ms().saturating_sub(ts) > market_silence_ms
+                    {
                         heartbeat(&cfg, "quote-engine", "kill switch: market stale")?;
                         request_stop(&stop, &cfg)?;
                         break;
@@ -85,6 +87,45 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+fn collector_owns_market_silence(cfg: &Config) -> bool {
+    cfg.data_mode == "live" && cfg.auto_discover_market
+}
+
+fn rebalance_target_side(up_shares: f64, down_shares: f64) -> Option<bool> {
+    const MIN_UNMATCHED_SHARES: f64 = 0.5;
+    let unmatched = up_shares - down_shares;
+    if unmatched > MIN_UNMATCHED_SHARES {
+        Some(false) // long Up: first try buying Down to pair filled inventory
+    } else if unmatched < -MIN_UNMATCHED_SHARES {
+        Some(true) // long Down: first try buying Up to pair filled inventory
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn directional_edge_target_side(
+    p_up: f64,
+    up_px: Option<f64>,
+    down_px: Option<f64>,
+    up_shares: f64,
+    down_shares: f64,
+    quote_size: f64,
+    max_unmatched: f64,
+    min_edge: f64,
+) -> Option<bool> {
+    let side_is_up = p_up >= 0.5;
+    let (fair, px, unmatched) = if side_is_up {
+        (p_up, up_px?, (up_shares - down_shares).max(0.0))
+    } else {
+        (1.0 - p_up, down_px?, (down_shares - up_shares).max(0.0))
+    };
+    if max_unmatched <= 0.0 || unmatched + quote_size > max_unmatched + 1e-9 {
+        return None;
+    }
+    (fair - px >= min_edge).then_some(side_is_up)
 }
 
 /// Compute the time-aware quotes for one market frame and emit them.
@@ -185,10 +226,7 @@ fn handle_market_frame(
     // ── 5. Endgame protocol + min-probability gate: a side is only quoted
     // if its win probability >= MIN_FAIR_TO_QUOTE (skip deep longshots).
     let phase = phase_for(tau, cfg.endgame_reduce_secs, cfg.endgame_pull_secs);
-    let up_ok = side_allowed(true, phase, up_eff, down_eff) && p_up >= cfg.min_fair_to_quote;
-    let down_ok =
-        side_allowed(false, phase, up_eff, down_eff) && (1.0 - p_up) >= cfg.min_fair_to_quote;
-    let up_px = if up_ok {
+    let up_pair_px = if side_allowed(true, phase, up_eff, down_eff) {
         post_only_bid(
             up_capped,
             frame.up_ask,
@@ -200,7 +238,7 @@ fn handle_market_frame(
     } else {
         None
     };
-    let down_px = if down_ok {
+    let down_pair_px = if side_allowed(false, phase, up_eff, down_eff) {
         post_only_bid(
             down_capped,
             frame.down_ask,
@@ -212,12 +250,71 @@ fn handle_market_frame(
     } else {
         None
     };
-
-    let reason = match phase {
-        Phase::Normal => "tov3_normal",
-        Phase::ReduceOnly => "tov3_reduce_only",
-        Phase::Pull => "tov3_pull",
+    let up_directional_px = if side_allowed(true, phase, up_eff, down_eff)
+        && p_up >= cfg.min_fair_to_quote
+    {
+        post_only_bid(
+            model.up_bid,
+            frame.up_ask,
+            cfg.tick_size,
+            cfg.min_bid,
+            cfg.max_bid,
+            cfg.post_only_margin_ticks,
+        )
+    } else {
+        None
     };
+    let down_directional_px = if side_allowed(false, phase, up_eff, down_eff)
+        && (1.0 - p_up) >= cfg.min_fair_to_quote
+    {
+        post_only_bid(
+            model.down_bid,
+            frame.down_ask,
+            cfg.tick_size,
+            cfg.min_bid,
+            cfg.max_bid,
+            cfg.post_only_margin_ticks,
+        )
+    } else {
+        None
+    };
+
+    let rebalance_target = rebalance_target_side(inventory.up_shares, inventory.down_shares);
+    let directional_target = if rebalance_target.is_some() {
+        directional_edge_target_side(
+            p_up,
+            up_directional_px,
+            down_directional_px,
+            inventory.up_shares,
+            inventory.down_shares,
+            cfg.quote_size,
+            cfg.max_directional_inventory(),
+            cfg.min_directional_edge,
+        )
+    } else {
+        None
+    };
+    let (up_px, down_px, reason) = match (phase, rebalance_target) {
+        (Phase::Pull, _) => (None, None, "tov3_pull"),
+        (Phase::Normal, Some(true)) if up_pair_px.is_some() => {
+            (up_pair_px, None, "tov3_rebalance_lock")
+        }
+        (Phase::Normal, Some(false)) if down_pair_px.is_some() => {
+            (None, down_pair_px, "tov3_rebalance_lock")
+        }
+        (Phase::Normal, Some(_)) => match directional_target {
+            Some(true) => (up_directional_px, None, "tov3_directional_edge"),
+            Some(false) => (None, down_directional_px, "tov3_directional_edge"),
+            None => (None, None, "tov3_wait_edge"),
+        },
+        (Phase::Normal, None) => {
+            let up_px = up_pair_px.filter(|_| p_up >= cfg.min_fair_to_quote);
+            let down_px = down_pair_px.filter(|_| (1.0 - p_up) >= cfg.min_fair_to_quote);
+            (up_px, down_px, "tov3_normal")
+        }
+        (Phase::ReduceOnly, _) => (up_pair_px, down_pair_px, "tov3_reduce_only"),
+    };
+
     if let Some(px) = up_px {
         send_quote(cfg, quote_tx, frame, "Up", px, p_up, inventory, reason)?;
     }
@@ -270,4 +367,53 @@ fn send_quote(
     // Best-effort: if the gateway is gone we're shutting down.
     let _ = quote_tx.send(quote);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_auto_discovery_waits_for_collector_liveness() {
+        let mut cfg = Config::from_env().expect("config");
+        cfg.data_mode = "live".to_string();
+        cfg.auto_discover_market = true;
+        assert!(collector_owns_market_silence(&cfg));
+
+        cfg.auto_discover_market = false;
+        assert!(!collector_owns_market_silence(&cfg));
+
+        cfg.data_mode = "sim".to_string();
+        cfg.auto_discover_market = true;
+        assert!(!collector_owns_market_silence(&cfg));
+    }
+
+    #[test]
+    fn filled_imbalance_quotes_only_pairing_side() {
+        assert_eq!(rebalance_target_side(5.0, 0.0), Some(false));
+        assert_eq!(rebalance_target_side(0.0, 5.0), Some(true));
+        assert_eq!(rebalance_target_side(5.0, 5.0), None);
+    }
+
+    #[test]
+    fn directional_edge_requires_winner_edge_and_room() {
+        assert_eq!(
+            directional_edge_target_side(0.70, Some(0.64), Some(0.20), 5.0, 0.0, 5.0, 10.0, 0.04),
+            Some(true)
+        );
+        assert_eq!(
+            directional_edge_target_side(0.70, Some(0.68), Some(0.20), 5.0, 0.0, 5.0, 10.0, 0.04),
+            None,
+            "edge below threshold"
+        );
+        assert_eq!(
+            directional_edge_target_side(0.70, Some(0.64), Some(0.20), 10.0, 0.0, 5.0, 10.0, 0.04),
+            None,
+            "directional unmatched cap reached"
+        );
+        assert_eq!(
+            directional_edge_target_side(0.30, Some(0.20), Some(0.64), 0.0, 5.0, 5.0, 10.0, 0.04),
+            Some(false)
+        );
+    }
 }

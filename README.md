@@ -334,7 +334,7 @@ POLYMARKET_GAMMA_API_URL=https://gamma-api.polymarket.com
 MARKET_WINDOW_SECS=300
 ```
 
-`collector` 会按 `btc-updown-5m-{窗口开始unix秒}` 查询 Gamma API，解析当前市场的 `clobTokenIds`，并把 token id 放进每条 quote。开盘价优先取交易所窗口开始附近成交价；如果 Binance 主站不可用，会 fallback 到 Binance.US、Coinbase、Kraken 的 BTC/USD 最新价。注意 Polymarket 结算源仍是 Chainlink BTC/USD Data Stream，外部交易所价格只是模型输入和兜底。
+`collector` 会按 `btc-updown-5m-{窗口开始unix秒}` 查询 Gamma API，解析当前市场的 `clobTokenIds`，并把 token id 放进每条 quote。自动发现时，判定价优先取 Coinbase 1 分钟 candle 的窗口开盘价；如果该 candle 还没生成，只接受窗口开始附近从 Coinbase WS 捕捉到的第一笔价格。拿不到可靠 Coinbase strike 时会等待，不会用当前价冒充开盘价。注意 Polymarket 结算源仍是 Chainlink BTC/USD Data Stream，外部交易所价格只是模型输入。
 
 如果你一定要手动覆盖，才设置：
 
@@ -461,8 +461,10 @@ LIVE_ORDER_NOTIONAL_CAP=5
 4. 根据库存做偏移：
    - Up 库存多：降低 Up bid，提高 Down bid。
    - Down 库存多：降低 Down bid，提高 Up bid。
-5. 报价不能吃单，必须低于当前 ask 一个 tick。
-6. 单边库存达到上限后，不再继续报该边。
+5. 如果已成交库存单边不平衡，先尝试买对边完成 `Up+Down < 1 - MIN_LOCK_EDGE` 的锁利配平。
+6. 如果对边不能锁利，只有模型胜率高的一边满足 `fair - price >= MIN_DIRECTIONAL_EDGE`，且未配平方向仓低于 `QUOTE_SIZE * DIRECTIONAL_INVENTORY_MULT`，才继续加方向仓。
+7. 报价不能吃单，必须低于当前 ask 一个 tick。
+8. 单边库存达到上限后，不再继续报该边。
 
 ## 当前限制
 
