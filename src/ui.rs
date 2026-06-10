@@ -4,6 +4,7 @@ use crate::pricing::{blend_market_anchor, digital_p_up, market_anchor_weight, un
 use crate::workers;
 use crate::AppResult;
 use serde::de::DeserializeOwned;
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Write};
@@ -1037,10 +1038,13 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         stat.fills += 1;
     }
 
-    // Settlement proxy: only near-close frames after the scheduled end are
-    // eligible. Otherwise the still-live latest frame would make the current
-    // active market look settled.
-    let mut won_up: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    let official_won_up = fetch_official_settlements(cfg, &order);
+
+    // Local settlement proxy fallback: only near-close frames after the scheduled
+    // end are eligible. Otherwise the still-live latest frame would make the
+    // current active market look settled.
+    let mut local_won_up: std::collections::HashMap<String, bool> =
+        std::collections::HashMap::new();
     let mut close_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let stats_now_ms = now_ms();
     for fr in read_all_jsonl::<MarketFrame>(&cfg.book_path())? {
@@ -1052,7 +1056,7 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         }
         if close_ts.get(&fr.market).map_or(true, |&t| fr.ts_ms >= t) {
             close_ts.insert(fr.market.clone(), fr.ts_ms);
-            won_up.insert(fr.market.clone(), fr.btc_price > fr.price_to_beat);
+            local_won_up.insert(fr.market.clone(), fr.btc_price > fr.price_to_beat);
         }
     }
 
@@ -1106,7 +1110,11 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         total_fills += s.fills;
 
         // Actual settlement + realized PnL for the window (if we have a close).
-        let (settle_cell, realized_cell) = match won_up.get(market).copied() {
+        let (settle_cell, realized_cell) = match official_won_up
+            .get(market)
+            .copied()
+            .or_else(|| local_won_up.get(market).copied())
+        {
             Some(up) => {
                 settled += 1;
                 let realized = if up { s.pnl_if_up() } else { s.pnl_if_down() };
@@ -1216,13 +1224,87 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     );
     println!();
     println!(
-        "{}说明:盘口列显示北京时间窗口起止。结算列按本机 BTC 行情最后一档 vs 判定价推断(非 \
-         Polymarket 官方 Chainlink 结算,临界盘可能有偏差);只有盘口已过结算点且捕获到临近\
-         收盘行情才显示 Up/Down;实现PnL=按该结算方向的逐盘已实现盈亏。未结算或缺少临近\
+        "{}说明:盘口列显示北京时间窗口起止。结算列优先读取 Polymarket Gamma 官方 resolved \
+         outcomePrices;官方结果暂不可用时才用本机 BTC 临近收盘行情兜底推断(临界盘可能有\
+         偏差)。实现PnL=按该结算方向的逐盘已实现盈亏。官方未 resolved 且本机缺少临近\
          收盘行情的盘口显示 ?。{}",
         C_DIM, C_RESET
     );
     Ok(())
+}
+
+fn fetch_official_settlements(
+    cfg: &Config,
+    markets: &[String],
+) -> std::collections::HashMap<String, bool> {
+    let mut out = std::collections::HashMap::new();
+    for market in markets {
+        if let Some(won_up) = fetch_official_settlement(cfg, market) {
+            out.insert(market.clone(), won_up);
+        }
+    }
+    out
+}
+
+fn fetch_official_settlement(cfg: &Config, slug: &str) -> Option<bool> {
+    let base = cfg.gamma_api_url.trim_end_matches('/');
+    let url = format!("{base}/events/slug/{slug}");
+    let value: Value = ureq::get(&url)
+        .set("User-Agent", "polymaker/0.1")
+        .timeout(Duration::from_secs(3))
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    let market = value
+        .get("markets")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())?;
+    let closed = market
+        .get("closed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let resolved = market
+        .get("umaResolutionStatus")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("resolved"));
+    if !closed && !resolved {
+        return None;
+    }
+    let outcomes = parse_json_string_array(market.get("outcomes"))?;
+    let prices = parse_json_string_array(market.get("outcomePrices"))?;
+    if outcomes.len() != prices.len() {
+        return None;
+    }
+    outcomes
+        .iter()
+        .zip(prices.iter())
+        .filter_map(|(outcome, price)| price.parse::<f64>().ok().map(|p| (outcome, p)))
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .and_then(|(outcome, price)| {
+            if price < 0.5 {
+                None
+            } else {
+                match outcome.trim().to_ascii_lowercase().as_str() {
+                    "up" => Some(true),
+                    "down" => Some(false),
+                    _ => None,
+                }
+            }
+        })
+}
+
+fn parse_json_string_array(value: Option<&Value>) -> Option<Vec<String>> {
+    match value? {
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string))
+                .collect(),
+        ),
+        Value::String(raw) => serde_json::from_str::<Vec<String>>(raw).ok(),
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
