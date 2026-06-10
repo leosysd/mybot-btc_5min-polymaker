@@ -939,14 +939,11 @@ fn short_market(slug: &str) -> String {
     }
 }
 
-/// Market slugs end with the window-start unix seconds (btc-updown-5m-<start>).
-/// Render that as a human-readable Beijing-time label "MM-DD HH:MM"; fall back
-/// to the trimmed slug if there is no plausible trailing timestamp.
-fn fmt_market_label(slug: &str) -> String {
-    if let Some(ts) = market_start_secs(slug) {
-        if (1_000_000_000..=4_000_000_000).contains(&ts) {
-            return fmt_window_time(ts);
-        }
+/// Render a slugged 5-minute market as "MM-DD HH:MM-HH:MM" in Beijing time.
+fn fmt_market_window_label(slug: &str, window_secs: u64) -> String {
+    if let Some(start) = market_start_secs(slug) {
+        let end = start.saturating_add(window_secs);
+        return format!("{}-{}", fmt_window_time(start), fmt_window_end_time(end));
     }
     short_market(slug)
 }
@@ -982,6 +979,13 @@ fn fmt_window_time(unix_secs: u64) -> String {
     let (hh, mm) = (sod / 3600, (sod % 3600) / 60);
     let (_, mon, day) = civil_from_days(days);
     format!("{mon:02}-{day:02} {hh:02}:{mm:02}")
+}
+
+fn fmt_window_end_time(unix_secs: u64) -> String {
+    let s = unix_secs as i64 + 8 * 3600;
+    let sod = s.rem_euclid(86_400);
+    let (hh, mm) = (sod / 3600, (sod % 3600) / 60);
+    format!("{hh:02}:{mm:02}")
 }
 
 /// Days since 1970-01-01 -> (year, month, day). Howard Hinnant's algorithm.
@@ -1055,7 +1059,7 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     println!(
         "{}",
         table_row(&[
-            ("盘口".to_string(), 12, Align::Left),
+            ("盘口".to_string(), 18, Align::Left),
             ("成交".to_string(), 4, Align::Right),
             ("Up份".to_string(), 5, Align::Right),
             ("Up均".to_string(), 6, Align::Right),
@@ -1135,7 +1139,11 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         println!(
             "{}",
             table_row(&[
-                (fmt_market_label(market), 12, Align::Left),
+                (
+                    fmt_market_window_label(market, cfg.market_window_secs),
+                    18,
+                    Align::Left,
+                ),
                 (s.fills.to_string(), 4, Align::Right),
                 (format!("{:.0}", s.up_shares), 5, Align::Right),
                 (format!("{:.3}", up_avg), 6, Align::Right),
@@ -1208,9 +1216,10 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     );
     println!();
     println!(
-        "{}说明:结算列按本机 BTC 行情最后一档 vs 判定价推断(非 Polymarket 官方 \
-         Chainlink 结算,临界盘可能有偏差);只有盘口已过结算点且捕获到临近收盘行情才显示 \
-         Up/Down;实现PnL=按该结算方向的逐盘已实现盈亏。未结算或缺少临近收盘行情的盘口显示 ?。{}",
+        "{}说明:盘口列显示北京时间窗口起止。结算列按本机 BTC 行情最后一档 vs 判定价推断(非 \
+         Polymarket 官方 Chainlink 结算,临界盘可能有偏差);只有盘口已过结算点且捕获到临近\
+         收盘行情才显示 Up/Down;实现PnL=按该结算方向的逐盘已实现盈亏。未结算或缺少临近\
+         收盘行情的盘口显示 ?。{}",
         C_DIM, C_RESET
     );
     Ok(())
