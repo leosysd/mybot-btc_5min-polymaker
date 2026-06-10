@@ -1212,6 +1212,8 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "POST_ONLY_MARGIN_TICKS", "2")?;
     upsert_env_if_missing(path, "REJECT_BACKOFF_MS", "500")?;
     upsert_env_if_missing(path, "MIN_FAIR_TO_QUOTE", "0")?;
+    upsert_env_if_missing(path, "MIN_DIRECTIONAL_EDGE", "0.04")?;
+    upsert_env_if_missing(path, "DIRECTIONAL_INVENTORY_MULT", "2")?;
     Ok(())
 }
 

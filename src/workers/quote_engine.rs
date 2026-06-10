@@ -97,12 +97,35 @@ fn rebalance_target_side(up_shares: f64, down_shares: f64) -> Option<bool> {
     const MIN_UNMATCHED_SHARES: f64 = 0.5;
     let unmatched = up_shares - down_shares;
     if unmatched > MIN_UNMATCHED_SHARES {
-        Some(false) // long Up: only buy Down until filled inventory is paired
+        Some(false) // long Up: first try buying Down to pair filled inventory
     } else if unmatched < -MIN_UNMATCHED_SHARES {
-        Some(true) // long Down: only buy Up until filled inventory is paired
+        Some(true) // long Down: first try buying Up to pair filled inventory
     } else {
         None
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn directional_edge_target_side(
+    p_up: f64,
+    up_px: Option<f64>,
+    down_px: Option<f64>,
+    up_shares: f64,
+    down_shares: f64,
+    quote_size: f64,
+    max_unmatched: f64,
+    min_edge: f64,
+) -> Option<bool> {
+    let side_is_up = p_up >= 0.5;
+    let (fair, px, unmatched) = if side_is_up {
+        (p_up, up_px?, (up_shares - down_shares).max(0.0))
+    } else {
+        (1.0 - p_up, down_px?, (down_shares - up_shares).max(0.0))
+    };
+    if max_unmatched <= 0.0 || unmatched + quote_size > max_unmatched + 1e-9 {
+        return None;
+    }
+    (fair - px >= min_edge).then_some(side_is_up)
 }
 
 /// Compute the time-aware quotes for one market frame and emit them.
@@ -203,14 +226,7 @@ fn handle_market_frame(
     // ── 5. Endgame protocol + min-probability gate: a side is only quoted
     // if its win probability >= MIN_FAIR_TO_QUOTE (skip deep longshots).
     let phase = phase_for(tau, cfg.endgame_reduce_secs, cfg.endgame_pull_secs);
-    let rebalance_target = rebalance_target_side(inventory.up_shares, inventory.down_shares);
-    let up_ok = side_allowed(true, phase, up_eff, down_eff)
-        && rebalance_target.is_none_or(|target| target)
-        && p_up >= cfg.min_fair_to_quote;
-    let down_ok = side_allowed(false, phase, up_eff, down_eff)
-        && rebalance_target.is_none_or(|target| !target)
-        && (1.0 - p_up) >= cfg.min_fair_to_quote;
-    let up_px = if up_ok {
+    let up_pair_px = if side_allowed(true, phase, up_eff, down_eff) {
         post_only_bid(
             up_capped,
             frame.up_ask,
@@ -222,7 +238,7 @@ fn handle_market_frame(
     } else {
         None
     };
-    let down_px = if down_ok {
+    let down_pair_px = if side_allowed(false, phase, up_eff, down_eff) {
         post_only_bid(
             down_capped,
             frame.down_ask,
@@ -234,13 +250,71 @@ fn handle_market_frame(
     } else {
         None
     };
-
-    let reason = match (phase, rebalance_target) {
-        (Phase::Normal, Some(_)) => "tov3_rebalance_only",
-        (Phase::Normal, None) => "tov3_normal",
-        (Phase::ReduceOnly, _) => "tov3_reduce_only",
-        (Phase::Pull, _) => "tov3_pull",
+    let up_directional_px = if side_allowed(true, phase, up_eff, down_eff)
+        && p_up >= cfg.min_fair_to_quote
+    {
+        post_only_bid(
+            model.up_bid,
+            frame.up_ask,
+            cfg.tick_size,
+            cfg.min_bid,
+            cfg.max_bid,
+            cfg.post_only_margin_ticks,
+        )
+    } else {
+        None
     };
+    let down_directional_px = if side_allowed(false, phase, up_eff, down_eff)
+        && (1.0 - p_up) >= cfg.min_fair_to_quote
+    {
+        post_only_bid(
+            model.down_bid,
+            frame.down_ask,
+            cfg.tick_size,
+            cfg.min_bid,
+            cfg.max_bid,
+            cfg.post_only_margin_ticks,
+        )
+    } else {
+        None
+    };
+
+    let rebalance_target = rebalance_target_side(inventory.up_shares, inventory.down_shares);
+    let directional_target = if rebalance_target.is_some() {
+        directional_edge_target_side(
+            p_up,
+            up_directional_px,
+            down_directional_px,
+            inventory.up_shares,
+            inventory.down_shares,
+            cfg.quote_size,
+            cfg.max_directional_inventory(),
+            cfg.min_directional_edge,
+        )
+    } else {
+        None
+    };
+    let (up_px, down_px, reason) = match (phase, rebalance_target) {
+        (Phase::Pull, _) => (None, None, "tov3_pull"),
+        (Phase::Normal, Some(true)) if up_pair_px.is_some() => {
+            (up_pair_px, None, "tov3_rebalance_lock")
+        }
+        (Phase::Normal, Some(false)) if down_pair_px.is_some() => {
+            (None, down_pair_px, "tov3_rebalance_lock")
+        }
+        (Phase::Normal, Some(_)) => match directional_target {
+            Some(true) => (up_directional_px, None, "tov3_directional_edge"),
+            Some(false) => (None, down_directional_px, "tov3_directional_edge"),
+            None => (None, None, "tov3_wait_edge"),
+        },
+        (Phase::Normal, None) => {
+            let up_px = up_pair_px.filter(|_| p_up >= cfg.min_fair_to_quote);
+            let down_px = down_pair_px.filter(|_| (1.0 - p_up) >= cfg.min_fair_to_quote);
+            (up_px, down_px, "tov3_normal")
+        }
+        (Phase::ReduceOnly, _) => (up_pair_px, down_pair_px, "tov3_reduce_only"),
+    };
+
     if let Some(px) = up_px {
         send_quote(cfg, quote_tx, frame, "Up", px, p_up, inventory, reason)?;
     }
@@ -319,5 +393,27 @@ mod tests {
         assert_eq!(rebalance_target_side(5.0, 0.0), Some(false));
         assert_eq!(rebalance_target_side(0.0, 5.0), Some(true));
         assert_eq!(rebalance_target_side(5.0, 5.0), None);
+    }
+
+    #[test]
+    fn directional_edge_requires_winner_edge_and_room() {
+        assert_eq!(
+            directional_edge_target_side(0.70, Some(0.64), Some(0.20), 5.0, 0.0, 5.0, 10.0, 0.04),
+            Some(true)
+        );
+        assert_eq!(
+            directional_edge_target_side(0.70, Some(0.68), Some(0.20), 5.0, 0.0, 5.0, 10.0, 0.04),
+            None,
+            "edge below threshold"
+        );
+        assert_eq!(
+            directional_edge_target_side(0.70, Some(0.64), Some(0.20), 10.0, 0.0, 5.0, 10.0, 0.04),
+            None,
+            "directional unmatched cap reached"
+        );
+        assert_eq!(
+            directional_edge_target_side(0.30, Some(0.20), Some(0.64), 0.0, 5.0, 5.0, 10.0, 0.04),
+            Some(false)
+        );
     }
 }
