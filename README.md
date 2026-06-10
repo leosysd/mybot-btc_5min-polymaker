@@ -119,6 +119,7 @@ polymaker menu
 - 重启服务
 - 清空运行数据
 - 查看参数说明
+- 对比模型胜率和 Polymarket 盘口隐含胜率
 
 ## 交易监控页
 
@@ -139,9 +140,17 @@ polymaker dashboard --seconds 10
 - 进程心跳
 - 当前库存
 - Up 赢 / Down 赢两种情景 PnL
-- 最近行情
+- 最近行情，包括 Up/Down best bid 和 best ask
 - 最近报价
 - 最近模拟成交
+
+对比模型胜率和 Polymarket 当时盘口胜率：
+
+```bash
+polymaker model-market
+```
+
+`model-market` 会读取 `run/book.jsonl`，用 bot 的 BTC 模型概率对比 Polymarket 盘口隐含概率。新日志会用 best bid/ask mid；旧日志没有 bid 字段时，会明确标记为 ask 推算近似。
 
 ## 快速试跑
 
@@ -169,7 +178,7 @@ cat run/inventory.json
 
 你应该能看到：
 
-- `book.jsonl`：collector 产生的模拟盘口
+- `book.jsonl`：collector 产生的模拟盘口，live 模式包含 Up/Down best bid 和 best ask
 - `quotes.jsonl`：quote-engine 产生的做市报价
 - `fills.jsonl`：order-gateway 模拟成交
 - `inventory.json`：risk-ledger 当前库存

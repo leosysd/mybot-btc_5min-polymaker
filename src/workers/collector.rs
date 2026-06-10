@@ -75,14 +75,18 @@ fn run_sim_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResul
         let w = uncertainty_width(vol_now, tau_seconds, cfg.width_floor_usd);
         let fair_up = digital_p_up(btc_price, price_to_beat, w);
         let micro_noise = 0.012 * (phase * 1.7).sin();
+        let up_ask = (fair_up + 0.035 + micro_noise).clamp(0.03, 0.97);
+        let down_ask = (1.0 - fair_up + 0.035 - micro_noise).clamp(0.03, 0.97);
         let frame = MarketFrame {
             ts_ms: now_ms(),
             market: cfg.market_slug.clone(),
             condition_id: String::new(),
             up_token_id: cfg.polymarket_up_token_id.clone(),
             down_token_id: cfg.polymarket_down_token_id.clone(),
-            up_ask: (fair_up + 0.035 + micro_noise).clamp(0.03, 0.97),
-            down_ask: (1.0 - fair_up + 0.035 - micro_noise).clamp(0.03, 0.97),
+            up_bid: (up_ask - 0.07).max(0.01),
+            up_ask,
+            down_bid: (down_ask - 0.07).max(0.01),
+            down_ask,
             btc_price,
             price_to_beat,
             tau_seconds,
@@ -214,7 +218,9 @@ struct LiveMarketState {
     btc_open_window_start_s: u64,
     btc_open_price: f64,
     btc_source: String,
+    up_bid: f64,
     up_ask: f64,
+    down_bid: f64,
     down_ask: f64,
     last_btc_ts: u64,
     last_polymarket_ts: u64,
@@ -279,7 +285,9 @@ impl LiveMarketState {
             btc_open_window_start_s: 0,
             btc_open_price: 0.0,
             btc_source: String::new(),
+            up_bid: 0.0,
             up_ask: 0.0,
+            down_bid: 0.0,
             down_ask: 0.0,
             last_btc_ts: 0,
             last_polymarket_ts,
@@ -313,7 +321,9 @@ impl LiveMarketState {
             condition_id: market.condition_id.clone(),
             up_token_id: market.up_token_id.clone(),
             down_token_id: market.down_token_id.clone(),
+            up_bid: self.up_bid,
             up_ask: self.up_ask,
+            down_bid: self.down_bid,
             down_ask: self.down_ask,
             btc_price: self.btc_price,
             price_to_beat: market.price_to_beat,
@@ -337,7 +347,9 @@ impl LiveMarketState {
             // track spot → S-P≈0 → the model stuck at ~50/50 (blind to direction,
             // bidding ~0.50 on both sides). That was THE bug behind "buys both
             // sides / ignores that the market already moved".
+            self.up_bid = 0.0;
             self.up_ask = 0.0;
+            self.down_bid = 0.0;
             self.down_ask = 0.0;
             self.last_polymarket_ts = now_ms();
             self.price_to_beat = next.price_to_beat;
@@ -801,19 +813,23 @@ fn apply_polymarket_message(state: &Arc<Mutex<LiveMarketState>>, value: &Value) 
             let Some(asset_id) = value.get("asset_id").and_then(Value::as_str) else {
                 return false;
             };
-            let Some(best_ask) = best_ask_from_levels(value.get("asks")) else {
+            let best_bid = best_bid_from_levels(value.get("bids"));
+            let best_ask = best_ask_from_levels(value.get("asks"));
+            if best_bid.is_none() && best_ask.is_none() {
                 return false;
-            };
-            update_polymarket_ask(state, asset_id, best_ask)
+            }
+            update_polymarket_book(state, asset_id, best_bid, best_ask)
         }
         "best_bid_ask" => {
             let Some(asset_id) = value.get("asset_id").and_then(Value::as_str) else {
                 return false;
             };
-            let Some(best_ask) = parse_f64_value(value.get("best_ask")) else {
+            let best_bid = parse_f64_value(value.get("best_bid"));
+            let best_ask = parse_f64_value(value.get("best_ask"));
+            if best_bid.is_none() && best_ask.is_none() {
                 return false;
-            };
-            update_polymarket_ask(state, asset_id, best_ask)
+            }
+            update_polymarket_book(state, asset_id, best_bid, best_ask)
         }
         "price_change" => {
             let Some(changes) = value.get("price_changes").and_then(Value::as_array) else {
@@ -824,10 +840,12 @@ fn apply_polymarket_message(state: &Arc<Mutex<LiveMarketState>>, value: &Value) 
                 let Some(asset_id) = change.get("asset_id").and_then(Value::as_str) else {
                     continue;
                 };
-                let Some(best_ask) = parse_f64_value(change.get("best_ask")) else {
+                let best_bid = parse_f64_value(change.get("best_bid"));
+                let best_ask = parse_f64_value(change.get("best_ask"));
+                if best_bid.is_none() && best_ask.is_none() {
                     continue;
-                };
-                updated |= update_polymarket_ask(state, asset_id, best_ask);
+                }
+                updated |= update_polymarket_book(state, asset_id, best_bid, best_ask);
             }
             updated
         }
@@ -835,14 +853,15 @@ fn apply_polymarket_message(state: &Arc<Mutex<LiveMarketState>>, value: &Value) 
     }
 }
 
-fn update_polymarket_ask(
+fn update_polymarket_book(
     state: &Arc<Mutex<LiveMarketState>>,
     asset_id: &str,
-    best_ask: f64,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
 ) -> bool {
-    if !(0.0..=1.0).contains(&best_ask) || best_ask <= 0.0 {
-        return false;
-    }
+    let best_bid = best_bid.filter(|px| valid_probability_price(*px));
+    let best_ask = best_ask.filter(|px| valid_probability_price(*px));
+    let mut changed = false;
     let mut state = state.lock().unwrap();
     let Some(market) = state.market.as_ref() else {
         return false;
@@ -852,19 +871,44 @@ fn update_polymarket_ask(
     if !is_up && !is_down {
         return false;
     }
-    let changed = if is_up {
-        (state.up_ask - best_ask).abs() > f64::EPSILON
-    } else {
-        (state.down_ask - best_ask).abs() > f64::EPSILON
-    };
     state.started = true;
     state.last_polymarket_ts = now_ms();
     if is_up {
-        state.up_ask = best_ask;
+        if let Some(best_bid) = best_bid {
+            changed |= (state.up_bid - best_bid).abs() > f64::EPSILON;
+            state.up_bid = best_bid;
+        }
+        if let Some(best_ask) = best_ask {
+            changed |= (state.up_ask - best_ask).abs() > f64::EPSILON;
+            state.up_ask = best_ask;
+        }
     } else if is_down {
-        state.down_ask = best_ask;
+        if let Some(best_bid) = best_bid {
+            changed |= (state.down_bid - best_bid).abs() > f64::EPSILON;
+            state.down_bid = best_bid;
+        }
+        if let Some(best_ask) = best_ask {
+            changed |= (state.down_ask - best_ask).abs() > f64::EPSILON;
+            state.down_ask = best_ask;
+        }
     }
     changed
+}
+
+fn valid_probability_price(px: f64) -> bool {
+    px.is_finite() && px > 0.0 && px <= 1.0
+}
+
+fn best_bid_from_levels(levels: Option<&Value>) -> Option<f64> {
+    levels?
+        .as_array()?
+        .iter()
+        .filter_map(|level| {
+            let price = parse_f64_value(level.get("price"))?;
+            let size = parse_f64_value(level.get("size")).unwrap_or(0.0);
+            (size > 0.0).then_some(price)
+        })
+        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
 }
 
 fn best_ask_from_levels(levels: Option<&Value>) -> Option<f64> {
@@ -944,5 +988,29 @@ mod tests {
             None,
             "current BTC price must not be reused as another window's strike"
         );
+    }
+
+    #[test]
+    fn book_message_updates_best_bid_and_ask() {
+        let cfg = Config::from_env().expect("config");
+        let state = Arc::new(Mutex::new(LiveMarketState::new(&cfg)));
+        assert!(state.lock().unwrap().set_market(ident("win-A", 100.0)));
+        let value = serde_json::json!({
+            "event_type": "book",
+            "asset_id": "u",
+            "bids": [
+                {"price": "0.39", "size": "5"},
+                {"price": "0.41", "size": "5"}
+            ],
+            "asks": [
+                {"price": "0.45", "size": "5"},
+                {"price": "0.44", "size": "5"}
+            ]
+        });
+
+        assert!(apply_polymarket_message(&state, &value));
+        let state = state.lock().unwrap();
+        assert!((state.up_bid - 0.41).abs() < 1e-9);
+        assert!((state.up_ask - 0.44).abs() < 1e-9);
     }
 }

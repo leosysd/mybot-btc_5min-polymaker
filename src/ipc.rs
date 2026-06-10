@@ -17,7 +17,11 @@ pub struct MarketFrame {
     pub up_token_id: String,
     #[serde(default)]
     pub down_token_id: String,
+    #[serde(default)]
+    pub up_bid: f64,
     pub up_ask: f64,
+    #[serde(default)]
+    pub down_bid: f64,
     pub down_ask: f64,
     pub btc_price: f64,
     pub price_to_beat: f64,

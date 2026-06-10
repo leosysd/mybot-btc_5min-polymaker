@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::ipc::{now_ms, FillEvent, Heartbeat, Inventory, MarketFrame, QuoteIntent};
+use crate::pricing::{digital_p_up, uncertainty_width};
 use crate::workers;
 use crate::AppResult;
 use serde::de::DeserializeOwned;
@@ -77,6 +78,7 @@ pub fn run_menu(cfg: &Config) -> AppResult<()> {
         println!("  {}10.{} 清空运行数据", C_GREEN, C_RESET);
         println!("  {}11.{} 参数说明", C_GREEN, C_RESET);
         println!("  {}12.{} 交易统计表", C_GREEN, C_RESET);
+        println!("  {}13.{} 模型/盘口胜率对比", C_GREEN, C_RESET);
         println!("  {}0.{} 退出", C_GREEN, C_RESET);
         println!();
 
@@ -130,6 +132,11 @@ pub fn run_menu(cfg: &Config) -> AppResult<()> {
             "12" => {
                 clear_screen();
                 print_trade_stats(&active_cfg)?;
+                pause()?;
+            }
+            "13" => {
+                clear_screen();
+                print_model_market_stats(&active_cfg)?;
                 pause()?;
             }
             "0" => return Ok(()),
@@ -295,7 +302,9 @@ fn print_latest_market(cfg: &Config) -> AppResult<()> {
         table_row(&[
             ("时间".to_string(), 8, Align::Left),
             ("BTC".to_string(), 10, Align::Right),
+            ("UpBid".to_string(), 7, Align::Right),
             ("UpAsk".to_string(), 7, Align::Right),
+            ("DnBid".to_string(), 7, Align::Right),
             ("DnAsk".to_string(), 7, Align::Right),
             ("来源".to_string(), 20, Align::Left),
         ])
@@ -306,7 +315,9 @@ fn print_latest_market(cfg: &Config) -> AppResult<()> {
             table_row(&[
                 (fmt_ts(r.ts_ms), 8, Align::Left),
                 (format!("{:.2}", r.btc_price), 10, Align::Right),
+                (format_market_px(r.up_bid), 7, Align::Right),
                 (format!("{:.3}", r.up_ask), 7, Align::Right),
+                (format_market_px(r.down_bid), 7, Align::Right),
                 (format!("{:.3}", r.down_ask), 7, Align::Right),
                 (r.source, 20, Align::Left),
             ])
@@ -1190,6 +1201,245 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     Ok(())
 }
 
+#[derive(Clone)]
+struct ModelMarketSample {
+    ts_ms: u64,
+    market: String,
+    tau_seconds: f64,
+    model_up: f64,
+    market_up: f64,
+    exact_book: bool,
+}
+
+pub fn print_model_market_stats(cfg: &Config) -> AppResult<()> {
+    print_banner("模型/盘口胜率对比");
+    let frames = read_all_jsonl::<MarketFrame>(&cfg.book_path())?;
+    let samples = frames
+        .iter()
+        .filter_map(|fr| model_market_sample(cfg, fr))
+        .collect::<Vec<_>>();
+    if samples.is_empty() {
+        println!(
+            "{}暂无可用行情样本 ({})。先运行 live collector 生成 book.jsonl。{}",
+            C_DIM,
+            cfg.book_path().display(),
+            C_RESET
+        );
+        return Ok(());
+    }
+
+    let exact = samples
+        .iter()
+        .filter(|sample| sample.exact_book)
+        .cloned()
+        .collect::<Vec<_>>();
+    let approx = samples
+        .iter()
+        .filter(|sample| !sample.exact_book)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !exact.is_empty() {
+        print_model_market_summary("精确盘口(best bid/ask)", &exact);
+    }
+    if !approx.is_empty() {
+        print_model_market_summary("旧日志近似(ask推算)", &approx);
+    }
+
+    let primary = if exact.is_empty() { &samples } else { &exact };
+    println!();
+    println!(
+        "{}按剩余时间分桶{}  {}",
+        C_BOLD,
+        C_RESET,
+        if exact.is_empty() {
+            "(当前没有bid字段, 使用旧日志近似)"
+        } else {
+            "(使用真实best bid/ask)"
+        }
+    );
+    println!(
+        "{}",
+        table_row(&[
+            ("剩余秒".to_string(), 10, Align::Left),
+            ("样本".to_string(), 6, Align::Right),
+            ("模型Up".to_string(), 8, Align::Right),
+            ("盘口Up".to_string(), 8, Align::Right),
+            ("差值".to_string(), 8, Align::Right),
+            ("绝对差".to_string(), 8, Align::Right),
+        ])
+    );
+    for (lo, hi) in [
+        (240.0, 300.0),
+        (180.0, 240.0),
+        (120.0, 180.0),
+        (60.0, 120.0),
+        (30.0, 60.0),
+        (10.0, 30.0),
+        (0.0, 10.0),
+    ] {
+        let bucket = primary
+            .iter()
+            .filter(|sample| sample.tau_seconds >= lo && sample.tau_seconds < hi)
+            .cloned()
+            .collect::<Vec<_>>();
+        if bucket.is_empty() {
+            continue;
+        }
+        let (model, market, diff, abs_diff) = model_market_means(&bucket);
+        println!(
+            "{}",
+            table_row(&[
+                (format!("{lo:.0}-{hi:.0}"), 10, Align::Left),
+                (bucket.len().to_string(), 6, Align::Right),
+                (format!("{model:.3}"), 8, Align::Right),
+                (format!("{market:.3}"), 8, Align::Right),
+                (format!("{diff:+.3}"), 8, Align::Right),
+                (format!("{abs_diff:.3}"), 8, Align::Right),
+            ])
+        );
+    }
+
+    println!();
+    println!("{}最近样本{}", C_BOLD, C_RESET);
+    println!(
+        "{}",
+        table_row(&[
+            ("时间".to_string(), 8, Align::Left),
+            ("剩余".to_string(), 7, Align::Right),
+            ("模型Up".to_string(), 8, Align::Right),
+            ("盘口Up".to_string(), 8, Align::Right),
+            ("差值".to_string(), 8, Align::Right),
+            ("盘口".to_string(), 6, Align::Left),
+            ("市场".to_string(), 24, Align::Left),
+        ])
+    );
+    for sample in primary
+        .iter()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        println!(
+            "{}",
+            table_row(&[
+                (fmt_ts(sample.ts_ms), 8, Align::Left),
+                (format!("{:.0}s", sample.tau_seconds), 7, Align::Right),
+                (format!("{:.3}", sample.model_up), 8, Align::Right),
+                (format!("{:.3}", sample.market_up), 8, Align::Right),
+                (
+                    format!("{:+.3}", sample.model_up - sample.market_up),
+                    8,
+                    Align::Right,
+                ),
+                (
+                    if sample.exact_book {
+                        "bidask"
+                    } else {
+                        "approx"
+                    }
+                    .to_string(),
+                    6,
+                    Align::Left,
+                ),
+                (sample.market.clone(), 24, Align::Left),
+            ])
+        );
+    }
+    println!();
+    println!(
+        "{}说明: 模型Up=本bot用BTC价格/开盘价/波动率算出的Up概率; 盘口Up=Polymarket盘口隐含Up概率。\
+         新日志用best bid/ask mid; 老日志缺bid时用 UpAsk 和 1-DownAsk 做近似。差值=模型Up-盘口Up。{}",
+        C_DIM, C_RESET
+    );
+    Ok(())
+}
+
+fn print_model_market_summary(label: &str, samples: &[ModelMarketSample]) {
+    let (model, market, diff, abs_diff) = model_market_means(samples);
+    println!(
+        "{}{}{} 样本 {}  模型Up {:.3}  盘口Up {:.3}  差值 {:+.3}  平均绝对差 {:.3}",
+        C_BOLD,
+        label,
+        C_RESET,
+        samples.len(),
+        model,
+        market,
+        diff,
+        abs_diff
+    );
+}
+
+fn model_market_means(samples: &[ModelMarketSample]) -> (f64, f64, f64, f64) {
+    let n = samples.len().max(1) as f64;
+    let model = samples.iter().map(|sample| sample.model_up).sum::<f64>() / n;
+    let market = samples.iter().map(|sample| sample.market_up).sum::<f64>() / n;
+    let diff = samples
+        .iter()
+        .map(|sample| sample.model_up - sample.market_up)
+        .sum::<f64>()
+        / n;
+    let abs_diff = samples
+        .iter()
+        .map(|sample| (sample.model_up - sample.market_up).abs())
+        .sum::<f64>()
+        / n;
+    (model, market, diff, abs_diff)
+}
+
+fn model_market_sample(cfg: &Config, frame: &MarketFrame) -> Option<ModelMarketSample> {
+    if frame.btc_price <= 0.0 || frame.price_to_beat <= 0.0 {
+        return None;
+    }
+    let vol = if frame.vol_per_sqrt_sec > 0.0 {
+        frame.vol_per_sqrt_sec
+    } else {
+        cfg.vol_seed_per_sqrt_sec
+    };
+    let width = uncertainty_width(vol, frame.tau_seconds, cfg.width_floor_usd);
+    let model_up = digital_p_up(frame.btc_price, frame.price_to_beat, width);
+    let (market_up, exact_book) = market_up_mid(frame)?;
+    Some(ModelMarketSample {
+        ts_ms: frame.ts_ms,
+        market: frame.market.clone(),
+        tau_seconds: frame.tau_seconds,
+        model_up,
+        market_up,
+        exact_book,
+    })
+}
+
+fn market_up_mid(frame: &MarketFrame) -> Option<(f64, bool)> {
+    let up_exact = valid_market_px(frame.up_bid)
+        .then_some(frame.up_bid)
+        .zip(valid_market_px(frame.up_ask).then_some(frame.up_ask))
+        .map(|(bid, ask)| (bid + ask) / 2.0);
+    let down_exact = valid_market_px(frame.down_bid)
+        .then_some(frame.down_bid)
+        .zip(valid_market_px(frame.down_ask).then_some(frame.down_ask))
+        .map(|(bid, ask)| 1.0 - ((bid + ask) / 2.0));
+    match (up_exact, down_exact) {
+        (Some(up), Some(down)) => Some((((up + down) / 2.0).clamp(0.0, 1.0), true)),
+        (Some(up), None) => Some((up.clamp(0.0, 1.0), true)),
+        (None, Some(down)) => Some((down.clamp(0.0, 1.0), true)),
+        (None, None) => {
+            if valid_market_px(frame.up_ask) && valid_market_px(frame.down_ask) {
+                Some((
+                    ((frame.up_ask + (1.0 - frame.down_ask)) / 2.0).clamp(0.0, 1.0),
+                    false,
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn valid_market_px(px: f64) -> bool {
+    px.is_finite() && px > 0.0 && px <= 1.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1201,7 +1451,9 @@ mod tests {
             condition_id: String::new(),
             up_token_id: String::new(),
             down_token_id: String::new(),
+            up_bid: 0.0,
             up_ask: 0.0,
+            down_bid: 0.0,
             down_ask: 0.0,
             btc_price: 100.0,
             price_to_beat: 99.0,
@@ -1561,6 +1813,14 @@ fn fmt_ts(ts_ms: u64) -> String {
     let m = (secs % 3_600) / 60;
     let s = secs % 60;
     format!("{h:02}:{m:02}:{s:02}")
+}
+
+fn format_market_px(px: f64) -> String {
+    if valid_market_px(px) {
+        format!("{px:.3}")
+    } else {
+        "-".to_string()
+    }
 }
 
 fn format_age(age_ms: u64) -> String {
