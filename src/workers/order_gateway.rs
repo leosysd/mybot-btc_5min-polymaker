@@ -1301,6 +1301,9 @@ fn handle_user_trade(
             let Some(order_id) = first_str(maker, &["order_id", "id"]) else {
                 continue;
             };
+            if !order_map_contains(order_map, order_id) {
+                continue;
+            }
             let key = format!("{trade_id}:{order_id}");
             if !seen_trades.insert(key) {
                 continue;
@@ -1334,6 +1337,10 @@ fn handle_user_trade(
         )?;
     }
     Ok(())
+}
+
+fn order_map_contains(order_map: &SharedOrderMap, order_id: &str) -> bool {
+    order_map.lock().unwrap().contains_key(order_id)
 }
 
 fn handle_user_order(
@@ -1777,6 +1784,55 @@ mod tests {
             match_and_reduce_order(&order_map, "never-seen", 5.0),
             FillMatch::Unknown
         ));
+    }
+
+    #[test]
+    fn user_trade_maker_orders_skip_other_makers() {
+        let cfg = test_cfg();
+        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        }));
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
+        order_map.lock().unwrap().insert(
+            "our-order".to_string(),
+            QuoteMeta {
+                quote_id: "q-ours".to_string(),
+                market: "btc-updown-5m-test".to_string(),
+                condition_id: "condition".to_string(),
+                side: "Up".to_string(),
+                price: 0.42,
+                size: 5.0,
+                credited: false,
+                done: false,
+            },
+        );
+        let (gw_tx, _gw_rx) = std::sync::mpsc::channel();
+        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
+        let mut seen = HashSet::new();
+        let event = serde_json::json!({
+            "id": "trade-1",
+            "event_type": "trade",
+            "maker_orders": [
+                {"order_id": "other-maker", "matched_amount": "24", "price": "0.79"},
+                {"order_id": "our-order", "matched_amount": "5", "price": "0.42"}
+            ]
+        });
+
+        handle_user_trade(
+            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+        )
+        .unwrap();
+
+        assert_eq!(inventory.lock().unwrap().up_shares, 5.0);
+        assert!(matches!(
+            ledger_rx.try_recv().expect("known maker fill"),
+            LedgerEvent::Filled(fill) if fill.quote_id == "q-ours" && (fill.size - 5.0).abs() < 1e-9
+        ));
+        assert!(
+            ledger_rx.try_recv().is_err(),
+            "unknown maker_orders must not emit unmatched reconcile events"
+        );
     }
 
     #[test]
