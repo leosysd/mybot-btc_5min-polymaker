@@ -93,6 +93,18 @@ fn collector_owns_market_silence(cfg: &Config) -> bool {
     cfg.data_mode == "live" && cfg.auto_discover_market
 }
 
+fn rebalance_target_side(up_shares: f64, down_shares: f64) -> Option<bool> {
+    const MIN_UNMATCHED_SHARES: f64 = 0.5;
+    let unmatched = up_shares - down_shares;
+    if unmatched > MIN_UNMATCHED_SHARES {
+        Some(false) // long Up: only buy Down until filled inventory is paired
+    } else if unmatched < -MIN_UNMATCHED_SHARES {
+        Some(true) // long Down: only buy Up until filled inventory is paired
+    } else {
+        None
+    }
+}
+
 /// Compute the time-aware quotes for one market frame and emit them.
 /// Returns the fair `p_up` used, so the caller can feed the toxicity monitor.
 fn handle_market_frame(
@@ -191,9 +203,13 @@ fn handle_market_frame(
     // ── 5. Endgame protocol + min-probability gate: a side is only quoted
     // if its win probability >= MIN_FAIR_TO_QUOTE (skip deep longshots).
     let phase = phase_for(tau, cfg.endgame_reduce_secs, cfg.endgame_pull_secs);
-    let up_ok = side_allowed(true, phase, up_eff, down_eff) && p_up >= cfg.min_fair_to_quote;
-    let down_ok =
-        side_allowed(false, phase, up_eff, down_eff) && (1.0 - p_up) >= cfg.min_fair_to_quote;
+    let rebalance_target = rebalance_target_side(inventory.up_shares, inventory.down_shares);
+    let up_ok = side_allowed(true, phase, up_eff, down_eff)
+        && rebalance_target.is_none_or(|target| target)
+        && p_up >= cfg.min_fair_to_quote;
+    let down_ok = side_allowed(false, phase, up_eff, down_eff)
+        && rebalance_target.is_none_or(|target| !target)
+        && (1.0 - p_up) >= cfg.min_fair_to_quote;
     let up_px = if up_ok {
         post_only_bid(
             up_capped,
@@ -219,10 +235,11 @@ fn handle_market_frame(
         None
     };
 
-    let reason = match phase {
-        Phase::Normal => "tov3_normal",
-        Phase::ReduceOnly => "tov3_reduce_only",
-        Phase::Pull => "tov3_pull",
+    let reason = match (phase, rebalance_target) {
+        (Phase::Normal, Some(_)) => "tov3_rebalance_only",
+        (Phase::Normal, None) => "tov3_normal",
+        (Phase::ReduceOnly, _) => "tov3_reduce_only",
+        (Phase::Pull, _) => "tov3_pull",
     };
     if let Some(px) = up_px {
         send_quote(cfg, quote_tx, frame, "Up", px, p_up, inventory, reason)?;
@@ -295,5 +312,12 @@ mod tests {
         cfg.data_mode = "sim".to_string();
         cfg.auto_discover_market = true;
         assert!(!collector_owns_market_silence(&cfg));
+    }
+
+    #[test]
+    fn filled_imbalance_quotes_only_pairing_side() {
+        assert_eq!(rebalance_target_side(5.0, 0.0), Some(false));
+        assert_eq!(rebalance_target_side(0.0, 5.0), Some(true));
+        assert_eq!(rebalance_target_side(5.0, 5.0), None);
     }
 }
