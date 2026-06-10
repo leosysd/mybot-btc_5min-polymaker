@@ -724,7 +724,13 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("MARKET_INTERVAL_MS", "模拟行情间隔毫秒"),
         ("STALE_AFTER_MS", "行情过期毫秒"),
         ("WS_STALE_AFTER_MS", "live WS断流停止毫秒"),
-        ("STRATEGY_MODE", "TAKER_BRAIN_MAKER/HYBRID_MAKER/LEGACY_V3"),
+        (
+            "STRATEGY_MODE",
+            "VALUE_BUY_MAKER/TAKER_BRAIN_MAKER/HYBRID_MAKER/LEGACY_V3",
+        ),
+        ("VALUE_MIN_EDGE", "价值买入最低安全垫: fair - bid"),
+        ("VALUE_AGGRESSION_TICKS", "价值买入相对买一抬高多少tick"),
+        ("VALUE_MIN_FAIR", "价值买入最低模型胜率过滤"),
         (
             "PAIR_LOCK_MODE",
             "单边成交后补对边模式:ALWAYS/EDGE_ONLY/OFF",
@@ -804,7 +810,10 @@ fn print_param_help() {
     println!("  ENDGAME_PULL_SECS      剩余秒数<该值撤掉所有单(纯抛硬币区)");
     println!("  INVENTORY_SKEW_TIME_BOOST 库存偏移随临近收盘加码倍数");
     println!("  TOX_*                  逆选择监控:被割就自动加宽价差");
-    println!("  STRATEGY_MODE          TAKER_BRAIN_MAKER=只做强趋势; HYBRID_MAKER=趋势+震荡锁仓");
+    println!("  STRATEGY_MODE          VALUE_BUY_MAKER=独立买便宜边; TAKER/HYBRID/LEGACY为旧模式");
+    println!("  VALUE_MIN_EDGE         VALUE模式最低安全垫: 买价必须 <= 模型fair-该值");
+    println!("  VALUE_AGGRESSION_TICKS VALUE模式相对当前买一抬高多少tick,仍受安全垫限制");
+    println!("  VALUE_MIN_FAIR         VALUE模式最低模型胜率过滤,低于则不挂这一边");
     println!("  PAIR_LOCK_MODE         ALWAYS=旧强配平; EDGE_ONLY=最后阶段择优补; OFF=不补对边");
     println!("  PAIR_LOCK_MIN_PROFIT   EDGE_ONLY补对边至少锁多少每份利润");
     println!("  PAIR_LOCK_LAST_SECS    剩余多少秒内用残局高门槛判断持仓是否仍强");
@@ -1597,8 +1606,8 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing_with_comment(
         path,
         "PAIR_LOCK_MODE",
-        "ALWAYS",
-        "单边成交后的补对边模式：ALWAYS=旧强配平；EDGE_ONLY=中段不补,最后阶段择优补；OFF=完全不自动补对边。",
+        "OFF",
+        "旧策略的补对边模式。VALUE_BUY_MAKER 不使用强制补对边；切回旧策略时才看这个值。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
@@ -1615,8 +1624,26 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing_with_comment(
         path,
         "STRATEGY_MODE",
-        "HYBRID_MAKER",
-        "策略模式：TAKER_BRAIN_MAKER=只做强趋势,震荡等待；HYBRID_MAKER=趋势强边+震荡双边锁仓；LEGACY_V3=旧逻辑。",
+        "VALUE_BUY_MAKER",
+        "策略模式：VALUE_BUY_MAKER=JetFadil式独立价值买入；TAKER/HYBRID/LEGACY为旧逻辑。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "VALUE_MIN_EDGE",
+        "0.03",
+        "VALUE模式最低安全垫：买价必须 <= 模型fair - 该值。0.03=至少3美分edge。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "VALUE_AGGRESSION_TICKS",
+        "1",
+        "VALUE模式相对当前买一价抬高多少tick；仍受post-only和VALUE_MIN_EDGE限制。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "VALUE_MIN_FAIR",
+        "0.05",
+        "VALUE模式最低模型胜率过滤：低于这个fair的一边不挂单。",
     )?;
     upsert_env_if_missing_with_comment(
         path,

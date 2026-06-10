@@ -78,6 +78,9 @@ pub struct Config {
     pub hybrid_entry_aggression_ticks: f64,
     pub hybrid_endgame_secs: f64,
     pub hybrid_endgame_min_prob: f64,
+    pub value_min_edge: f64,
+    pub value_aggression_ticks: f64,
+    pub value_min_fair: f64,
     pub favorite_first_flat: bool,
     pub enable_directional_edge: bool,
     pub min_directional_edge: f64,
@@ -190,7 +193,7 @@ impl Config {
             pair_lock_mode: get(&file_env, "PAIR_LOCK_MODE", pair_lock_default),
             pair_lock_min_profit: get_f64(&file_env, "PAIR_LOCK_MIN_PROFIT", 0.02),
             pair_lock_last_secs: get_f64(&file_env, "PAIR_LOCK_LAST_SECS", 35.0),
-            strategy_mode: get(&file_env, "STRATEGY_MODE", "HYBRID_MAKER"),
+            strategy_mode: get(&file_env, "STRATEGY_MODE", "VALUE_BUY_MAKER"),
             hybrid_trend_min_prob: get_f64(&file_env, "HYBRID_TREND_MIN_PROB", 0.60),
             hybrid_trend_min_market_edge: get_f64(&file_env, "HYBRID_TREND_MIN_MARKET_EDGE", 0.02),
             hybrid_range_max_prob: get_f64(&file_env, "HYBRID_RANGE_MAX_PROB", 0.58),
@@ -198,6 +201,9 @@ impl Config {
             hybrid_entry_aggression_ticks: get_f64(&file_env, "HYBRID_ENTRY_AGGRESSION_TICKS", 1.0),
             hybrid_endgame_secs: get_f64(&file_env, "HYBRID_ENDGAME_SECS", 45.0),
             hybrid_endgame_min_prob: get_f64(&file_env, "HYBRID_ENDGAME_MIN_PROB", 0.70),
+            value_min_edge: get_f64(&file_env, "VALUE_MIN_EDGE", 0.03),
+            value_aggression_ticks: get_f64(&file_env, "VALUE_AGGRESSION_TICKS", 1.0),
+            value_min_fair: get_f64(&file_env, "VALUE_MIN_FAIR", 0.05),
             favorite_first_flat: get_bool(&file_env, "FAVORITE_FIRST_FLAT", true),
             enable_directional_edge: get_bool(&file_env, "ENABLE_DIRECTIONAL_EDGE", false),
             min_directional_edge: get_f64(&file_env, "MIN_DIRECTIONAL_EDGE", 0.04),
@@ -298,10 +304,11 @@ impl Config {
         let strategy_mode = self.strategy_mode.to_ascii_uppercase();
         if !matches!(
             strategy_mode.as_str(),
-            "HYBRID_MAKER" | "TAKER_BRAIN_MAKER" | "LEGACY_V3"
+            "VALUE_BUY_MAKER" | "HYBRID_MAKER" | "TAKER_BRAIN_MAKER" | "LEGACY_V3"
         ) {
             return Err(
-                "STRATEGY_MODE must be HYBRID_MAKER, TAKER_BRAIN_MAKER, or LEGACY_V3".into(),
+                "STRATEGY_MODE must be VALUE_BUY_MAKER, HYBRID_MAKER, TAKER_BRAIN_MAKER, or LEGACY_V3"
+                    .into(),
             );
         }
         let pair_lock_mode = self.pair_lock_mode.to_ascii_uppercase();
@@ -337,6 +344,18 @@ impl Config {
         }
         if self.hybrid_endgame_secs < 0.0 || !self.hybrid_endgame_secs.is_finite() {
             return Err("HYBRID_ENDGAME_SECS must be finite and non-negative".into());
+        }
+        if self.value_min_edge < 0.0
+            || self.value_min_edge >= 1.0
+            || !self.value_min_edge.is_finite()
+        {
+            return Err("VALUE_MIN_EDGE must be finite and in [0, 1)".into());
+        }
+        if self.value_aggression_ticks < 0.0 || !self.value_aggression_ticks.is_finite() {
+            return Err("VALUE_AGGRESSION_TICKS must be finite and non-negative".into());
+        }
+        if !(0.0..=1.0).contains(&self.value_min_fair) || !self.value_min_fair.is_finite() {
+            return Err("VALUE_MIN_FAIR must be a finite probability in [0, 1]".into());
         }
         Ok(())
     }

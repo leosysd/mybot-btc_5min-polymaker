@@ -285,10 +285,7 @@ pub fn run(
                         };
                         // Counts OUTSTANDING orders, so churn/lag cannot exceed the cap.
                         let side_cap_room = cfg.max_side_inventory() - held - pending;
-                        let room = pairing_room
-                            .map(|pair| pair.min(side_cap_room))
-                            .unwrap_or(side_cap_room)
-                            .floor();
+                        let room = quote_room(side_cap_room, pairing_room, &quote.reason).floor();
                         // Skip unless there's room for a FULL quote. Posting the
                         // leftover (e.g. 2 shares when room=2) is below the exchange
                         // minimum order size and gets rejected ("Size lower than
@@ -444,6 +441,9 @@ fn pair_only_block_reason(
     inventory: &SharedInventory,
     quote: &QuoteIntent,
 ) -> Option<String> {
+    if is_value_buy_quote(&quote.reason) {
+        return None;
+    }
     if cfg.enable_directional_edge && quote.reason == "tov3_directional_edge" {
         return None;
     }
@@ -465,6 +465,19 @@ fn pair_only_block_reason(
         "pair-only blocks {} while held up={:.0} down={:.0}; pairing side={}",
         quote.side, inv.up_shares, inv.down_shares, pairing_side
     ))
+}
+
+fn is_value_buy_quote(reason: &str) -> bool {
+    reason == "value_buy"
+}
+
+fn quote_room(side_cap_room: f64, pairing_room: Option<f64>, reason: &str) -> f64 {
+    if is_value_buy_quote(reason) {
+        return side_cap_room;
+    }
+    pairing_room
+        .map(|pair| pair.min(side_cap_room))
+        .unwrap_or(side_cap_room)
 }
 
 fn pairing_shortfall_room(inv: &Inventory, market: &str, side: &str) -> Option<f64> {
@@ -1621,6 +1634,40 @@ mod tests {
             pair_only_block_reason(&cfg, &inventory, &quote("Up", "tov3_directional_edge"))
                 .is_none(),
             "explicit directional-edge quotes remain opt-in"
+        );
+    }
+
+    #[test]
+    fn value_buy_quote_bypasses_pair_only_block() {
+        let cfg = test_cfg();
+        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 5.0,
+            up_cost: 2.5,
+            ..Default::default()
+        }));
+
+        assert!(
+            pair_only_block_reason(&cfg, &inventory, &quote("Up", "tov3_normal")).is_some(),
+            "legacy quote should still be blocked while long Up"
+        );
+        assert!(
+            pair_only_block_reason(&cfg, &inventory, &quote("Up", "value_buy")).is_none(),
+            "value-buy quotes are independently risk-capped, not pair-only gated"
+        );
+    }
+
+    #[test]
+    fn value_buy_room_uses_side_cap_not_pair_shortfall() {
+        assert_eq!(
+            quote_room(20.0, Some(5.0), "tov3_hybrid_pair_lock"),
+            5.0,
+            "legacy pairing quote is limited to the unmatched shortfall"
+        );
+        assert_eq!(
+            quote_room(20.0, Some(5.0), "value_buy"),
+            20.0,
+            "value-buy quote can use the full side cap"
         );
     }
 

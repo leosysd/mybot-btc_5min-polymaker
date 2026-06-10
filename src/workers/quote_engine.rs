@@ -184,6 +184,10 @@ fn use_taker_brain_maker(cfg: &Config) -> bool {
     cfg.strategy_mode.eq_ignore_ascii_case("TAKER_BRAIN_MAKER")
 }
 
+fn use_value_buy_maker(cfg: &Config) -> bool {
+    cfg.strategy_mode.eq_ignore_ascii_case("VALUE_BUY_MAKER")
+}
+
 fn valid_market_px(px: f64) -> bool {
     px.is_finite() && px > 0.0 && px <= 1.0
 }
@@ -246,6 +250,54 @@ fn hybrid_entry_px(
         cfg.max_bid,
         cfg.post_only_margin_ticks,
     )
+}
+
+fn value_buy_px(
+    cfg: &Config,
+    frame: &MarketFrame,
+    side_is_up: bool,
+    fair: f64,
+    model_bid: f64,
+) -> Option<f64> {
+    if fair < cfg.value_min_fair {
+        return None;
+    }
+    let edge_cap = fair - cfg.value_min_edge;
+    if edge_cap < cfg.min_bid {
+        return None;
+    }
+    let book_improved = top_bid(frame, side_is_up)
+        .map(|bid| bid + cfg.value_aggression_ticks * cfg.tick_size)
+        .unwrap_or(model_bid);
+    let raw_bid = model_bid.max(book_improved).min(edge_cap).min(cfg.max_bid);
+    let ask = if side_is_up {
+        frame.up_ask
+    } else {
+        frame.down_ask
+    };
+    post_only_bid(
+        raw_bid,
+        ask,
+        cfg.tick_size,
+        cfg.min_bid,
+        cfg.max_bid,
+        cfg.post_only_margin_ticks,
+    )
+}
+
+fn value_buy_quotes(
+    cfg: &Config,
+    frame: &MarketFrame,
+    phase: Phase,
+    p_up: f64,
+    model: ModelQuote,
+) -> (Option<f64>, Option<f64>, &'static str) {
+    if phase == Phase::Pull {
+        return (None, None, "value_buy_pull");
+    }
+    let up_px = value_buy_px(cfg, frame, true, p_up, model.up_bid);
+    let down_px = value_buy_px(cfg, frame, false, 1.0 - p_up, model.down_bid);
+    (up_px, down_px, "value_buy")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -384,6 +436,27 @@ fn handle_market_frame(
         min_lock_edge: cfg.min_lock_edge,
     });
 
+    let phase = phase_for(tau, cfg.endgame_reduce_secs, cfg.endgame_pull_secs);
+    if use_value_buy_maker(cfg) {
+        let (up_px, down_px, reason) = value_buy_quotes(cfg, frame, phase, p_up, model);
+        if let Some(px) = up_px {
+            send_quote(cfg, quote_tx, frame, "Up", px, p_up, inventory, reason)?;
+        }
+        if let Some(px) = down_px {
+            send_quote(
+                cfg,
+                quote_tx,
+                frame,
+                "Down",
+                px,
+                1.0 - p_up,
+                inventory,
+                reason,
+            )?;
+        }
+        return Ok(p_up);
+    }
+
     // ── 4b. SYMMETRIC cost-basis lock: cap BOTH sides by the opposite side's
     // average cost, so COMPLETING a pair can never exceed the lock budget
     // (1 - MIN_LOCK_EDGE). This prevents legging into a combined-cost > 1
@@ -421,7 +494,6 @@ fn handle_market_frame(
 
     // ── 5. Endgame protocol + min-probability gate: a side is only quoted
     // if its win probability >= MIN_FAIR_TO_QUOTE (skip deep longshots).
-    let phase = phase_for(tau, cfg.endgame_reduce_secs, cfg.endgame_pull_secs);
     let up_pair_px = if side_allowed(true, phase, up_eff, down_eff) {
         post_only_bid(
             up_capped,
@@ -676,6 +748,15 @@ mod tests {
         cfg
     }
 
+    fn value_buy_quote_test_cfg() -> Config {
+        let mut cfg = flat_quote_test_cfg();
+        cfg.strategy_mode = "VALUE_BUY_MAKER".to_string();
+        cfg.value_min_edge = 0.03;
+        cfg.value_aggression_ticks = 1.0;
+        cfg.value_min_fair = 0.05;
+        cfg
+    }
+
     fn flat_frame(btc_price: f64) -> MarketFrame {
         MarketFrame {
             ts_ms: now_ms(),
@@ -693,6 +774,89 @@ mod tests {
             vol_per_sqrt_sec: 1.5,
             source: "test".to_string(),
         }
+    }
+
+    #[test]
+    fn value_buy_quotes_only_side_above_fair_filter() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.value_min_fair = 0.30;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(110.0), &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("value quote");
+        assert_eq!(quote.side, "Up");
+        assert_eq!(quote.reason, "value_buy");
+        assert!(quote.price <= quote.fair - cfg.value_min_edge + 1e-9);
+        assert!(rx.try_recv().is_err(), "Down is below VALUE_MIN_FAIR");
+    }
+
+    #[test]
+    fn value_buy_quotes_both_sides_when_both_are_discounted() {
+        let cfg = value_buy_quote_test_cfg();
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(100.0), &inventory, &mut tox).expect("quote");
+
+        let q1 = rx.try_recv().expect("first value quote");
+        let q2 = rx.try_recv().expect("second value quote");
+        assert_eq!(q1.reason, "value_buy");
+        assert_eq!(q2.reason, "value_buy");
+        assert_ne!(q1.side, q2.side);
+        assert!(q1.price <= q1.fair - cfg.value_min_edge + 1e-9);
+        assert!(q2.price <= q2.fair - cfg.value_min_edge + 1e-9);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn value_buy_can_add_same_side_instead_of_forcing_pair() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.value_min_fair = 0.30;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 5.0,
+            up_cost: 2.5,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(110.0), &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("same-side value quote");
+        assert_eq!(quote.side, "Up");
+        assert_eq!(quote.reason, "value_buy");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn value_buy_pulls_quotes_in_final_seconds() {
+        let cfg = value_buy_quote_test_cfg();
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let mut frame = flat_frame(100.0);
+        frame.tau_seconds = 5.0;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "final Pull phase must not open value buys"
+        );
     }
 
     #[test]
@@ -1010,6 +1174,8 @@ mod tests {
     #[test]
     fn directional_edge_is_opt_in_when_pairing_unavailable() {
         let mut cfg = Config::from_env().expect("config");
+        cfg.strategy_mode = "LEGACY_V3".to_string();
+        cfg.pair_lock_mode = "ALWAYS".to_string();
         cfg.enable_directional_edge = false;
         cfg.max_bid = 0.62;
         cfg.min_bid = 0.05;

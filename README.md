@@ -472,21 +472,16 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 1. 用 BTC 相对开盘价的偏移估算 `p_up`。
 2. `p_down = 1 - p_up`。
-3. 按 fair value 减掉半边价差，得到 Up/Down 模型报价。
-4. 根据库存做偏移：
-   - Up 库存多：降低 Up bid，提高 Down bid。
-   - Down 库存多：降低 Down bid，提高 Up bid。
+3. 默认 `STRATEGY_MODE=VALUE_BUY_MAKER`：Up/Down 各自独立判断，只在买价低于模型 fair 至少 `VALUE_MIN_EDGE` 时挂 maker 买单。
+4. 新模式会参考当前买一价，最多抬高 `VALUE_AGGRESSION_TICKS` 个 tick，但仍然必须满足 post-only，且不能高于 `fair - VALUE_MIN_EDGE`。
 5. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
-6. 默认 `STRATEGY_MODE=HYBRID_MAKER`：趋势明显时只挂胜率高且相对盘口有 edge 的一边；震荡时允许双边同时挂，目标是更快形成 `Up+Down <= 1 - MIN_LOCK_EDGE` 的锁仓组合。`STRATEGY_MODE=TAKER_BRAIN_MAKER` 会禁用震荡双边锁仓，只在强趋势且相对盘口有 edge 时挂强边。
-7. 趋势开仓必须同时满足 `HYBRID_TREND_MIN_PROB` 和 `HYBRID_TREND_MIN_MARKET_EDGE`，挂单价还会受 `HYBRID_ENTRY_MIN_EDGE` 限制，避免为了成交把模型安全垫吃光。
-8. 震荡锁仓由 `HYBRID_RANGE_MAX_PROB` 控制：最高胜率不超过该值时，按 range 处理，允许同时挂 Up/Down；一旦单边成交，再由 `PAIR_LOCK_MODE` 决定是否补对边。
-9. `PAIR_LOCK_MODE=ALWAYS` 是旧逻辑：如果已成交库存单边不平衡，先尝试买对边完成锁利配平；但补腿出价不会高于 `模型 fair + REBALANCE_MAX_OVER_FAIR`（默认 0.05）。
-10. `PAIR_LOCK_MODE=EDGE_ONLY` 是 taker brain/maker execution：中段不补对边；只在最后 `PAIR_LOCK_LAST_SECS` 秒内、持仓不再满足残局强边门槛、且补完至少能锁出 `PAIR_LOCK_MIN_PROFIT` 的利润时，才用 maker 单补对边。
-11. `PAIR_LOCK_MODE=OFF` 完全不自动补对边，单边成交后持有到结算。这个模式机会更大，单边错时亏损也更完整。
-12. 默认不主动加同边方向仓：如果对边不能锁利配平，就等待，不继续给已偏多的一边加仓。
-13. 如需回到旧逻辑，设置 `STRATEGY_MODE=LEGACY_V3`；旧逻辑下才继续使用 `FAVORITE_FIRST_FLAT` 和可选 `ENABLE_DIRECTIONAL_EDGE` 分支。
-14. 报价不能吃单，必须低于当前 ask 一个 tick。
-15. 单边库存达到上限后，不再继续报该边。
+6. 新模式不做中途卖出，不做强制补对边；如果另一边之后也变得便宜，会按同样规则自己挂买单。
+7. `VALUE_MIN_FAIR` 用来过滤极低胜率的一边；默认 0.05，避免买几乎归零的深度劣势方。
+8. 单边库存仍受 `QUOTE_SIZE * INVENTORY_MULT` 限制，总库存仍受 `MAX_TOTAL_INVENTORY` 和 `MAX_LOSS` 限制。
+9. 如果同时持有 Up/Down，网关仍保留成本锁：补成一对时不会允许 `Up成本 + Down成本 > 1 - MIN_LOCK_EDGE`。
+10. 剩余 `ENDGAME_PULL_SECS` 秒进入 Pull，不再发新报价，等已有挂单过期/撤掉。
+11. 报价不能吃单，必须低于当前 ask 至少 `POST_ONLY_MARGIN_TICKS` 个 tick。
+12. 旧模式仍可回退：`TAKER_BRAIN_MAKER`、`HYBRID_MAKER`、`LEGACY_V3` 保留在代码里；这些模式才继续使用 `PAIR_LOCK_MODE`、`HYBRID_*`、`FAVORITE_FIRST_FLAT`。
 
 ## 当前限制
 
