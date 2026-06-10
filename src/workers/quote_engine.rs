@@ -5,9 +5,9 @@
 use crate::config::Config;
 use crate::ipc::{heartbeat, now_ms, Inventory, MarketFrame, QuoteIntent};
 use crate::pricing::{
-    digital_p_up, half_spread, in_warmup, market_maker_bids, phase_for, post_only_bid,
-    price_sensitivity, time_boosted_skew, uncertainty_width, MmParams, ModelQuote, Phase,
-    SpreadInputs, ToxicityMonitor,
+    blend_market_anchor, digital_p_up, half_spread, in_warmup, market_anchor_weight,
+    market_maker_bids, phase_for, post_only_bid, price_sensitivity, time_boosted_skew,
+    uncertainty_width, MmParams, ModelQuote, Phase, SpreadInputs, ToxicityMonitor,
 };
 use crate::AppResult;
 use std::sync::mpsc::RecvTimeoutError;
@@ -101,6 +101,89 @@ fn top_bid(frame: &MarketFrame, side_is_up: bool) -> Option<f64> {
         frame.down_bid
     };
     valid_market_px(bid).then_some(bid)
+}
+
+fn market_up_mid_and_spread(frame: &MarketFrame) -> Option<(f64, f64)> {
+    let up = valid_market_px(frame.up_bid)
+        .then_some(frame.up_bid)
+        .zip(valid_market_px(frame.up_ask).then_some(frame.up_ask))
+        .filter(|(bid, ask)| ask >= bid)
+        .map(|(bid, ask)| ((bid + ask) / 2.0, ask - bid));
+    let down = valid_market_px(frame.down_bid)
+        .then_some(frame.down_bid)
+        .zip(valid_market_px(frame.down_ask).then_some(frame.down_ask))
+        .filter(|(bid, ask)| ask >= bid)
+        .map(|(bid, ask)| (1.0 - ((bid + ask) / 2.0), ask - bid));
+    match (up, down) {
+        (Some((up_mid, up_spread)), Some((down_mid, down_spread))) => Some((
+            ((up_mid + down_mid) / 2.0).clamp(0.0, 1.0),
+            up_spread.max(down_spread),
+        )),
+        (Some((up_mid, up_spread)), None) => Some((up_mid.clamp(0.0, 1.0), up_spread)),
+        (None, Some((down_mid, down_spread))) => Some((down_mid.clamp(0.0, 1.0), down_spread)),
+        (None, None) => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FairSnapshot {
+    model_up: f64,
+    market_up: f64,
+    final_up_shadow: f64,
+    anchor_weight: f64,
+    quote_up: f64,
+    anchor_active: bool,
+}
+
+impl FairSnapshot {
+    fn fair_source(self) -> &'static str {
+        if self.anchor_active {
+            "market_anchor"
+        } else if self.anchor_weight > 0.0 {
+            "model_shadow"
+        } else {
+            "model"
+        }
+    }
+}
+
+fn fair_snapshot(cfg: &Config, frame: &MarketFrame, model_up: f64) -> FairSnapshot {
+    let anchor_enabled = cfg.enable_market_anchor || cfg.market_anchor_shadow;
+    let (market_up, anchor_weight) = if anchor_enabled {
+        market_up_mid_and_spread(frame)
+            .map(|(market_up, spread)| {
+                (
+                    market_up,
+                    market_anchor_weight(
+                        cfg.market_anchor_weight,
+                        spread,
+                        cfg.market_anchor_max_spread,
+                    ),
+                )
+            })
+            .unwrap_or((0.0, 0.0))
+    } else {
+        (0.0, 0.0)
+    };
+    let final_up_shadow = if anchor_weight > 0.0 {
+        blend_market_anchor(model_up, market_up, anchor_weight)
+    } else {
+        model_up
+    };
+    let anchor_active = cfg.enable_market_anchor && anchor_weight > 0.0;
+    let quote_up = if anchor_active {
+        final_up_shadow
+    } else {
+        model_up
+    };
+    FairSnapshot {
+        model_up,
+        market_up,
+        final_up_shadow,
+        anchor_weight,
+        quote_up,
+        anchor_active,
+    }
 }
 
 fn value_buy_px(
@@ -198,7 +281,9 @@ fn handle_market_frame(
         cfg.vol_seed_per_sqrt_sec
     };
     let width = uncertainty_width(vol, tau, cfg.width_floor_usd);
-    let p_up = digital_p_up(frame.btc_price, frame.price_to_beat, width);
+    let p_model_up = digital_p_up(frame.btc_price, frame.price_to_beat, width);
+    let fair = fair_snapshot(cfg, frame, p_model_up);
+    let p_up = fair.quote_up;
 
     // ── 2. Toxicity feedback: settle matured fills, get any extra widening.
     tox.on_fair(p_up, now_ms());
@@ -248,7 +333,9 @@ fn handle_market_frame(
     let phase = phase_for(tau, cfg.endgame_pull_secs);
     let (up_px, down_px, reason) = value_buy_quotes(cfg, frame, phase, p_up, model);
     if let Some(px) = up_px {
-        send_quote(cfg, quote_tx, frame, "Up", px, p_up, inventory, reason)?;
+        send_quote(
+            cfg, quote_tx, frame, "Up", px, p_up, inventory, reason, fair,
+        )?;
     }
     if let Some(px) = down_px {
         send_quote(
@@ -260,6 +347,7 @@ fn handle_market_frame(
             1.0 - p_up,
             inventory,
             reason,
+            fair,
         )?;
     }
     Ok(p_up)
@@ -275,6 +363,7 @@ fn send_quote(
     fair: f64,
     inventory: &Inventory,
     reason: &str,
+    fair_snapshot: FairSnapshot,
 ) -> AppResult<()> {
     let size = cfg.quote_size.round().max(1.0);
     if !unpaired_limit_allows(cfg, inventory, side, size) {
@@ -303,6 +392,11 @@ fn send_quote(
         price,
         size,
         fair,
+        model_up: fair_snapshot.model_up,
+        market_up: fair_snapshot.market_up,
+        final_up_shadow: fair_snapshot.final_up_shadow,
+        market_anchor_weight: fair_snapshot.anchor_weight,
+        fair_source: fair_snapshot.fair_source().to_string(),
         inventory_up: inventory.effective_up(),
         inventory_down: inventory.effective_down(),
         reason: reason.to_string(),

@@ -48,6 +48,16 @@ pub struct QuoteIntent {
     pub price: f64,
     pub size: f64,
     pub fair: f64,
+    #[serde(default)]
+    pub model_up: f64,
+    #[serde(default)]
+    pub market_up: f64,
+    #[serde(default)]
+    pub final_up_shadow: f64,
+    #[serde(default)]
+    pub market_anchor_weight: f64,
+    #[serde(default)]
+    pub fair_source: String,
     pub inventory_up: f64,
     pub inventory_down: f64,
     pub reason: String,

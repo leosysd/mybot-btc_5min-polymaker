@@ -68,6 +68,10 @@ pub struct Config {
     pub value_min_edge: f64,
     pub value_aggression_ticks: f64,
     pub value_min_fair: f64,
+    pub enable_market_anchor: bool,
+    pub market_anchor_shadow: bool,
+    pub market_anchor_weight: f64,
+    pub market_anchor_max_spread: f64,
     pub enable_real_orders: String,
     pub polymarket_clob_host: String,
     pub poly_private_key: String,
@@ -169,6 +173,10 @@ impl Config {
             value_min_edge: get_f64(&file_env, "VALUE_MIN_EDGE", 0.03),
             value_aggression_ticks: get_f64(&file_env, "VALUE_AGGRESSION_TICKS", 1.0),
             value_min_fair: get_f64(&file_env, "VALUE_MIN_FAIR", 0.05),
+            enable_market_anchor: get_bool(&file_env, "ENABLE_MARKET_ANCHOR", false),
+            market_anchor_shadow: get_bool(&file_env, "MARKET_ANCHOR_SHADOW", true),
+            market_anchor_weight: get_f64(&file_env, "MARKET_ANCHOR_WEIGHT", 0.30),
+            market_anchor_max_spread: get_f64(&file_env, "MARKET_ANCHOR_MAX_SPREAD", 0.12),
             enable_real_orders: get(&file_env, "ENABLE_REAL_ORDERS", ""),
             polymarket_clob_host: get(
                 &file_env,
@@ -270,6 +278,17 @@ impl Config {
         }
         if !(0.0..=1.0).contains(&self.value_min_fair) || !self.value_min_fair.is_finite() {
             return Err("VALUE_MIN_FAIR must be a finite probability in [0, 1]".into());
+        }
+        if !(0.0..=1.0).contains(&self.market_anchor_weight)
+            || !self.market_anchor_weight.is_finite()
+        {
+            return Err("MARKET_ANCHOR_WEIGHT must be a finite probability in [0, 1]".into());
+        }
+        if self.market_anchor_max_spread <= 0.0
+            || self.market_anchor_max_spread > 1.0
+            || !self.market_anchor_max_spread.is_finite()
+        {
+            return Err("MARKET_ANCHOR_MAX_SPREAD must be finite and in (0, 1]".into());
         }
         Ok(())
     }

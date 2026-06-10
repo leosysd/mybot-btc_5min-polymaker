@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::ipc::{now_ms, FillEvent, Heartbeat, Inventory, MarketFrame, QuoteIntent};
-use crate::pricing::{digital_p_up, uncertainty_width};
+use crate::pricing::{blend_market_anchor, digital_p_up, market_anchor_weight, uncertainty_width};
 use crate::workers;
 use crate::AppResult;
 use serde::de::DeserializeOwned;
@@ -730,6 +730,10 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("VALUE_MIN_EDGE", "价值买入最低安全垫: fair - bid"),
         ("VALUE_AGGRESSION_TICKS", "价值买入相对买一抬高多少tick"),
         ("VALUE_MIN_FAIR", "价值买入最低模型胜率过滤"),
+        ("ENABLE_MARKET_ANCHOR", "1=真实报价使用盘口锚定融合胜率"),
+        ("MARKET_ANCHOR_SHADOW", "1=记录影子融合胜率,不改报价"),
+        ("MARKET_ANCHOR_WEIGHT", "盘口锚定最大权重"),
+        ("MARKET_ANCHOR_MAX_SPREAD", "盘口健康价差上限"),
     ];
     println!("直接回车表示不修改。");
     for (key, desc) in keys {
@@ -795,6 +799,10 @@ fn print_param_help() {
     println!("  VALUE_MIN_EDGE         最低安全垫: 买价必须 <= 模型fair-该值");
     println!("  VALUE_AGGRESSION_TICKS 相对当前买一抬高多少tick,仍受安全垫限制");
     println!("  VALUE_MIN_FAIR         最低模型胜率过滤,低于则不挂这一边");
+    println!("  ENABLE_MARKET_ANCHOR   1=真实报价使用盘口锚定融合胜率;默认0");
+    println!("  MARKET_ANCHOR_SHADOW   1=只记录FinalUp影子胜率,不改变报价");
+    println!("  MARKET_ANCHOR_WEIGHT   盘口锚定最大权重,盘口越窄实际权重越高");
+    println!("  MARKET_ANCHOR_MAX_SPREAD 盘口健康价差上限,超过则权重归零");
     println!("  ENABLE_DELTA_HEDGE     0=关。对冲为占位骨架，实单模式禁止开启");
 }
 
@@ -1215,6 +1223,8 @@ struct ModelMarketSample {
     tau_seconds: f64,
     model_up: f64,
     market_up: f64,
+    final_up_shadow: f64,
+    anchor_weight: f64,
     exact_book: bool,
 }
 
@@ -1271,8 +1281,9 @@ pub fn print_model_market_stats(cfg: &Config) -> AppResult<()> {
             ("样本".to_string(), 6, Align::Right),
             ("模型Up".to_string(), 8, Align::Right),
             ("盘口Up".to_string(), 8, Align::Right),
-            ("差值".to_string(), 8, Align::Right),
-            ("绝对差".to_string(), 8, Align::Right),
+            ("FinalUp".to_string(), 8, Align::Right),
+            ("M差".to_string(), 8, Align::Right),
+            ("F差".to_string(), 8, Align::Right),
         ])
     );
     for (lo, hi) in [
@@ -1292,7 +1303,7 @@ pub fn print_model_market_stats(cfg: &Config) -> AppResult<()> {
         if bucket.is_empty() {
             continue;
         }
-        let (model, market, diff, abs_diff) = model_market_means(&bucket);
+        let (model, market, final_up, model_diff, final_diff, _) = model_market_means(&bucket);
         println!(
             "{}",
             table_row(&[
@@ -1300,8 +1311,9 @@ pub fn print_model_market_stats(cfg: &Config) -> AppResult<()> {
                 (bucket.len().to_string(), 6, Align::Right),
                 (format!("{model:.3}"), 8, Align::Right),
                 (format!("{market:.3}"), 8, Align::Right),
-                (format!("{diff:+.3}"), 8, Align::Right),
-                (format!("{abs_diff:.3}"), 8, Align::Right),
+                (format!("{final_up:.3}"), 8, Align::Right),
+                (format!("{model_diff:+.3}"), 8, Align::Right),
+                (format!("{final_diff:+.3}"), 8, Align::Right),
             ])
         );
     }
@@ -1315,7 +1327,9 @@ pub fn print_model_market_stats(cfg: &Config) -> AppResult<()> {
             ("剩余".to_string(), 7, Align::Right),
             ("模型Up".to_string(), 8, Align::Right),
             ("盘口Up".to_string(), 8, Align::Right),
-            ("差值".to_string(), 8, Align::Right),
+            ("FinalUp".to_string(), 8, Align::Right),
+            ("F差".to_string(), 8, Align::Right),
+            ("权重".to_string(), 6, Align::Right),
             ("盘口".to_string(), 6, Align::Left),
             ("市场".to_string(), 24, Align::Left),
         ])
@@ -1335,11 +1349,13 @@ pub fn print_model_market_stats(cfg: &Config) -> AppResult<()> {
                 (format!("{:.0}s", sample.tau_seconds), 7, Align::Right),
                 (format!("{:.3}", sample.model_up), 8, Align::Right),
                 (format!("{:.3}", sample.market_up), 8, Align::Right),
+                (format!("{:.3}", sample.final_up_shadow), 8, Align::Right),
                 (
-                    format!("{:+.3}", sample.model_up - sample.market_up),
+                    format!("{:+.3}", sample.final_up_shadow - sample.market_up),
                     8,
                     Align::Right,
                 ),
+                (format!("{:.2}", sample.anchor_weight), 6, Align::Right),
                 (
                     if sample.exact_book {
                         "bidask"
@@ -1356,43 +1372,64 @@ pub fn print_model_market_stats(cfg: &Config) -> AppResult<()> {
     }
     println!();
     println!(
-        "{}说明: 模型Up=本bot用BTC价格/开盘价/波动率算出的Up概率; 盘口Up=Polymarket盘口隐含Up概率。\
-         新日志用best bid/ask mid; 老日志缺bid时用 UpAsk 和 1-DownAsk 做近似。差值=模型Up-盘口Up。{}",
+        "{}说明: 模型Up=本bot用BTC价格/开盘价/波动率算出的Up概率; 盘口Up=Polymarket盘口隐含Up概率; \
+         FinalUp=按 MARKET_ANCHOR_WEIGHT 影子融合后的概率。新日志用best bid/ask mid; \
+         老日志缺bid时用 UpAsk 和 1-DownAsk 做近似。M差=模型Up-盘口Up; F差=FinalUp-盘口Up。{}",
         C_DIM, C_RESET
     );
     Ok(())
 }
 
 fn print_model_market_summary(label: &str, samples: &[ModelMarketSample]) {
-    let (model, market, diff, abs_diff) = model_market_means(samples);
+    let (model, market, final_up, model_diff, final_diff, final_abs_diff) =
+        model_market_means(samples);
     println!(
-        "{}{}{} 样本 {}  模型Up {:.3}  盘口Up {:.3}  差值 {:+.3}  平均绝对差 {:.3}",
+        "{}{}{} 样本 {}  模型Up {:.3}  盘口Up {:.3}  FinalUp {:.3}  M差 {:+.3}  F差 {:+.3}  Final绝对差 {:.3}",
         C_BOLD,
         label,
         C_RESET,
         samples.len(),
         model,
         market,
-        diff,
-        abs_diff
+        final_up,
+        model_diff,
+        final_diff,
+        final_abs_diff
     );
 }
 
-fn model_market_means(samples: &[ModelMarketSample]) -> (f64, f64, f64, f64) {
+fn model_market_means(samples: &[ModelMarketSample]) -> (f64, f64, f64, f64, f64, f64) {
     let n = samples.len().max(1) as f64;
     let model = samples.iter().map(|sample| sample.model_up).sum::<f64>() / n;
     let market = samples.iter().map(|sample| sample.market_up).sum::<f64>() / n;
-    let diff = samples
+    let final_up = samples
+        .iter()
+        .map(|sample| sample.final_up_shadow)
+        .sum::<f64>()
+        / n;
+    let model_diff = samples
         .iter()
         .map(|sample| sample.model_up - sample.market_up)
         .sum::<f64>()
         / n;
-    let abs_diff = samples
+    let final_diff = samples
         .iter()
-        .map(|sample| (sample.model_up - sample.market_up).abs())
+        .map(|sample| sample.final_up_shadow - sample.market_up)
         .sum::<f64>()
         / n;
-    (model, market, diff, abs_diff)
+    let final_abs_diff = samples
+        .iter()
+        .map(|sample| (sample.final_up_shadow - sample.market_up).abs())
+        .sum::<f64>()
+        / n;
+    (
+        model,
+        market,
+        final_up,
+        model_diff,
+        final_diff,
+        final_abs_diff,
+    )
 }
 
 fn model_market_sample(cfg: &Config, frame: &MarketFrame) -> Option<ModelMarketSample> {
@@ -1406,35 +1443,59 @@ fn model_market_sample(cfg: &Config, frame: &MarketFrame) -> Option<ModelMarketS
     };
     let width = uncertainty_width(vol, frame.tau_seconds, cfg.width_floor_usd);
     let model_up = digital_p_up(frame.btc_price, frame.price_to_beat, width);
-    let (market_up, exact_book) = market_up_mid(frame)?;
+    let (market_up, exact_book, book_spread) = market_up_mid(frame)?;
+    let anchor_enabled = cfg.enable_market_anchor || cfg.market_anchor_shadow;
+    let anchor_weight = if anchor_enabled {
+        market_anchor_weight(
+            cfg.market_anchor_weight,
+            book_spread,
+            cfg.market_anchor_max_spread,
+        )
+    } else {
+        0.0
+    };
+    let final_up_shadow = if anchor_weight > 0.0 {
+        blend_market_anchor(model_up, market_up, anchor_weight)
+    } else {
+        model_up
+    };
     Some(ModelMarketSample {
         ts_ms: frame.ts_ms,
         market: frame.market.clone(),
         tau_seconds: frame.tau_seconds,
         model_up,
         market_up,
+        final_up_shadow,
+        anchor_weight,
         exact_book,
     })
 }
 
-fn market_up_mid(frame: &MarketFrame) -> Option<(f64, bool)> {
+fn market_up_mid(frame: &MarketFrame) -> Option<(f64, bool, f64)> {
     let up_exact = valid_market_px(frame.up_bid)
         .then_some(frame.up_bid)
         .zip(valid_market_px(frame.up_ask).then_some(frame.up_ask))
-        .map(|(bid, ask)| (bid + ask) / 2.0);
+        .filter(|(bid, ask)| ask >= bid)
+        .map(|(bid, ask)| ((bid + ask) / 2.0, ask - bid));
     let down_exact = valid_market_px(frame.down_bid)
         .then_some(frame.down_bid)
         .zip(valid_market_px(frame.down_ask).then_some(frame.down_ask))
-        .map(|(bid, ask)| 1.0 - ((bid + ask) / 2.0));
+        .filter(|(bid, ask)| ask >= bid)
+        .map(|(bid, ask)| (1.0 - ((bid + ask) / 2.0), ask - bid));
     match (up_exact, down_exact) {
-        (Some(up), Some(down)) => Some((((up + down) / 2.0).clamp(0.0, 1.0), true)),
-        (Some(up), None) => Some((up.clamp(0.0, 1.0), true)),
-        (None, Some(down)) => Some((down.clamp(0.0, 1.0), true)),
+        (Some((up, up_spread)), Some((down, down_spread))) => Some((
+            ((up + down) / 2.0).clamp(0.0, 1.0),
+            true,
+            up_spread.max(down_spread),
+        )),
+        (Some((up, up_spread)), None) => Some((up.clamp(0.0, 1.0), true, up_spread)),
+        (None, Some((down, down_spread))) => Some((down.clamp(0.0, 1.0), true, down_spread)),
         (None, None) => {
             if valid_market_px(frame.up_ask) && valid_market_px(frame.down_ask) {
                 Some((
                     ((frame.up_ask + (1.0 - frame.down_ask)) / 2.0).clamp(0.0, 1.0),
                     false,
+                    (frame.up_ask + frame.down_ask).clamp(0.0, 1.0),
                 ))
             } else {
                 None
@@ -1591,6 +1652,30 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
         "VALUE_MIN_FAIR",
         "0.05",
         "最低模型胜率过滤：低于这个fair的一边不挂单。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "ENABLE_MARKET_ANCHOR",
+        "0",
+        "1=真实报价使用盘口锚定融合胜率；默认0只记录影子值。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "MARKET_ANCHOR_SHADOW",
+        "1",
+        "1=记录FinalUp影子胜率，不改变报价。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "MARKET_ANCHOR_WEIGHT",
+        "0.30",
+        "盘口胜率最大融合权重；盘口越窄实际权重越接近该值。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "MARKET_ANCHOR_MAX_SPREAD",
+        "0.12",
+        "盘口健康价差上限；超过该价差则盘口锚定权重降为0。",
     )?;
     Ok(())
 }

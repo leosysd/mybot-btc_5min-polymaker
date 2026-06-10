@@ -243,6 +243,21 @@ pub fn floor_to_tick(px: f64, tick_size: f64) -> f64 {
     ((px / tick_size).floor() * tick_size).clamp(0.01, 0.99)
 }
 
+pub fn market_anchor_weight(base_weight: f64, book_spread: f64, max_spread: f64) -> f64 {
+    let base = base_weight.clamp(0.0, 1.0);
+    if base <= 0.0 || !book_spread.is_finite() || !max_spread.is_finite() || max_spread <= 0.0 {
+        return 0.0;
+    }
+    let health = (1.0 - (book_spread.max(0.0) / max_spread)).clamp(0.0, 1.0);
+    base * health
+}
+
+pub fn blend_market_anchor(model_up: f64, market_up: f64, weight: f64) -> f64 {
+    let w = weight.clamp(0.0, 1.0);
+    ((1.0 - w) * model_up.clamp(0.0001, 0.9999) + w * market_up.clamp(0.0001, 0.9999))
+        .clamp(0.0001, 0.9999)
+}
+
 fn enforce_binary_edge(up_bid: &mut f64, down_bid: &mut f64, cap_sum: f64, min_bid: f64) {
     let excess = (*up_bid + *down_bid - cap_sum).max(0.0);
     if excess <= 1e-12 {

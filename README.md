@@ -442,6 +442,21 @@ MAX_UNPAIRED_SHARES=19
 最大未配平差额，按 `abs((Up已成交+pending) - (Down已成交+pending))` 计算。达到上限后，机器人不再给领先的一边加仓，只允许继续挂落后的一边来缩小差额。`0` 表示关闭该限制。
 
 ```text
+ENABLE_MARKET_ANCHOR=0
+MARKET_ANCHOR_SHADOW=1
+MARKET_ANCHOR_WEIGHT=0.30
+MARKET_ANCHOR_MAX_SPREAD=0.12
+```
+
+盘口锚定胜率。默认只记录影子融合胜率，不改变实盘报价：
+
+```text
+FinalUp = 模型Up * (1 - 权重) + 盘口Up * 权重
+```
+
+实际权重会随盘口健康度变化；bid/ask 越窄，权重越接近 `MARKET_ANCHOR_WEIGHT`，价差超过 `MARKET_ANCHOR_MAX_SPREAD` 时权重归零。只有把 `ENABLE_MARKET_ANCHOR=1` 后，quote-engine 才会用 `FinalUp` 替代纯模型胜率参与真实报价。`polymaker model-market` 会显示 `FinalUp` 方便先观察。
+
+```text
 MIN_BID=0.05
 MAX_BID=0.62
 ```
@@ -480,7 +495,7 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 1. 用 BTC 相对开盘价的偏移估算 `p_up`。
 2. `p_down = 1 - p_up`。
-3. 当前只有一套 value-buy maker 策略：Up/Down 各自独立判断，只在买价低于模型 fair 至少 `VALUE_MIN_EDGE` 时挂 maker 买单。
+3. 当前只有一套 value-buy maker 策略：Up/Down 各自独立判断，只在买价低于 fair 至少 `VALUE_MIN_EDGE` 时挂 maker 买单。默认 fair 是 Binance 模型；如果启用 `ENABLE_MARKET_ANCHOR=1`，fair 会使用盘口锚定后的 `FinalUp`。
 4. 新模式会参考当前买一价，最多抬高 `VALUE_AGGRESSION_TICKS` 个 tick，但仍然必须满足 post-only，且不能高于 `fair - VALUE_MIN_EDGE`。
 5. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
 6. 新模式不做中途卖出；`MAX_UNPAIRED_SHARES` 会限制单边差额，超过后只允许挂落后的一边。
