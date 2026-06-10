@@ -3,13 +3,15 @@ use crate::ipc::{now_ms, FillEvent, Heartbeat, Inventory, MarketFrame, QuoteInte
 use crate::pricing::{blend_market_anchor, digital_p_up, market_anchor_weight, uncertainty_width};
 use crate::workers;
 use crate::AppResult;
+use alloy::signers::local::PrivateKeySigner;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::Command;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 const C_RESET: &str = "\x1b[0m";
@@ -905,6 +907,7 @@ fn read_all_jsonl<T: DeserializeOwned>(path: &Path) -> AppResult<Vec<T>> {
     Ok(out)
 }
 
+#[derive(Clone, Debug)]
 struct MarketStat {
     up_shares: f64,
     up_cost: f64,
@@ -928,6 +931,178 @@ impl MarketStat {
     }
     fn pnl_if_down(&self) -> f64 {
         (self.down_shares - self.down_cost) - self.up_cost
+    }
+
+    fn total_abs_shares(&self) -> f64 {
+        self.up_shares.abs() + self.down_shares.abs()
+    }
+
+    fn total_abs_cost(&self) -> f64 {
+        self.up_cost.abs() + self.down_cost.abs()
+    }
+
+    fn materially_differs_from(&self, other: &Self) -> bool {
+        const EPS: f64 = 0.000_001;
+        self.fills != other.fills
+            || (self.up_shares - other.up_shares).abs() > EPS
+            || (self.down_shares - other.down_shares).abs() > EPS
+            || (self.up_cost - other.up_cost).abs() > EPS
+            || (self.down_cost - other.down_cost).abs() > EPS
+    }
+}
+
+fn official_stats_user(cfg: &Config) -> Option<String> {
+    let funder = cfg.poly_funder_address.trim();
+    if !funder.is_empty() {
+        return Some(funder.to_string());
+    }
+    let private_key = cfg.poly_private_key.trim();
+    if private_key.is_empty() {
+        return None;
+    }
+    PrivateKeySigner::from_str(private_key)
+        .ok()
+        .map(|signer| signer.address().to_string())
+}
+
+fn fetch_official_trade_stats(cfg: &Config, markets: &[String]) -> HashMap<String, MarketStat> {
+    let Some(user) = official_stats_user(cfg) else {
+        return HashMap::new();
+    };
+    if markets.is_empty() {
+        return HashMap::new();
+    }
+
+    let wanted = markets.iter().cloned().collect::<HashSet<_>>();
+    let min_start = markets.iter().filter_map(|m| market_start_secs(m)).min();
+    let max_start = markets.iter().filter_map(|m| market_start_secs(m)).max();
+    let start_filter = min_start.map(|s| s.saturating_sub(60));
+    let end_filter = max_start
+        .and_then(|s| s.checked_add(cfg.market_window_secs))
+        .and_then(|s| s.checked_add(600));
+
+    let mut out = HashMap::new();
+    let mut offset = 0;
+    const LIMIT: usize = 500;
+    while offset <= 10_000 {
+        let mut url = format!(
+            "https://data-api.polymarket.com/activity?user={user}&type=TRADE&limit={LIMIT}&offset={offset}"
+        );
+        if let Some(start) = start_filter {
+            url.push_str(&format!("&start={start}"));
+        }
+        if let Some(end) = end_filter {
+            url.push_str(&format!("&end={end}"));
+        }
+
+        let response = match ureq::get(&url)
+            .set("User-Agent", "polymaker/0.1")
+            .timeout(Duration::from_secs(5))
+            .call()
+        {
+            Ok(response) => response,
+            Err(_) => break,
+        };
+        let value: Value = match response.into_json() {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let Some(items) = value.as_array() else {
+            break;
+        };
+        for item in items {
+            let Some(slug) = item.get("slug").and_then(Value::as_str) else {
+                continue;
+            };
+            if !wanted.contains(slug) {
+                continue;
+            }
+            let stat = out.entry(slug.to_string()).or_insert_with(MarketStat::new);
+            apply_official_trade_activity(stat, item);
+        }
+        if items.len() < LIMIT {
+            break;
+        }
+        offset += LIMIT;
+    }
+    out
+}
+
+fn apply_official_trade_activity(stat: &mut MarketStat, row: &Value) -> bool {
+    if !row
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t.eq_ignore_ascii_case("TRADE"))
+    {
+        return false;
+    }
+    let side_mult = match row.get("side").and_then(Value::as_str) {
+        Some(side) if side.eq_ignore_ascii_case("BUY") => 1.0,
+        Some(side) if side.eq_ignore_ascii_case("SELL") => -1.0,
+        _ => return false,
+    };
+    let Some(outcome) = row.get("outcome").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(size) = value_as_f64(row.get("size")) else {
+        return false;
+    };
+    if size <= 0.0 || !size.is_finite() {
+        return false;
+    }
+    let cost = value_as_f64(row.get("usdcSize"))
+        .or_else(|| value_as_f64(row.get("price")).map(|price| price * size))
+        .unwrap_or(0.0);
+
+    match outcome.trim().to_ascii_lowercase().as_str() {
+        "up" => {
+            stat.up_shares += side_mult * size;
+            stat.up_cost += side_mult * cost;
+        }
+        "down" => {
+            stat.down_shares += side_mult * size;
+            stat.down_cost += side_mult * cost;
+        }
+        _ => return false,
+    }
+    stat.fills += 1;
+    true
+}
+
+fn value_as_f64(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn should_use_official_stat(
+    local: &MarketStat,
+    official: &MarketStat,
+    market: &str,
+    cfg: &Config,
+) -> bool {
+    if official.fills == 0 || !official.materially_differs_from(local) {
+        return false;
+    }
+    let official_has_at_least_local_volume = official.total_abs_shares() + 0.000_001
+        >= local.total_abs_shares()
+        && official.total_abs_cost() + 0.000_001 >= local.total_abs_cost();
+    if official_has_at_least_local_volume {
+        return true;
+    }
+    let now_secs = now_ms() / 1_000;
+    market_start_secs(market)
+        .and_then(|start| start.checked_add(cfg.market_window_secs))
+        .is_some_and(|end| now_secs > end.saturating_add(30))
+}
+
+fn format_shares(value: f64) -> String {
+    if (value - value.round()).abs() < 0.01 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.1}")
     }
 }
 
@@ -1018,7 +1193,7 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     }
 
     let mut order: Vec<String> = Vec::new();
-    let mut agg: std::collections::HashMap<String, MarketStat> = std::collections::HashMap::new();
+    let mut agg: HashMap<String, MarketStat> = HashMap::new();
     for f in &fills {
         let stat = agg.entry(f.market.clone()).or_insert_with(|| {
             order.push(f.market.clone());
@@ -1038,6 +1213,7 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         stat.fills += 1;
     }
 
+    let official_trade_stats = fetch_official_trade_stats(cfg, &order);
     let official_won_up = fetch_official_settlements(cfg, &order);
 
     // Local settlement proxy fallback: only near-close frames after the scheduled
@@ -1064,10 +1240,10 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         "{}",
         table_row(&[
             ("盘口".to_string(), 18, Align::Left),
-            ("成交".to_string(), 4, Align::Right),
-            ("Up份".to_string(), 5, Align::Right),
+            ("成交".to_string(), 5, Align::Right),
+            ("Up份".to_string(), 6, Align::Right),
             ("Up均".to_string(), 6, Align::Right),
-            ("Dn份".to_string(), 5, Align::Right),
+            ("Dn份".to_string(), 6, Align::Right),
             ("Dn均".to_string(), 6, Align::Right),
             ("双边成本".to_string(), 8, Align::Right),
             ("Up赢".to_string(), 7, Align::Right),
@@ -1081,8 +1257,25 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     let (mut sum_worst, mut sum_locked_edge, mut total_fills) = (0.0_f64, 0.0_f64, 0u64);
     let (mut sum_realized, mut settled, mut wins, mut losses, mut up_wins, mut dn_wins) =
         (0.0_f64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut official_corrected, mut official_share_delta) = (0u64, 0.0_f64);
     for market in &order {
-        let s = &agg[market];
+        let local = &agg[market];
+        let official = official_trade_stats.get(market);
+        let use_official =
+            official.is_some_and(|s| should_use_official_stat(local, s, market, cfg));
+        let s = if use_official {
+            let official = official.expect("checked by is_some_and");
+            official_corrected += 1;
+            official_share_delta += (official.total_abs_shares() - local.total_abs_shares()).abs();
+            official
+        } else {
+            local
+        };
+        let fill_cell = if use_official {
+            format!("{}/{}", local.fills, s.fills)
+        } else {
+            s.fills.to_string()
+        };
         let up_avg = if s.up_shares > 0.0 {
             s.up_cost / s.up_shares
         } else {
@@ -1152,10 +1345,10 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
                     18,
                     Align::Left,
                 ),
-                (s.fills.to_string(), 4, Align::Right),
-                (format!("{:.0}", s.up_shares), 5, Align::Right),
+                (fill_cell, 5, Align::Right),
+                (format_shares(s.up_shares), 6, Align::Right),
                 (format!("{:.3}", up_avg), 6, Align::Right),
-                (format!("{:.0}", s.down_shares), 5, Align::Right),
+                (format_shares(s.down_shares), 6, Align::Right),
                 (format!("{:.3}", dn_avg), 6, Align::Right),
                 (format!("{:.3}", combined), 8, Align::Right),
                 (format!("{:+.2}", s.pnl_if_up()), 7, Align::Right),
@@ -1196,6 +1389,12 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         "  {}锁定毛利合计{} ≈ {}   {}最坏情景PnL合计{} {}",
         C_BOLD, C_RESET, edge_styled, C_BOLD, C_RESET, worst_styled
     );
+    if official_corrected > 0 {
+        println!(
+            "  {}官方成交对账{} 修正 {} 盘，份额差合计约 {:.1}",
+            C_CYAN, C_RESET, official_corrected, official_share_delta
+        );
+    }
     let realized_styled = if sum_realized >= 0.0 {
         format!("{C_GREEN}{sum_realized:+.2}{C_RESET}")
     } else {
@@ -1224,10 +1423,11 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     );
     println!();
     println!(
-        "{}说明:盘口列显示北京时间窗口起止。结算列优先读取 Polymarket Gamma 官方 resolved \
-         outcomePrices;官方结果暂不可用时才用本机 BTC 临近收盘行情兜底推断(临界盘可能有\
-         偏差)。实现PnL=按该结算方向的逐盘已实现盈亏。官方未 resolved 且本机缺少临近\
-         收盘行情的盘口显示 ?。{}",
+        "{}说明:盘口列显示北京时间窗口起止。成交列若显示 a/b，表示本地 fills.jsonl 记到 a \
+         笔、Polymarket 官方 Activity 记到 b 笔，统计已按官方成交修正。结算列优先读取 \
+         Polymarket Gamma 官方 resolved outcomePrices;官方结果暂不可用时才用本机 BTC 临近\
+         收盘行情兜底推断(临界盘可能有偏差)。实现PnL=按该结算方向的逐盘已实现盈亏。\
+         官方未 resolved 且本机缺少临近收盘行情的盘口显示 ?。{}",
         C_DIM, C_RESET
     );
     Ok(())
