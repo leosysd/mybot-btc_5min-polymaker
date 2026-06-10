@@ -151,6 +151,20 @@ fn value_buy_quotes(
     (up_px, down_px, "value_buy")
 }
 
+fn unpaired_limit_allows(cfg: &Config, inventory: &Inventory, side: &str, size: f64) -> bool {
+    let limit = cfg.max_unpaired_shares;
+    if limit <= 0.0 {
+        return true;
+    }
+    let current = inventory.effective_up() - inventory.effective_down();
+    let projected = match side {
+        "Up" => current + size,
+        "Down" => current - size,
+        _ => current,
+    };
+    projected.abs() <= limit + 1e-9 || projected.abs() < current.abs()
+}
+
 /// Compute the time-aware quotes for one market frame and emit them.
 /// Returns the fair `p_up` used, so the caller can feed the toxicity monitor.
 fn handle_market_frame(
@@ -262,6 +276,10 @@ fn send_quote(
     inventory: &Inventory,
     reason: &str,
 ) -> AppResult<()> {
+    let size = cfg.quote_size.round().max(1.0);
+    if !unpaired_limit_allows(cfg, inventory, side, size) {
+        return Ok(());
+    }
     let side_inventory = if side == "Up" {
         inventory.effective_up()
     } else {
@@ -283,7 +301,7 @@ fn send_quote(
         },
         side: side.to_string(),
         price,
-        size: cfg.quote_size.round().max(1.0),
+        size,
         fair,
         inventory_up: inventory.effective_up(),
         inventory_down: inventory.effective_down(),
@@ -320,6 +338,7 @@ mod tests {
         cfg.min_lock_edge = 0.02;
         cfg.quote_size = 5.0;
         cfg.inventory_mult = 2.0;
+        cfg.max_unpaired_shares = 5.0;
         cfg.post_only_margin_ticks = 1.0;
         cfg.tick_size = 0.01;
         cfg.base_half_spread = 0.01;
@@ -400,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn value_buy_can_add_same_side_instead_of_forcing_pair() {
+    fn value_buy_blocks_same_side_when_unpaired_cap_reached() {
         let mut cfg = value_buy_quote_test_cfg();
         cfg.value_min_fair = 0.30;
         let inventory = Inventory {
@@ -414,8 +433,29 @@ mod tests {
 
         handle_market_frame(&cfg, &tx, &flat_frame(110.0), &inventory, &mut tox).expect("quote");
 
-        let quote = rx.try_recv().expect("same-side value quote");
-        assert_eq!(quote.side, "Up");
+        assert!(
+            rx.try_recv().is_err(),
+            "same-side add would push unpaired exposure above MAX_UNPAIRED_SHARES"
+        );
+    }
+
+    #[test]
+    fn value_buy_allows_opposite_side_to_reduce_unpaired_exposure() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.value_min_fair = 0.30;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 20.0,
+            up_cost: 10.0,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(90.0), &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("opposite-side reducing quote");
+        assert_eq!(quote.side, "Down");
         assert_eq!(quote.reason, "value_buy");
         assert!(rx.try_recv().is_err());
     }

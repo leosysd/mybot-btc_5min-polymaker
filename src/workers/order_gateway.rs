@@ -9,7 +9,7 @@
 
 use crate::config::Config;
 use crate::ipc::{
-    heartbeat, now_ms, write_json, FillEvent, OrderAccepted, OrderCancelled, QuoteIntent,
+    heartbeat, now_ms, write_json, FillEvent, Inventory, OrderAccepted, OrderCancelled, QuoteIntent,
 };
 use crate::pricing::floor_to_tick;
 use crate::real_orders::{RealOrderClient, UserWsCredentials};
@@ -284,6 +284,33 @@ pub fn run(
                             continue;
                         }
 
+                        let incremental_size = if resting.contains_key(&quote.side) {
+                            0.0
+                        } else {
+                            quote.size
+                        };
+                        let unpaired_allowed = {
+                            let inv = inventory.lock().unwrap();
+                            unpaired_limit_allows_quote(
+                                &cfg,
+                                &inv,
+                                &quote.market,
+                                &quote.side,
+                                incremental_size,
+                            )
+                        };
+                        if !unpaired_allowed {
+                            heartbeat(
+                                &cfg,
+                                "order-gateway",
+                                format!(
+                                    "unpaired cap blocks {} size={:.0} limit={:.0}",
+                                    quote.side, quote.size, cfg.max_unpaired_shares
+                                ),
+                            )?;
+                            continue;
+                        }
+
                         // Gateway-authoritative cost-basis lock: cap THIS leg's price
                         // by the OPPOSITE side's real average fill, so completing a
                         // pair can never breach 1 - MIN_LOCK_EDGE.
@@ -470,6 +497,28 @@ fn should_keep_resting(cfg: &Config, old: Option<&RestingOrder>, quote: &QuoteIn
     }
     let threshold = cfg.tick_size * cfg.requote_threshold_ticks.max(0.0);
     (old.price - quote.price).abs() < threshold && (old.size - quote.size).abs() < 0.001
+}
+
+fn unpaired_limit_allows_quote(
+    cfg: &Config,
+    inv: &Inventory,
+    market: &str,
+    side: &str,
+    incremental_size: f64,
+) -> bool {
+    let limit = cfg.max_unpaired_shares;
+    if limit <= 0.0 || incremental_size <= 0.0 {
+        return true;
+    }
+    let up = held_shares(inv, market, "Up") + pending_shares(inv, market, "Up");
+    let down = held_shares(inv, market, "Down") + pending_shares(inv, market, "Down");
+    let current = up - down;
+    let projected = match side {
+        "Up" => current + incremental_size,
+        "Down" => current - incremental_size,
+        _ => current,
+    };
+    projected.abs() <= limit + 1e-9 || projected.abs() < current.abs()
 }
 
 fn load_active_orders(cfg: &Config) -> AppResult<HashMap<String, RestingOrder>> {
@@ -1769,5 +1818,26 @@ mod tests {
 
         // Touch a StopFlag type so the import stays meaningful in the test cfg.
         let _stop: StopFlag = Arc::new(AtomicBool::new(false));
+    }
+
+    #[test]
+    fn unpaired_cap_blocks_only_the_side_that_worsens_imbalance() {
+        let mut cfg = test_cfg();
+        cfg.max_unpaired_shares = 5.0;
+        let inv = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 10.0,
+            down_shares: 5.0,
+            ..Default::default()
+        };
+
+        assert!(
+            !unpaired_limit_allows_quote(&cfg, &inv, "btc-updown-5m-test", "Up", 5.0),
+            "adding to the already-ahead side must be blocked"
+        );
+        assert!(
+            unpaired_limit_allows_quote(&cfg, &inv, "btc-updown-5m-test", "Down", 5.0),
+            "adding to the lagging side reduces imbalance and must be allowed"
+        );
     }
 }

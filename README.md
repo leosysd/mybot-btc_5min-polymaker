@@ -436,6 +436,12 @@ QUOTE_SIZE * INVENTORY_MULT
 例如 `QUOTE_SIZE=5`、`INVENTORY_MULT=2`，单边最多买 `10` 份。这里会同时计算已成交库存和 pending 未成交报价，避免连续报价把真实仓位打穿。
 
 ```text
+MAX_UNPAIRED_SHARES=5
+```
+
+最大未配平差额，按 `abs((Up已成交+pending) - (Down已成交+pending))` 计算。达到上限后，机器人不再给领先的一边加仓，只允许继续挂落后的一边来缩小差额。`0` 表示关闭该限制。
+
+```text
 MIN_BID=0.05
 MAX_BID=0.62
 ```
@@ -477,7 +483,7 @@ LIVE_ORDER_NOTIONAL_CAP=5
 3. 当前只有一套 value-buy maker 策略：Up/Down 各自独立判断，只在买价低于模型 fair 至少 `VALUE_MIN_EDGE` 时挂 maker 买单。
 4. 新模式会参考当前买一价，最多抬高 `VALUE_AGGRESSION_TICKS` 个 tick，但仍然必须满足 post-only，且不能高于 `fair - VALUE_MIN_EDGE`。
 5. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
-6. 新模式不做中途卖出，不做强制补对边；如果另一边之后也变得便宜，会按同样规则自己挂买单。
+6. 新模式不做中途卖出；`MAX_UNPAIRED_SHARES` 会限制单边差额，超过后只允许挂落后的一边。
 7. `VALUE_MIN_FAIR` 用来过滤极低胜率的一边；默认 0.05，避免买几乎归零的深度劣势方。
 8. 单边库存仍受 `QUOTE_SIZE * INVENTORY_MULT` 限制，总库存仍受 `MAX_TOTAL_INVENTORY` 和 `MAX_LOSS` 限制。
 9. 如果同时持有 Up/Down，网关仍保留成本锁：补成一对时不会允许 `Up成本 + Down成本 > 1 - MIN_LOCK_EDGE`。

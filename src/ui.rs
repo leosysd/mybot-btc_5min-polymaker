@@ -718,6 +718,7 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("REQUOTE_THRESHOLD_TICKS", "价差变化多少tick才撤旧换新"),
         ("INVENTORY_SKEW", "库存偏移强度"),
         ("INVENTORY_MULT", "单边最大库存倍数"),
+        ("MAX_UNPAIRED_SHARES", "最大未配平份额"),
         ("MIN_BID", "最低挂买价"),
         ("MAX_BID", "最高挂买价"),
         ("MAX_LOSS", "最坏情景最大亏损"),
@@ -768,6 +769,7 @@ fn print_param_help() {
     println!("  REQUOTE_*         旧报价和新报价差多少 tick 才撤旧换新");
     println!("  INVENTORY_SKEW    库存偏移，多仓侧降价、少仓侧抬价");
     println!("  INVENTORY_MULT    单边最大库存 = QUOTE_SIZE * INVENTORY_MULT");
+    println!("  MAX_UNPAIRED_*    最大未配平份额，超过后只允许挂落后的一边");
     println!("  MAX_LOSS          最坏结算情景亏损达到阈值就停止");
     println!("  MAX_TOTAL_*       Up+Down 已成交+pending 达到阈值就停止");
     println!("  ENABLE_REAL_*     实单确认串；菜单2切实单时会自动写入");
@@ -1534,6 +1536,7 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "REQUOTE_THRESHOLD_TICKS", "1")?;
     upsert_env_if_missing(path, "INVENTORY_SKEW", "0.03")?;
     upsert_env_if_missing(path, "INVENTORY_MULT", "2")?;
+    upsert_env_if_missing(path, "MAX_UNPAIRED_SHARES", "5")?;
     upsert_env_if_missing(path, "MIN_BID", "0.05")?;
     upsert_env_if_missing(path, "MAX_BID", "0.62")?;
     upsert_env_if_missing(path, "TICK_SIZE", "0.01")?;
