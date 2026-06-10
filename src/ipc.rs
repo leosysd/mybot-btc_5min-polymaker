@@ -129,8 +129,13 @@ impl Default for Inventory {
 
 impl Inventory {
     pub fn add_fill(&mut self, market: &str, side: &str, price: f64, size: f64) {
+        if self.market != market {
+            *self = Self {
+                market: market.to_string(),
+                ..Self::default()
+            };
+        }
         self.ts_ms = now_ms();
-        self.market = market.to_string();
         match side {
             "Up" => {
                 self.up_shares += size;
@@ -158,6 +163,29 @@ impl Inventory {
 
     pub fn effective_down(&self) -> f64 {
         self.down_shares + self.pending_down
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Inventory;
+
+    #[test]
+    fn add_fill_clears_old_market_inventory() {
+        let mut inv = Inventory {
+            market: "old-market".to_string(),
+            up_shares: 40.0,
+            up_cost: 28.8,
+            ..Inventory::default()
+        };
+
+        inv.add_fill("new-market", "Down", 0.25, 10.0);
+
+        assert_eq!(inv.market, "new-market");
+        assert_eq!(inv.up_shares, 0.0);
+        assert_eq!(inv.up_cost, 0.0);
+        assert_eq!(inv.down_shares, 10.0);
+        assert_eq!(inv.down_cost, 2.5);
     }
 }
 
