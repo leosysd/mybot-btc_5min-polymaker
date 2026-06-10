@@ -470,12 +470,13 @@ LIVE_ORDER_NOTIONAL_CAP=5
 4. 根据库存做偏移：
    - Up 库存多：降低 Up bid，提高 Down bid。
    - Down 库存多：降低 Down bid，提高 Up bid。
-5. 默认开启 `FAVORITE_FIRST_FLAT=1`：无库存或库存已配平时，只先挂模型胜率高的一边，不再双边同时开仓。
-6. 如果已成交库存单边不平衡，先尝试买对边完成 `Up+Down < 1 - MIN_LOCK_EDGE` 的锁利配平。
-7. 默认不主动加方向仓：如果对边不能锁利配平，就等待，不继续给已偏多的一边加仓。
-8. 只有手动开启 `ENABLE_DIRECTIONAL_EDGE=1` 后，模型胜率高的一边满足 `fair - price >= MIN_DIRECTIONAL_EDGE`，且未配平方向仓低于 `QUOTE_SIZE * DIRECTIONAL_INVENTORY_MULT`，才继续加方向仓。
-9. 报价不能吃单，必须低于当前 ask 一个 tick。
-10. 单边库存达到上限后，不再继续报该边。
+5. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
+6. 默认开启 `FAVORITE_FIRST_FLAT=1`：无库存或库存已配平时，只先挂模型胜率高的一边，不再双边同时开仓。
+7. 如果已成交库存单边不平衡，先尝试买对边完成 `Up+Down < 1 - MIN_LOCK_EDGE` 的锁利配平；但补腿出价不会高于 `模型 fair + REBALANCE_MAX_OVER_FAIR`（默认 0.05），不会为锁几分钱小利去高价买几乎归零的对边。
+8. 默认不主动加方向仓：如果对边不能锁利配平，就等待，不继续给已偏多的一边加仓。
+9. 只有手动开启 `ENABLE_DIRECTIONAL_EDGE=1` 后，模型胜率高的一边满足 `fair - price >= MIN_DIRECTIONAL_EDGE`，且未配平方向仓低于 `QUOTE_SIZE * DIRECTIONAL_INVENTORY_MULT`，才继续加方向仓。
+10. 报价不能吃单，必须低于当前 ask 一个 tick。
+11. 单边库存达到上限后，不再继续报该边。
 
 ## 当前限制
 

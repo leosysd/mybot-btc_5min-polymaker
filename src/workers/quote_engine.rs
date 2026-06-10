@@ -7,9 +7,9 @@
 use crate::config::Config;
 use crate::ipc::{heartbeat, now_ms, Inventory, MarketFrame, QuoteIntent};
 use crate::pricing::{
-    digital_p_up, half_spread, lock_capped_bid, market_maker_bids, phase_for, post_only_bid,
-    price_sensitivity, side_allowed, time_boosted_skew, uncertainty_width, MmParams, Phase,
-    SpreadInputs, ToxicityMonitor,
+    digital_p_up, fair_capped_bid, half_spread, in_warmup, lock_capped_bid, market_maker_bids,
+    phase_for, post_only_bid, price_sensitivity, side_allowed, time_boosted_skew,
+    uncertainty_width, MmParams, Phase, SpreadInputs, ToxicityMonitor,
 };
 use crate::AppResult;
 use std::sync::mpsc::RecvTimeoutError;
@@ -166,6 +166,14 @@ fn handle_market_frame(
     // ── 2. Toxicity feedback: settle matured fills, get any extra widening.
     tox.on_fair(p_up, now_ms());
 
+    // ── 2b. Opening quiet period. Live data (2026-06-10): 21 of 33 windows
+    // had their first fill within 10s of the open, and the resulting one-sided
+    // positions lost 11 of 13 times — informed flow hits a seconds-old market
+    // exactly when our fair is still a coin flip. Don't quote a young window.
+    if in_warmup(tau, window, cfg.quote_warmup_secs) {
+        return Ok(p_up);
+    }
+
     // ── 3. Spread: base + adverse-selection (sensitivity-driven) + toxicity.
     let sensitivity = price_sensitivity(frame.btc_price, frame.price_to_beat, width);
     let half = half_spread(&SpreadInputs {
@@ -222,6 +230,13 @@ fn handle_market_frame(
         inventory.down_cost,
         cfg.min_lock_edge,
     );
+
+    // ── 4c. Fair cap on pairing bids: never pay more than fair + premium to
+    // complete a pair. Without this, holding the near-certain winner makes the
+    // engine bid the lock cap (e.g. 0.55) for the nearly-worthless side — an
+    // order that only fills when it converts a ~sure win into a tiny lock.
+    let up_capped = fair_capped_bid(up_capped, p_up, cfg.rebalance_max_over_fair);
+    let down_capped = fair_capped_bid(down_capped, 1.0 - p_up, cfg.rebalance_max_over_fair);
 
     // ── 5. Endgame protocol + min-probability gate: a side is only quoted
     // if its win probability >= MIN_FAIR_TO_QUOTE (skip deep longshots).
@@ -475,6 +490,72 @@ mod tests {
         assert_eq!(quote.side, "Down");
         assert_eq!(quote.reason, "tov3_favorite_first");
         assert!(rx.try_recv().is_err(), "underdog side should not be quoted");
+    }
+
+    #[test]
+    fn warmup_suppresses_all_quotes_in_young_window() {
+        let mut cfg = flat_quote_test_cfg();
+        cfg.quote_warmup_secs = 25.0;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        // 10s into a 300s window (tau 290): inside warmup, nothing quoted.
+        let mut frame = flat_frame(110.0);
+        frame.tau_seconds = 290.0;
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+        assert!(rx.try_recv().is_err(), "warmup must suppress quotes");
+
+        // 30s in (tau 270): warmup over, favorite quote resumes.
+        frame.tau_seconds = 270.0;
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+        assert!(rx.try_recv().is_ok(), "quotes must resume after warmup");
+    }
+
+    #[test]
+    fn rebalance_never_overpays_for_nearly_dead_side() {
+        let mut cfg = flat_quote_test_cfg();
+        cfg.min_bid = 0.10;
+        cfg.rebalance_max_over_fair = 0.05;
+        // Holding Up@0.43 with BTC far above strike and tiny vol: p_up ~ 1,
+        // fair Down ~ 0. The lock cap alone would allow a Down bid up to
+        // 0.98-0.43=0.55; the fair cap must suppress the quote instead.
+        let mut frame = flat_frame(110.0);
+        frame.tau_seconds = 120.0;
+        frame.vol_per_sqrt_sec = 0.05;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 5.0,
+            up_cost: 2.15,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+        assert!(
+            rx.try_recv().is_err(),
+            "must not bid up to the lock cap for a ~worthless side"
+        );
+
+        // Same inventory but the opposite side still has real value
+        // (p_up ~ 0.7): pairing bid survives, capped near fair.
+        let mut live_frame = flat_frame(101.0);
+        live_frame.tau_seconds = 120.0;
+        live_frame.vol_per_sqrt_sec = 0.17;
+        handle_market_frame(&cfg, &tx, &live_frame, &inventory, &mut tox).expect("quote");
+        let quote = rx.try_recv().expect("pairing quote should survive");
+        assert_eq!(quote.side, "Down");
+        assert_eq!(quote.reason, "tov3_rebalance_lock");
+        assert!(
+            quote.price <= quote.fair + cfg.rebalance_max_over_fair + 1e-9,
+            "pairing bid {} must respect fair {} + premium",
+            quote.price,
+            quote.fair
+        );
     }
 
     #[test]

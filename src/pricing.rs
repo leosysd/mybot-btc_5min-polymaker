@@ -290,6 +290,28 @@ fn enforce_binary_edge(up_bid: &mut f64, down_bid: &mut f64, cap_sum: f64, min_b
     *down_bid -= excess * down_room / total_room;
 }
 
+/// Opening quiet period: true while the window is younger than `warmup_secs`.
+/// Right after the open the fair value is ~0.5 (pure noise), the book is wide
+/// and the vol estimator is cold, so fresh quotes are informed-flow bait:
+/// the only people hitting a 4-second-old market are the ones who already saw
+/// BTC move. During warmup we quote nothing at all.
+pub fn in_warmup(tau_sec: f64, window_sec: f64, warmup_secs: f64) -> bool {
+    if warmup_secs <= 0.0 || window_sec <= 0.0 {
+        return false;
+    }
+    (window_sec - tau_sec) < warmup_secs
+}
+
+/// Cap a *pairing* bid by `fair + max_over_fair`. The cost-basis lock alone
+/// lets the pairing bid ride up to (1-edge)-avg even when the opposite side is
+/// nearly worthless — e.g. holding Up@0.43 with p_up=0.999, it would bid 0.55
+/// for a token worth 0.001. Such a bid only fills when filling is bad for us:
+/// the counterparty happily dumps the dead side, swapping our near-certain win
+/// for a tiny locked edge. Never pay more than fair plus a small premium.
+pub fn fair_capped_bid(bid: f64, fair: f64, max_over_fair: f64) -> f64 {
+    bid.min((fair + max_over_fair.max(0.0)).max(0.0))
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // 5. Endgame protocol + inventory-skew time boost
 // ─────────────────────────────────────────────────────────────────────────
@@ -540,6 +562,27 @@ mod tests {
         let px3 = post_only_bid(0.55, 0.53, 0.01, 0.05, 0.62, 3.0).unwrap();
         assert!((px3 - 0.50).abs() < 1e-9);
         assert!(px3 < px1 && px3 < 0.53);
+    }
+
+    #[test]
+    fn warmup_blocks_only_the_opening_seconds() {
+        // 300s window, 25s warmup: 10s elapsed (tau 290) is quiet, 30s is not.
+        assert!(in_warmup(290.0, 300.0, 25.0));
+        assert!(!in_warmup(270.0, 300.0, 25.0));
+        assert!(!in_warmup(290.0, 300.0, 0.0), "0 disables warmup");
+        // tau glitching above the window still counts as "just opened".
+        assert!(in_warmup(301.0, 300.0, 25.0));
+    }
+
+    #[test]
+    fn fair_cap_blocks_overpaying_for_dead_side() {
+        // Lock cap says 0.55 but the side is worth 0.001: cap to ~0.051,
+        // which the caller's min_bid floor then suppresses.
+        assert!((fair_capped_bid(0.55, 0.001, 0.05) - 0.051).abs() < 1e-9);
+        // Bid already below fair+premium: untouched.
+        assert!((fair_capped_bid(0.40, 0.45, 0.05) - 0.40).abs() < 1e-9);
+        // Negative premium is treated as zero, never negative price.
+        assert!(fair_capped_bid(0.30, 0.10, -1.0) >= 0.0);
     }
 
     #[test]
