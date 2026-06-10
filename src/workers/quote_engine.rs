@@ -9,7 +9,7 @@ use crate::ipc::{heartbeat, now_ms, Inventory, MarketFrame, QuoteIntent};
 use crate::pricing::{
     digital_p_up, fair_capped_bid, half_spread, in_warmup, lock_capped_bid, market_maker_bids,
     phase_for, post_only_bid, price_sensitivity, side_allowed, time_boosted_skew,
-    uncertainty_width, MmParams, Phase, SpreadInputs, ToxicityMonitor,
+    uncertainty_width, MmParams, ModelQuote, Phase, SpreadInputs, ToxicityMonitor,
 };
 use crate::AppResult;
 use std::sync::mpsc::RecvTimeoutError;
@@ -66,8 +66,7 @@ pub fn run(
                     continue;
                 }
                 let inv_snapshot = inventory.lock().unwrap().clone();
-                last_p_up =
-                    handle_market_frame(&cfg, &quote_tx, &frame, &inv_snapshot, &mut tox)?;
+                last_p_up = handle_market_frame(&cfg, &quote_tx, &frame, &inv_snapshot, &mut tox)?;
                 heartbeat(&cfg, "quote-engine", "quoted")?;
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -126,6 +125,129 @@ fn directional_edge_target_side(
         return None;
     }
     (fair - px >= min_edge).then_some(side_is_up)
+}
+
+fn use_hybrid_maker(cfg: &Config) -> bool {
+    cfg.strategy_mode.eq_ignore_ascii_case("HYBRID_MAKER")
+}
+
+fn valid_market_px(px: f64) -> bool {
+    px.is_finite() && px > 0.0 && px <= 1.0
+}
+
+fn market_up_mid(frame: &MarketFrame) -> Option<f64> {
+    let up_exact = valid_market_px(frame.up_bid)
+        .then_some(frame.up_bid)
+        .zip(valid_market_px(frame.up_ask).then_some(frame.up_ask))
+        .map(|(bid, ask)| (bid + ask) / 2.0);
+    let down_exact = valid_market_px(frame.down_bid)
+        .then_some(frame.down_bid)
+        .zip(valid_market_px(frame.down_ask).then_some(frame.down_ask))
+        .map(|(bid, ask)| 1.0 - ((bid + ask) / 2.0));
+    match (up_exact, down_exact) {
+        (Some(up), Some(down)) => Some(((up + down) / 2.0).clamp(0.0, 1.0)),
+        (Some(up), None) => Some(up.clamp(0.0, 1.0)),
+        (None, Some(down)) => Some(down.clamp(0.0, 1.0)),
+        (None, None) => None,
+    }
+}
+
+fn top_bid(frame: &MarketFrame, side_is_up: bool) -> Option<f64> {
+    let bid = if side_is_up {
+        frame.up_bid
+    } else {
+        frame.down_bid
+    };
+    valid_market_px(bid).then_some(bid)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hybrid_entry_px(
+    cfg: &Config,
+    frame: &MarketFrame,
+    side_is_up: bool,
+    fair: f64,
+    model_bid: f64,
+) -> Option<f64> {
+    if fair < cfg.min_fair_to_quote {
+        return None;
+    }
+    let edge_cap = fair - cfg.hybrid_entry_min_edge;
+    if edge_cap < cfg.min_bid {
+        return None;
+    }
+    let book_improved = top_bid(frame, side_is_up)
+        .map(|bid| bid + cfg.hybrid_entry_aggression_ticks * cfg.tick_size)
+        .unwrap_or(model_bid);
+    let raw_bid = model_bid.max(book_improved).min(edge_cap).min(cfg.max_bid);
+    let ask = if side_is_up {
+        frame.up_ask
+    } else {
+        frame.down_ask
+    };
+    post_only_bid(
+        raw_bid,
+        ask,
+        cfg.tick_size,
+        cfg.min_bid,
+        cfg.max_bid,
+        cfg.post_only_margin_ticks,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hybrid_flat_quotes(
+    cfg: &Config,
+    frame: &MarketFrame,
+    phase: Phase,
+    tau: f64,
+    p_up: f64,
+    model: ModelQuote,
+    up_pair_px: Option<f64>,
+    down_pair_px: Option<f64>,
+) -> (Option<f64>, Option<f64>, &'static str) {
+    let favorite_is_up = p_up >= 0.5;
+    let favorite_prob = if favorite_is_up { p_up } else { 1.0 - p_up };
+
+    let trend_min_prob = if tau <= cfg.hybrid_endgame_secs {
+        cfg.hybrid_endgame_min_prob
+    } else {
+        cfg.hybrid_trend_min_prob
+    };
+    let market_edge_ok = market_up_mid(frame)
+        .map(|market_up| {
+            let market_prob = if favorite_is_up {
+                market_up
+            } else {
+                1.0 - market_up
+            };
+            favorite_prob - market_prob >= cfg.hybrid_trend_min_market_edge
+        })
+        .unwrap_or(false);
+
+    if favorite_prob >= trend_min_prob && market_edge_ok {
+        let (fair, bid) = if favorite_is_up {
+            (p_up, model.up_bid)
+        } else {
+            (1.0 - p_up, model.down_bid)
+        };
+        let px = hybrid_entry_px(cfg, frame, favorite_is_up, fair, bid);
+        return if favorite_is_up {
+            (px, None, "tov3_hybrid_trend")
+        } else {
+            (None, px, "tov3_hybrid_trend")
+        };
+    }
+
+    if phase == Phase::Normal && favorite_prob <= cfg.hybrid_range_max_prob {
+        if let (Some(up), Some(down)) = (up_pair_px, down_pair_px) {
+            if up + down <= 1.0 - cfg.min_lock_edge + 1e-9 {
+                return (Some(up), Some(down), "tov3_hybrid_range_lock");
+            }
+        }
+    }
+
+    (None, None, "tov3_hybrid_wait")
 }
 
 /// Compute the time-aware quotes for one market frame and emit them.
@@ -188,7 +310,12 @@ fn handle_market_frame(
     });
 
     // ── 4. Inventory skew, ramped up as the window closes.
-    let skew = time_boosted_skew(cfg.inventory_skew, tau, window, cfg.inventory_skew_time_boost);
+    let skew = time_boosted_skew(
+        cfg.inventory_skew,
+        tau,
+        window,
+        cfg.inventory_skew_time_boost,
+    );
     let up_eff = inventory.effective_up();
     let down_eff = inventory.effective_down();
     let model = market_maker_bids(&MmParams {
@@ -265,34 +392,32 @@ fn handle_market_frame(
     } else {
         None
     };
-    let up_directional_px = if side_allowed(true, phase, up_eff, down_eff)
-        && p_up >= cfg.min_fair_to_quote
-    {
-        post_only_bid(
-            model.up_bid,
-            frame.up_ask,
-            cfg.tick_size,
-            cfg.min_bid,
-            cfg.max_bid,
-            cfg.post_only_margin_ticks,
-        )
-    } else {
-        None
-    };
-    let down_directional_px = if side_allowed(false, phase, up_eff, down_eff)
-        && (1.0 - p_up) >= cfg.min_fair_to_quote
-    {
-        post_only_bid(
-            model.down_bid,
-            frame.down_ask,
-            cfg.tick_size,
-            cfg.min_bid,
-            cfg.max_bid,
-            cfg.post_only_margin_ticks,
-        )
-    } else {
-        None
-    };
+    let up_directional_px =
+        if side_allowed(true, phase, up_eff, down_eff) && p_up >= cfg.min_fair_to_quote {
+            post_only_bid(
+                model.up_bid,
+                frame.up_ask,
+                cfg.tick_size,
+                cfg.min_bid,
+                cfg.max_bid,
+                cfg.post_only_margin_ticks,
+            )
+        } else {
+            None
+        };
+    let down_directional_px =
+        if side_allowed(false, phase, up_eff, down_eff) && (1.0 - p_up) >= cfg.min_fair_to_quote {
+            post_only_bid(
+                model.down_bid,
+                frame.down_ask,
+                cfg.tick_size,
+                cfg.min_bid,
+                cfg.max_bid,
+                cfg.post_only_margin_ticks,
+            )
+        } else {
+            None
+        };
 
     let rebalance_target = rebalance_target_side(inventory.up_shares, inventory.down_shares);
     let directional_target = if cfg.enable_directional_edge && rebalance_target.is_some() {
@@ -309,40 +434,70 @@ fn handle_market_frame(
     } else {
         None
     };
-    let (up_px, down_px, reason) = match (phase, rebalance_target) {
-        (Phase::Pull, _) => (None, None, "tov3_pull"),
-        (Phase::Normal, Some(true)) if up_pair_px.is_some() => {
-            (up_pair_px, None, "tov3_rebalance_lock")
-        }
-        (Phase::Normal, Some(false)) if down_pair_px.is_some() => {
-            (None, down_pair_px, "tov3_rebalance_lock")
-        }
-        (Phase::Normal, Some(_)) => match directional_target {
-            Some(true) => (up_directional_px, None, "tov3_directional_edge"),
-            Some(false) => (None, down_directional_px, "tov3_directional_edge"),
-            None => (None, None, "tov3_wait_pair"),
-        },
-        (Phase::Normal, None) => {
-            let up_px = up_pair_px.filter(|_| p_up >= cfg.min_fair_to_quote);
-            let down_px = down_pair_px.filter(|_| (1.0 - p_up) >= cfg.min_fair_to_quote);
-            if cfg.favorite_first_flat {
-                if p_up >= 0.5 {
-                    (up_px, None, "tov3_favorite_first")
-                } else {
-                    (None, down_px, "tov3_favorite_first")
-                }
-            } else {
-                (up_px, down_px, "tov3_normal")
+    let (up_px, down_px, reason) = if use_hybrid_maker(cfg) {
+        match (phase, rebalance_target) {
+            (Phase::Pull, _) => (None, None, "tov3_pull"),
+            (_, Some(true)) if up_pair_px.is_some() => (up_pair_px, None, "tov3_hybrid_pair_lock"),
+            (_, Some(false)) if down_pair_px.is_some() => {
+                (None, down_pair_px, "tov3_hybrid_pair_lock")
             }
+            (_, Some(_)) => (None, None, "tov3_hybrid_wait_pair"),
+            (Phase::Normal | Phase::ReduceOnly, None) => hybrid_flat_quotes(
+                cfg,
+                frame,
+                phase,
+                tau,
+                p_up,
+                model,
+                up_pair_px,
+                down_pair_px,
+            ),
         }
-        (Phase::ReduceOnly, _) => (up_pair_px, down_pair_px, "tov3_reduce_only"),
+    } else {
+        match (phase, rebalance_target) {
+            (Phase::Pull, _) => (None, None, "tov3_pull"),
+            (Phase::Normal, Some(true)) if up_pair_px.is_some() => {
+                (up_pair_px, None, "tov3_rebalance_lock")
+            }
+            (Phase::Normal, Some(false)) if down_pair_px.is_some() => {
+                (None, down_pair_px, "tov3_rebalance_lock")
+            }
+            (Phase::Normal, Some(_)) => match directional_target {
+                Some(true) => (up_directional_px, None, "tov3_directional_edge"),
+                Some(false) => (None, down_directional_px, "tov3_directional_edge"),
+                None => (None, None, "tov3_wait_pair"),
+            },
+            (Phase::Normal, None) => {
+                let up_px = up_pair_px.filter(|_| p_up >= cfg.min_fair_to_quote);
+                let down_px = down_pair_px.filter(|_| (1.0 - p_up) >= cfg.min_fair_to_quote);
+                if cfg.favorite_first_flat {
+                    if p_up >= 0.5 {
+                        (up_px, None, "tov3_favorite_first")
+                    } else {
+                        (None, down_px, "tov3_favorite_first")
+                    }
+                } else {
+                    (up_px, down_px, "tov3_normal")
+                }
+            }
+            (Phase::ReduceOnly, _) => (up_pair_px, down_pair_px, "tov3_reduce_only"),
+        }
     };
 
     if let Some(px) = up_px {
         send_quote(cfg, quote_tx, frame, "Up", px, p_up, inventory, reason)?;
     }
     if let Some(px) = down_px {
-        send_quote(cfg, quote_tx, frame, "Down", px, 1.0 - p_up, inventory, reason)?;
+        send_quote(
+            cfg,
+            quote_tx,
+            frame,
+            "Down",
+            px,
+            1.0 - p_up,
+            inventory,
+            reason,
+        )?;
     }
     // In Pull/ReduceOnly the pulled side simply isn't re-quoted; the gateway
     // expires its resting order by TTL (QUOTE_TTL_MS), flattening it.
@@ -420,6 +575,7 @@ mod tests {
 
     fn flat_quote_test_cfg() -> Config {
         let mut cfg = Config::from_env().expect("config");
+        cfg.strategy_mode = "LEGACY_V3".to_string();
         cfg.favorite_first_flat = true;
         cfg.max_bid = 0.92;
         cfg.min_bid = 0.05;
@@ -434,6 +590,19 @@ mod tests {
         cfg.max_half_spread = 0.25;
         cfg.latency_sec = 0.0;
         cfg.k_adverse = 0.0;
+        cfg
+    }
+
+    fn hybrid_quote_test_cfg() -> Config {
+        let mut cfg = flat_quote_test_cfg();
+        cfg.strategy_mode = "HYBRID_MAKER".to_string();
+        cfg.hybrid_trend_min_prob = 0.60;
+        cfg.hybrid_trend_min_market_edge = 0.02;
+        cfg.hybrid_range_max_prob = 0.58;
+        cfg.hybrid_entry_min_edge = 0.02;
+        cfg.hybrid_entry_aggression_ticks = 1.0;
+        cfg.hybrid_endgame_secs = 45.0;
+        cfg.hybrid_endgame_min_prob = 0.70;
         cfg
     }
 
@@ -490,6 +659,95 @@ mod tests {
         assert_eq!(quote.side, "Down");
         assert_eq!(quote.reason, "tov3_favorite_first");
         assert!(rx.try_recv().is_err(), "underdog side should not be quoted");
+    }
+
+    #[test]
+    fn hybrid_range_lock_quotes_both_sides_when_choppy() {
+        let cfg = hybrid_quote_test_cfg();
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(100.0), &inventory, &mut tox).expect("quote");
+
+        let q1 = rx.try_recv().expect("first range quote");
+        let q2 = rx.try_recv().expect("second range quote");
+        assert_eq!(q1.reason, "tov3_hybrid_range_lock");
+        assert_eq!(q2.reason, "tov3_hybrid_range_lock");
+        assert_ne!(q1.side, q2.side, "range mode should quote both sides");
+        assert!(q1.price + q2.price <= 1.0 - cfg.min_lock_edge + 1e-9);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn hybrid_trend_quotes_only_favorite_with_market_edge() {
+        let cfg = hybrid_quote_test_cfg();
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let mut frame = flat_frame(105.0);
+        frame.up_bid = 0.50;
+        frame.up_ask = 0.54;
+        frame.down_bid = 0.44;
+        frame.down_ask = 0.48;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("trend quote");
+        assert_eq!(quote.side, "Up");
+        assert_eq!(quote.reason, "tov3_hybrid_trend");
+        assert!(quote.price <= quote.fair - cfg.hybrid_entry_min_edge + 1e-9);
+        assert!(
+            rx.try_recv().is_err(),
+            "trend mode should not quote the weak side"
+        );
+    }
+
+    #[test]
+    fn hybrid_waits_when_model_has_no_market_edge() {
+        let cfg = hybrid_quote_test_cfg();
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let mut frame = flat_frame(105.0);
+        frame.up_bid = 0.60;
+        frame.up_ask = 0.64;
+        frame.down_bid = 0.36;
+        frame.down_ask = 0.40;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+        assert!(rx.try_recv().is_err(), "no edge and not range: wait");
+    }
+
+    #[test]
+    fn hybrid_imbalance_only_quotes_lockable_pairing_side() {
+        let cfg = hybrid_quote_test_cfg();
+        let mut frame = flat_frame(101.0);
+        frame.vol_per_sqrt_sec = 0.17;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 5.0,
+            up_cost: 2.15,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("pairing quote");
+        assert_eq!(quote.side, "Down");
+        assert_eq!(quote.reason, "tov3_hybrid_pair_lock");
+        assert!(rx.try_recv().is_err(), "must not add more Up while long Up");
     }
 
     #[test]

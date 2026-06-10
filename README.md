@@ -471,12 +471,14 @@ LIVE_ORDER_NOTIONAL_CAP=5
    - Up 库存多：降低 Up bid，提高 Down bid。
    - Down 库存多：降低 Down bid，提高 Up bid。
 5. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
-6. 默认开启 `FAVORITE_FIRST_FLAT=1`：无库存或库存已配平时，只先挂模型胜率高的一边，不再双边同时开仓。
-7. 如果已成交库存单边不平衡，先尝试买对边完成 `Up+Down < 1 - MIN_LOCK_EDGE` 的锁利配平；但补腿出价不会高于 `模型 fair + REBALANCE_MAX_OVER_FAIR`（默认 0.05），不会为锁几分钱小利去高价买几乎归零的对边。
-8. 默认不主动加方向仓：如果对边不能锁利配平，就等待，不继续给已偏多的一边加仓。
-9. 只有手动开启 `ENABLE_DIRECTIONAL_EDGE=1` 后，模型胜率高的一边满足 `fair - price >= MIN_DIRECTIONAL_EDGE`，且未配平方向仓低于 `QUOTE_SIZE * DIRECTIONAL_INVENTORY_MULT`，才继续加方向仓。
-10. 报价不能吃单，必须低于当前 ask 一个 tick。
-11. 单边库存达到上限后，不再继续报该边。
+6. 默认 `STRATEGY_MODE=HYBRID_MAKER`：趋势明显时只挂胜率高且相对盘口有 edge 的一边；震荡时允许双边同时挂，目标是更快形成 `Up+Down <= 1 - MIN_LOCK_EDGE` 的锁仓组合。
+7. 趋势开仓必须同时满足 `HYBRID_TREND_MIN_PROB` 和 `HYBRID_TREND_MIN_MARKET_EDGE`，挂单价还会受 `HYBRID_ENTRY_MIN_EDGE` 限制，避免为了成交把模型安全垫吃光。
+8. 震荡锁仓由 `HYBRID_RANGE_MAX_PROB` 控制：最高胜率不超过该值时，按 range 处理，允许同时挂 Up/Down；一旦单边成交，立即转为只补对边。
+9. 如果已成交库存单边不平衡，先尝试买对边完成锁利配平；但补腿出价不会高于 `模型 fair + REBALANCE_MAX_OVER_FAIR`（默认 0.05），不会为锁几分钱小利去高价买几乎归零的对边。
+10. 默认不主动加同边方向仓：如果对边不能锁利配平，就等待，不继续给已偏多的一边加仓。
+11. 如需回到旧逻辑，设置 `STRATEGY_MODE=LEGACY_V3`；旧逻辑下才继续使用 `FAVORITE_FIRST_FLAT` 和可选 `ENABLE_DIRECTIONAL_EDGE` 分支。
+12. 报价不能吃单，必须低于当前 ask 一个 tick。
+13. 单边库存达到上限后，不再继续报该边。
 
 ## 当前限制
 

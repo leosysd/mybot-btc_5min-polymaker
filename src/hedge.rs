@@ -109,7 +109,10 @@ mod tests {
     fn matched_inventory_needs_no_hedge() {
         let w = uncertainty_width(6.0, 120.0, 3.0);
         let hedge = target_hedge_btc(7.0, 7.0, 100_000.0, 100_000.0, w);
-        assert!(hedge.abs() < 1e-9, "matched book is delta-flat, got {hedge}");
+        assert!(
+            hedge.abs() < 1e-9,
+            "matched book is delta-flat, got {hedge}"
+        );
     }
 
     #[test]

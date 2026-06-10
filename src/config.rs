@@ -67,6 +67,14 @@ pub struct Config {
     pub min_fair_to_quote: f64,
     pub quote_warmup_secs: f64,
     pub rebalance_max_over_fair: f64,
+    pub strategy_mode: String,
+    pub hybrid_trend_min_prob: f64,
+    pub hybrid_trend_min_market_edge: f64,
+    pub hybrid_range_max_prob: f64,
+    pub hybrid_entry_min_edge: f64,
+    pub hybrid_entry_aggression_ticks: f64,
+    pub hybrid_endgame_secs: f64,
+    pub hybrid_endgame_min_prob: f64,
     pub favorite_first_flat: bool,
     pub enable_directional_edge: bool,
     pub min_directional_edge: f64,
@@ -171,6 +179,14 @@ impl Config {
             min_fair_to_quote: get_f64(&file_env, "MIN_FAIR_TO_QUOTE", 0.0),
             quote_warmup_secs: get_f64(&file_env, "QUOTE_WARMUP_SECS", 25.0),
             rebalance_max_over_fair: get_f64(&file_env, "REBALANCE_MAX_OVER_FAIR", 0.05),
+            strategy_mode: get(&file_env, "STRATEGY_MODE", "HYBRID_MAKER"),
+            hybrid_trend_min_prob: get_f64(&file_env, "HYBRID_TREND_MIN_PROB", 0.60),
+            hybrid_trend_min_market_edge: get_f64(&file_env, "HYBRID_TREND_MIN_MARKET_EDGE", 0.02),
+            hybrid_range_max_prob: get_f64(&file_env, "HYBRID_RANGE_MAX_PROB", 0.58),
+            hybrid_entry_min_edge: get_f64(&file_env, "HYBRID_ENTRY_MIN_EDGE", 0.02),
+            hybrid_entry_aggression_ticks: get_f64(&file_env, "HYBRID_ENTRY_AGGRESSION_TICKS", 1.0),
+            hybrid_endgame_secs: get_f64(&file_env, "HYBRID_ENDGAME_SECS", 45.0),
+            hybrid_endgame_min_prob: get_f64(&file_env, "HYBRID_ENDGAME_MIN_PROB", 0.70),
             favorite_first_flat: get_bool(&file_env, "FAVORITE_FIRST_FLAT", true),
             enable_directional_edge: get_bool(&file_env, "ENABLE_DIRECTIONAL_EDGE", false),
             min_directional_edge: get_f64(&file_env, "MIN_DIRECTIONAL_EDGE", 0.04),
@@ -267,6 +283,31 @@ impl Config {
         }
         if self.directional_inventory_mult < 0.0 || !self.directional_inventory_mult.is_finite() {
             return Err("DIRECTIONAL_INVENTORY_MULT must be finite and non-negative".into());
+        }
+        let strategy_mode = self.strategy_mode.to_ascii_uppercase();
+        if !matches!(strategy_mode.as_str(), "HYBRID_MAKER" | "LEGACY_V3") {
+            return Err("STRATEGY_MODE must be HYBRID_MAKER or LEGACY_V3".into());
+        }
+        if !(0.0..=1.0).contains(&self.hybrid_trend_min_prob)
+            || !(0.0..=1.0).contains(&self.hybrid_range_max_prob)
+            || !(0.0..=1.0).contains(&self.hybrid_endgame_min_prob)
+        {
+            return Err("HYBRID_*_PROB settings must be finite probabilities in [0, 1]".into());
+        }
+        if self.hybrid_trend_min_market_edge < 0.0
+            || !self.hybrid_trend_min_market_edge.is_finite()
+            || self.hybrid_entry_min_edge < 0.0
+            || !self.hybrid_entry_min_edge.is_finite()
+        {
+            return Err("HYBRID_*_EDGE settings must be finite and non-negative".into());
+        }
+        if self.hybrid_entry_aggression_ticks < 0.0
+            || !self.hybrid_entry_aggression_ticks.is_finite()
+        {
+            return Err("HYBRID_ENTRY_AGGRESSION_TICKS must be finite and non-negative".into());
+        }
+        if self.hybrid_endgame_secs < 0.0 || !self.hybrid_endgame_secs.is_finite() {
+            return Err("HYBRID_ENDGAME_SECS must be finite and non-negative".into());
         }
         Ok(())
     }

@@ -724,6 +724,17 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("MARKET_INTERVAL_MS", "模拟行情间隔毫秒"),
         ("STALE_AFTER_MS", "行情过期毫秒"),
         ("WS_STALE_AFTER_MS", "live WS断流停止毫秒"),
+        ("STRATEGY_MODE", "HYBRID_MAKER新混合策略/LEGACY_V3旧逻辑"),
+        ("HYBRID_TREND_MIN_PROB", "趋势开仓最低模型胜率"),
+        (
+            "HYBRID_TREND_MIN_MARKET_EDGE",
+            "模型胜率需高于盘口隐含胜率多少",
+        ),
+        ("HYBRID_RANGE_MAX_PROB", "震荡锁仓最高胜率阈值"),
+        ("HYBRID_ENTRY_MIN_EDGE", "趋势挂单保留的模型安全垫"),
+        ("HYBRID_ENTRY_AGGRESSION_TICKS", "趋势挂单抬高多少tick"),
+        ("HYBRID_ENDGAME_SECS", "残局高门槛开始秒数"),
+        ("HYBRID_ENDGAME_MIN_PROB", "残局开仓最低模型胜率"),
         ("FAVORITE_FIRST_FLAT", "空仓/已配平时只先挂胜率高的一边"),
     ];
     println!("直接回车表示不修改。");
@@ -787,6 +798,11 @@ fn print_param_help() {
     println!("  ENDGAME_PULL_SECS      剩余秒数<该值撤掉所有单(纯抛硬币区)");
     println!("  INVENTORY_SKEW_TIME_BOOST 库存偏移随临近收盘加码倍数");
     println!("  TOX_*                  逆选择监控:被割就自动加宽价差");
+    println!("  STRATEGY_MODE          HYBRID_MAKER=趋势强边+震荡锁仓; LEGACY_V3=旧逻辑");
+    println!("  HYBRID_TREND_*         趋势开仓阈值:模型胜率和相对盘口edge都要够");
+    println!("  HYBRID_RANGE_MAX_PROB  最高胜率低于该值时按震荡处理,允许双边锁仓");
+    println!("  HYBRID_ENTRY_*         趋势挂单的安全垫和相对买一价的maker抬价tick");
+    println!("  HYBRID_ENDGAME_*       残局开新仓使用更高胜率门槛");
     println!("  FAVORITE_FIRST_FLAT    空仓/已配平时只先挂胜率高的一边，降低低胜率边先成交");
     println!("  ENABLE_DELTA_HEDGE     0=关。对冲为占位骨架，实单模式禁止开启");
 }
@@ -1567,6 +1583,56 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "POST_ONLY_MARGIN_TICKS", "2")?;
     upsert_env_if_missing(path, "REJECT_BACKOFF_MS", "500")?;
     upsert_env_if_missing(path, "MIN_FAIR_TO_QUOTE", "0")?;
+    upsert_env_if_missing(path, "QUOTE_WARMUP_SECS", "25")?;
+    upsert_env_if_missing(path, "REBALANCE_MAX_OVER_FAIR", "0.05")?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "STRATEGY_MODE",
+        "HYBRID_MAKER",
+        "策略模式：HYBRID_MAKER=趋势用maker追强边、震荡双边快速锁仓；LEGACY_V3=旧v3逻辑。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "HYBRID_TREND_MIN_PROB",
+        "0.60",
+        "趋势开仓最低模型胜率。低于这个值不追方向，避免 0.52/0.48 这种震荡假信号。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "HYBRID_TREND_MIN_MARKET_EDGE",
+        "0.02",
+        "趋势开仓要求：模型胜率必须比 Polymarket 盘口隐含胜率至少高多少。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "HYBRID_RANGE_MAX_PROB",
+        "0.58",
+        "震荡锁仓区间：最高胜率不超过该值时，允许同时挂 Up/Down 争取快速配对锁住。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "HYBRID_ENTRY_MIN_EDGE",
+        "0.02",
+        "趋势挂单至少保留多少模型安全垫：挂买价 <= 模型胜率 - 该值。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "HYBRID_ENTRY_AGGRESSION_TICKS",
+        "1",
+        "趋势挂单相对当前买一价抬高多少 tick，仍然受 post-only 和安全垫限制。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "HYBRID_ENDGAME_SECS",
+        "45",
+        "剩余多少秒以内算残局，开新方向仓必须达到更高胜率。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "HYBRID_ENDGAME_MIN_PROB",
+        "0.70",
+        "残局开仓最低模型胜率。",
+    )?;
     upsert_env_if_missing_with_comment(
         path,
         "FAVORITE_FIRST_FLAT",

@@ -339,7 +339,12 @@ pub fn phase_for(tau_sec: f64, reduce_secs: f64, pull_secs: f64) -> Phase {
 /// Whether a given side may be quoted given the current phase and inventory.
 /// In ReduceOnly we only allow the side that brings unmatched inventory toward
 /// zero (i.e. the currently-short side).
-pub fn side_allowed(side_is_up: bool, phase: Phase, up_inventory: f64, down_inventory: f64) -> bool {
+pub fn side_allowed(
+    side_is_up: bool,
+    phase: Phase,
+    up_inventory: f64,
+    down_inventory: f64,
+) -> bool {
     match phase {
         Phase::Normal => true,
         Phase::Pull => false,
@@ -551,7 +556,10 @@ mod tests {
         assert!((free - 0.52).abs() < 1e-9);
         // Cheap existing side leaves room to complete profitably.
         let ok = lock_capped_bid(false, 0.40, 25.0, 25.0 * 0.45, 0.0, 0.0, 0.02);
-        assert!((ok - 0.40).abs() < 1e-9, "0.45+0.40=0.85<0.98, no cap; got {ok}");
+        assert!(
+            (ok - 0.40).abs() < 1e-9,
+            "0.45+0.40=0.85<0.98, no cap; got {ok}"
+        );
     }
 
     #[test]
