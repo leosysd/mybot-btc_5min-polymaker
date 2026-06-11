@@ -20,6 +20,7 @@ use super::state::{
 };
 
 const RECV_TIMEOUT: Duration = Duration::from_millis(250);
+const POSITION_RECONCILE_SETTLE_DELAY: Duration = Duration::from_millis(3_000);
 
 pub fn run(
     cfg: Config,
@@ -62,26 +63,30 @@ pub fn run(
     let mut current_market = String::new();
     let mut up_token = String::new();
     let mut down_token = String::new();
-    // P2: set when the gateway reports an unmatched account fill — forces an
-    // immediate reconcile on the next loop, bypassing the interval timer.
-    let mut force_reconcile = false;
+    // P2: after a real fill, keep placement paused briefly before the
+    // authoritative Data API reconcile. The Data API can lag the user WS by a
+    // couple seconds; reconciling immediately may read a stale position and
+    // release the gate too early.
+    let mut force_reconcile_after: Option<Instant> = None;
 
     while !stopping(&stop, &cfg) {
         // Periodic on-chain position reconciliation (real mode only).
         if let Some(reconciler) = &position_reconciler {
             let interval_due = cfg.reconcile_interval_ms > 0
                 && last_position_sync.elapsed() >= Duration::from_millis(cfg.reconcile_interval_ms);
+            let force_due = force_reconcile_after.is_some_and(|due| Instant::now() >= due);
+            let periodic_allowed = interval_due && force_reconcile_after.is_none();
             let token_ready = (!up_token.trim().is_empty() || !down_token.trim().is_empty())
                 && !current_market.is_empty();
-            if (interval_due || force_reconcile) && token_ready {
+            if (periodic_allowed || force_due) && token_ready {
                 last_position_sync = Instant::now();
                 // Only reconcile when BOTH tokens belong to the SAME market the
                 // shared inventory is currently on — never mix new/old windows.
                 let market_matches = { inventory.lock().unwrap().market == current_market };
                 if market_matches {
-                    force_reconcile = false;
                     match reconciler.fetch(&up_token, &down_token) {
                         Ok(snap) => {
+                            force_reconcile_after = None;
                             let corrected = {
                                 let mut inv = inventory.lock().unwrap();
                                 reconcile_inventory_with_chain(&cfg, &mut inv, &snap)?
@@ -95,12 +100,21 @@ pub fn run(
                                 check_kill_switch(&cfg, &stop, &inv)?;
                             }
                         }
-                        Err(err) => heartbeat(
-                            &cfg,
-                            "risk-ledger",
-                            format!("position reconcile failed: {err}"),
-                        )?,
+                        Err(err) => {
+                            if force_due {
+                                force_reconcile_after =
+                                    Some(Instant::now() + POSITION_RECONCILE_SETTLE_DELAY);
+                            }
+                            heartbeat(
+                                &cfg,
+                                "risk-ledger",
+                                format!("position reconcile failed: {err}"),
+                            )?;
+                        }
                     }
+                } else if force_due {
+                    force_reconcile_after = None;
+                    reconcile_gate.store(false, Ordering::Relaxed);
                 }
             }
         }
@@ -114,6 +128,8 @@ pub fn run(
                     current_market = accepted.quote.market.clone();
                     up_token.clear();
                     down_token.clear();
+                    force_reconcile_after = None;
+                    reconcile_gate.store(false, Ordering::Relaxed);
                 }
                 if !accepted.quote.token_id.trim().is_empty() {
                     match accepted.quote.side.as_str() {
@@ -166,7 +182,8 @@ pub fn run(
                         &mut down_token,
                         &fill,
                     );
-                    force_reconcile = true;
+                    reconcile_gate.store(true, Ordering::Relaxed);
+                    force_reconcile_after = Some(Instant::now() + POSITION_RECONCILE_SETTLE_DELAY);
                 }
                 heartbeat(&cfg, "risk-ledger", "fill accounted")?;
             }
@@ -176,7 +193,7 @@ pub fn run(
                 // real position until we reconcile) and force an immediate
                 // on-chain reconcile; the gate is released once it succeeds.
                 reconcile_gate.store(true, Ordering::Relaxed);
-                force_reconcile = true;
+                force_reconcile_after = Some(Instant::now() + POSITION_RECONCILE_SETTLE_DELAY);
                 heartbeat(
                     &cfg,
                     "risk-ledger",

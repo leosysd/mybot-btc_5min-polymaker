@@ -123,6 +123,7 @@ pub fn run(
             Arc::clone(&order_map),
             gw_tx.clone(),
             ledger_tx.clone(),
+            Arc::clone(&reconcile_gate),
         )?;
     }
 
@@ -227,24 +228,16 @@ pub fn run(
 
             if placement_paused && !pause_cleanup_done {
                 if let Some(real_orders) = real_orders.as_ref() {
-                    if !resting.is_empty() {
-                        heartbeat(
-                            &cfg,
-                            "order-gateway",
-                            "inventory dirty: canceling resting orders before reconcile",
-                        )?;
-                        cancel_all_resting_orders(
-                            &cfg,
-                            &inventory,
-                            real_orders,
-                            &order_map,
-                            &mut resting,
-                            &ledger_tx,
-                            "inventory_dirty",
-                        )?;
-                    }
+                    pause_cleanup_done = sweep_exchange_orders_before_reconcile(
+                        &cfg,
+                        &inventory,
+                        real_orders,
+                        &order_map,
+                        &mut resting,
+                    )?;
+                } else {
+                    pause_cleanup_done = true;
                 }
-                pause_cleanup_done = true;
             }
 
             match quote_rx.recv_timeout(RECV_TIMEOUT) {
@@ -277,6 +270,14 @@ pub fn run(
                         continue;
                     }
                     for (_qside, mut quote) in latest.into_iter() {
+                        if reconcile_gate.load(Ordering::Relaxed) {
+                            heartbeat(
+                                &cfg,
+                                "order-gateway",
+                                "placement paused: fill detected during quote cycle",
+                            )?;
+                            break;
+                        }
                         let age = now_ms().saturating_sub(quote.ts_ms);
                         if age > cfg.stale_after_ms {
                             heartbeat(
@@ -440,6 +441,10 @@ pub fn run(
                             // Old order not confirmed cancelled — it may still be live.
                             // Don't place a second order on this side (would risk a
                             // double-fill past the cap); retry on the next cycle.
+                            continue;
+                        }
+                        if reconcile_gate.load(Ordering::Relaxed) {
+                            heartbeat(&cfg, "order-gateway", "placement paused before order post")?;
                             continue;
                         }
                         if !accept_resting_order(
@@ -957,6 +962,43 @@ fn cancel_all_resting_orders(
     Ok(())
 }
 
+fn sweep_exchange_orders_before_reconcile(
+    cfg: &Config,
+    inventory: &SharedInventory,
+    real_orders: &RealOrderClient,
+    order_map: &SharedOrderMap,
+    resting: &mut HashMap<String, RestingOrder>,
+) -> AppResult<bool> {
+    heartbeat(
+        cfg,
+        "order-gateway",
+        "inventory dirty: sweeping exchange open orders before reconcile",
+    )?;
+    match real_orders.cancel_all() {
+        Ok(n) => {
+            heartbeat(
+                cfg,
+                "order-gateway",
+                format!("inventory dirty: exchange sweep canceled {n}"),
+            )?;
+            resting.clear();
+            order_map.lock().unwrap().clear();
+            persist_active_orders_if_real(cfg, Some(real_orders), resting)?;
+            let mut inv = inventory.lock().unwrap();
+            recompute_pending_from_resting(&mut inv, resting);
+            Ok(true)
+        }
+        Err(err) => {
+            heartbeat(
+                cfg,
+                "order-gateway",
+                format!("inventory dirty: exchange sweep failed: {err}"),
+            )?;
+            Ok(false)
+        }
+    }
+}
+
 /// Returns Ok(true) if the cancel reached a CONFIRMED-terminal state (canceled,
 /// already-gone, filled, etc.) so the caller may release the order's pending.
 /// Returns Err if the cancel was actively rejected (order may still be live).
@@ -1118,6 +1160,7 @@ fn start_user_channel(
     order_map: SharedOrderMap,
     gw_tx: GatewayTx,
     ledger_tx: LedgerTx,
+    reconcile_gate: ReconcileGate,
 ) -> AppResult<()> {
     let cfg = cfg.clone();
     thread::spawn(move || {
@@ -1129,6 +1172,7 @@ fn start_user_channel(
             order_map,
             gw_tx,
             ledger_tx,
+            reconcile_gate,
         )
     });
     Ok(())
@@ -1143,6 +1187,7 @@ fn user_channel_loop(
     order_map: SharedOrderMap,
     gw_tx: GatewayTx,
     ledger_tx: LedgerTx,
+    reconcile_gate: ReconcileGate,
 ) {
     // Trade dedup MUST persist across reconnects: when the user WS drops and
     // reconnects, the exchange can replay recent (partial) fills. A per-
@@ -1157,6 +1202,7 @@ fn user_channel_loop(
             &order_map,
             &gw_tx,
             &ledger_tx,
+            &reconcile_gate,
             &mut seen_trades,
         ) {
             let _ = heartbeat(&cfg, "order-gateway", format!("user ws reconnect: {err}"));
@@ -1174,6 +1220,7 @@ fn user_channel_once(
     order_map: &SharedOrderMap,
     gw_tx: &GatewayTx,
     ledger_tx: &LedgerTx,
+    reconcile_gate: &ReconcileGate,
     seen_trades: &mut HashSet<String>,
 ) -> AppResult<()> {
     let (mut socket, _) = connect(cfg.polymarket_user_ws_url.as_str())?;
@@ -1246,6 +1293,7 @@ fn user_channel_once(
                         order_map,
                         gw_tx,
                         ledger_tx,
+                        reconcile_gate,
                         seen_trades,
                         &value,
                     )?;
@@ -1282,6 +1330,7 @@ fn apply_user_channel_message(
     order_map: &SharedOrderMap,
     gw_tx: &GatewayTx,
     ledger_tx: &LedgerTx,
+    reconcile_gate: &ReconcileGate,
     seen_trades: &mut HashSet<String>,
     value: &Value,
 ) -> AppResult<()> {
@@ -1293,6 +1342,7 @@ fn apply_user_channel_message(
                 order_map,
                 gw_tx,
                 ledger_tx,
+                reconcile_gate,
                 seen_trades,
                 item,
             )?;
@@ -1311,6 +1361,7 @@ fn apply_user_channel_message(
             order_map,
             gw_tx,
             ledger_tx,
+            reconcile_gate,
             seen_trades,
             value,
         )?;
@@ -1327,6 +1378,7 @@ fn handle_user_trade(
     order_map: &SharedOrderMap,
     gw_tx: &GatewayTx,
     ledger_tx: &LedgerTx,
+    reconcile_gate: &ReconcileGate,
     seen_trades: &mut HashSet<String>,
     value: &Value,
 ) -> AppResult<()> {
@@ -1384,7 +1436,15 @@ fn handle_user_trade(
                 .or_else(|| parse_f64_value(value.get("price")))
                 .unwrap_or(0.0);
             emit_user_fill(
-                cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size,
+                cfg,
+                inventory,
+                order_map,
+                gw_tx,
+                ledger_tx,
+                reconcile_gate,
+                order_id,
+                price,
+                size,
             )?;
         }
         let must_reconcile = owned_unknown_hint.or_else(|| {
@@ -1414,7 +1474,15 @@ fn handle_user_trade(
         let price = parse_f64_value(value.get("price")).unwrap_or(0.0);
         let size = parse_f64_value(value.get("size")).unwrap_or(0.0);
         emit_user_fill(
-            cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size,
+            cfg,
+            inventory,
+            order_map,
+            gw_tx,
+            ledger_tx,
+            reconcile_gate,
+            order_id,
+            price,
+            size,
         )?;
     }
     Ok(())
@@ -1505,6 +1573,7 @@ fn emit_user_fill(
     order_map: &SharedOrderMap,
     gw_tx: &GatewayTx,
     ledger_tx: &LedgerTx,
+    reconcile_gate: &ReconcileGate,
     order_id: &str,
     price: f64,
     size: f64,
@@ -1536,6 +1605,7 @@ fn emit_user_fill(
     if fill_size <= 0.001 {
         return Ok(());
     }
+    reconcile_gate.store(true, Ordering::Relaxed);
     let fill = FillEvent {
         quote_id: meta.quote_id,
         ts_ms: now_ms(),
@@ -1864,6 +1934,7 @@ mod tests {
         );
         let (gw_tx, _gw_rx) = std::sync::mpsc::channel();
         let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
+        let reconcile_gate: ReconcileGate = Arc::new(AtomicBool::new(false));
         let mut seen = HashSet::new();
         let event = serde_json::json!({
             "id": "trade-1",
@@ -1875,11 +1946,19 @@ mod tests {
         });
 
         handle_user_trade(
-            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+            &cfg,
+            &inventory,
+            &order_map,
+            &gw_tx,
+            &ledger_tx,
+            &reconcile_gate,
+            &mut seen,
+            &event,
         )
         .unwrap();
 
         assert_eq!(inventory.lock().unwrap().up_shares, 5.0);
+        assert!(reconcile_gate.load(Ordering::Relaxed));
         assert!(matches!(
             ledger_rx.try_recv().expect("known maker fill"),
             LedgerEvent::Filled(fill) if fill.quote_id == "q-ours" && (fill.size - 5.0).abs() < 1e-9
@@ -1915,6 +1994,7 @@ mod tests {
         );
         let (gw_tx, _gw_rx) = std::sync::mpsc::channel();
         let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
+        let reconcile_gate: ReconcileGate = Arc::new(AtomicBool::new(false));
         let mut seen = HashSet::new();
         let event = serde_json::json!({
             "id": "trade-mixed-owned",
@@ -1931,7 +2011,14 @@ mod tests {
         });
 
         handle_user_trade(
-            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+            &cfg,
+            &inventory,
+            &order_map,
+            &gw_tx,
+            &ledger_tx,
+            &reconcile_gate,
+            &mut seen,
+            &event,
         )
         .unwrap();
 
@@ -1955,6 +2042,7 @@ mod tests {
         let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
         let (gw_tx, _gw_rx) = std::sync::mpsc::channel();
         let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
+        let reconcile_gate: ReconcileGate = Arc::new(AtomicBool::new(false));
         let mut seen = HashSet::new();
         let event = serde_json::json!({
             "id": "trade-lost-local-state",
@@ -1965,7 +2053,14 @@ mod tests {
         });
 
         handle_user_trade(
-            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+            &cfg,
+            &inventory,
+            &order_map,
+            &gw_tx,
+            &ledger_tx,
+            &reconcile_gate,
+            &mut seen,
+            &event,
         )
         .unwrap();
 
@@ -1980,7 +2075,14 @@ mod tests {
         ));
 
         handle_user_trade(
-            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+            &cfg,
+            &inventory,
+            &order_map,
+            &gw_tx,
+            &ledger_tx,
+            &reconcile_gate,
+            &mut seen,
+            &event,
         )
         .unwrap();
         assert!(
