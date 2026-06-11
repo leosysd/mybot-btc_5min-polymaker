@@ -77,6 +77,9 @@ pub struct Config {
     pub market_anchor_weight_low: f64,
     pub market_anchor_low_side_below: f64,
     pub market_anchor_max_spread: f64,
+    pub momentum_shadow: bool,
+    pub momentum_weight: f64,
+    pub momentum_scale_usd_per_sec: f64,
     pub enable_real_orders: String,
     pub polymarket_clob_host: String,
     pub poly_private_key: String,
@@ -194,6 +197,9 @@ impl Config {
             ),
             market_anchor_low_side_below: get_f64(&file_env, "MARKET_ANCHOR_LOW_SIDE_BELOW", 0.50),
             market_anchor_max_spread: get_f64(&file_env, "MARKET_ANCHOR_MAX_SPREAD", 0.12),
+            momentum_shadow: get_bool(&file_env, "MOMENTUM_SHADOW", true),
+            momentum_weight: get_f64(&file_env, "MOMENTUM_WEIGHT", 0.08),
+            momentum_scale_usd_per_sec: get_f64(&file_env, "MOMENTUM_SCALE_USD_PER_SEC", 8.0),
             enable_real_orders: get(&file_env, "ENABLE_REAL_ORDERS", ""),
             polymarket_clob_host: get(
                 &file_env,
@@ -323,6 +329,12 @@ impl Config {
             || !self.market_anchor_max_spread.is_finite()
         {
             return Err("MARKET_ANCHOR_MAX_SPREAD must be finite and in (0, 1]".into());
+        }
+        if !(0.0..=0.5).contains(&self.momentum_weight) || !self.momentum_weight.is_finite() {
+            return Err("MOMENTUM_WEIGHT must be finite and in [0, 0.5]".into());
+        }
+        if self.momentum_scale_usd_per_sec <= 0.0 || !self.momentum_scale_usd_per_sec.is_finite() {
+            return Err("MOMENTUM_SCALE_USD_PER_SEC must be positive".into());
         }
         Ok(())
     }

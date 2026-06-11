@@ -449,6 +449,9 @@ MARKET_ANCHOR_WEIGHT_HIGH=0.30
 MARKET_ANCHOR_WEIGHT_LOW=0.60
 MARKET_ANCHOR_LOW_SIDE_BELOW=0.50
 MARKET_ANCHOR_MAX_SPREAD=0.12
+MOMENTUM_SHADOW=1
+MOMENTUM_WEIGHT=0.08
+MOMENTUM_SCALE_USD_PER_SEC=8
 ```
 
 盘口锚定胜率。默认只记录影子融合胜率，不改变实盘报价：
@@ -459,6 +462,8 @@ Down边fair = 模型Down * (1 - Down边权重) + 盘口Down * Down边权重
 ```
 
 `MARKET_ANCHOR_WEIGHT_HIGH` 用在模型高胜率边，默认 0.30，保留模型自己的优势；`MARKET_ANCHOR_WEIGHT_LOW` 用在模型低胜率边，默认 0.60，让对边更多参考盘口，避免“盘口 25、模型只挂 5”这种差太远的报价。`MARKET_ANCHOR_LOW_SIDE_BELOW=0.50` 表示模型胜率低于 50% 的一边按 LOW 权重处理。实际权重会随盘口健康度变化；bid/ask 越窄，权重越接近 HIGH/LOW 设定，价差超过 `MARKET_ANCHOR_MAX_SPREAD` 时权重归零。只有把 `ENABLE_MARKET_ANCHOR=1` 后，quote-engine 才会用融合后的单边 fair 参与真实报价。`polymaker model-market` 会显示影子 `FinalUp` 方便先观察。
+
+`MOMENTUM_SHADOW=1` 会记录短线动量影子胜率，不改变真实报价。collector 从 Binance BTC 价计算 `mom_1s/mom_3s/mom_10s/accel`；quote-engine 写入 `quotes.jsonl` 的 `momentum_up_shadow`。`MOMENTUM_WEIGHT=0.08` 表示动量最多把 Up 胜率上/下修 8 分；`MOMENTUM_SCALE_USD_PER_SEC=8` 表示 BTC 每秒约 8 美元趋势会被视为强动量。阶段 2 默认只观察它是否能更早反映单边趋势，确认有效后再考虑让真实报价使用它。
 
 ```text
 MIN_BID=0.05

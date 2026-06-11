@@ -207,6 +207,13 @@ ensure_env_defaults() {
     append_env_line MARKET_ANCHOR_MAX_SPREAD "# 盘口价差超过该值时锚定权重归零。" "MARKET_ANCHOR_MAX_SPREAD=0.12"
   fi
 
+  if section_has_missing MOMENTUM_SHADOW MOMENTUM_WEIGHT MOMENTUM_SCALE_USD_PER_SEC; then
+    append_section_header "# ── 短线动量影子胜率（install.sh 自动补齐）──────────────────"
+    append_env_line MOMENTUM_SHADOW "# 1=记录动量影子胜率，不改变真实报价。" "MOMENTUM_SHADOW=1"
+    append_env_line MOMENTUM_WEIGHT "# 动量最多把Up胜率上/下修多少；0.08=最多8分。" "MOMENTUM_WEIGHT=0.08"
+    append_env_line MOMENTUM_SCALE_USD_PER_SEC "# BTC每秒约多少美元趋势视为强动量；越小越敏感。" "MOMENTUM_SCALE_USD_PER_SEC=8"
+  fi
+
   if section_has_missing MIN_FAIR_TO_QUOTE; then
     append_section_header "# ── 最低胜率门槛（install.sh 自动补齐）──────────────────────"
     append_env_line MIN_FAIR_TO_QUOTE "# 某边胜率低于此值就不报该边(不碰深度劣势方)。0=关;建议 0.25~0.35。" "MIN_FAIR_TO_QUOTE=0"

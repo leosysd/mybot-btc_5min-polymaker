@@ -7,6 +7,7 @@ use crate::ipc::{heartbeat, now_ms, MarketFrame};
 use crate::pricing::{digital_p_up, uncertainty_width, VolEstimator};
 use crate::AppResult;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -18,6 +19,74 @@ use super::state::{
 };
 
 const WS_OPEN_CAPTURE_GRACE_SECS: u64 = 5;
+const MOMENTUM_HISTORY_MS: u64 = 12_000;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MomentumSnapshot {
+    mom_1s: f64,
+    mom_3s: f64,
+    mom_10s: f64,
+    accel: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MomentumTracker {
+    points: VecDeque<(u64, f64)>,
+    prev_mom_1s: f64,
+    snapshot: MomentumSnapshot,
+}
+
+impl MomentumTracker {
+    fn record(&mut self, ts_ms: u64, price: f64) -> MomentumSnapshot {
+        if !price.is_finite() || price <= 0.0 {
+            return self.snapshot;
+        }
+        self.points.push_back((ts_ms, price));
+        while self.points.len() > 1
+            && self
+                .points
+                .front()
+                .is_some_and(|(ts, _)| ts.saturating_add(MOMENTUM_HISTORY_MS) < ts_ms)
+        {
+            self.points.pop_front();
+        }
+
+        let mom_1s = price
+            - self
+                .price_at_or_before(ts_ms.saturating_sub(1_000))
+                .unwrap_or(price);
+        let mom_3s = price
+            - self
+                .price_at_or_before(ts_ms.saturating_sub(3_000))
+                .unwrap_or(price);
+        let mom_10s = price
+            - self
+                .price_at_or_before(ts_ms.saturating_sub(10_000))
+                .unwrap_or(price);
+        let accel = mom_1s - self.prev_mom_1s;
+        self.prev_mom_1s = mom_1s;
+        self.snapshot = MomentumSnapshot {
+            mom_1s,
+            mom_3s,
+            mom_10s,
+            accel,
+        };
+        self.snapshot
+    }
+
+    fn snapshot(&self) -> MomentumSnapshot {
+        self.snapshot
+    }
+
+    fn price_at_or_before(&self, target_ms: u64) -> Option<f64> {
+        self.points
+            .iter()
+            .rev()
+            .find(|(ts, _)| *ts <= target_ms)
+            .map(|(_, price)| *price)
+            .or_else(|| self.points.front().map(|(_, price)| *price))
+    }
+}
 
 /// Entry point for the collector thread. Picks sim vs live mode, retrying the
 /// live path until stopped (mirrors the old per-process retry loop).
@@ -55,13 +124,16 @@ fn run_sim_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResul
     let mut window_start = (now_ms() / 1000) / window * window;
     let mut price_to_beat = center;
     let mut window_initialized = false;
+    let mut momentum = MomentumTracker::default();
 
     while !stopping(stop, cfg) {
         let phase = step as f64 / 9.0;
         let btc_price = center + 42.0 * phase.sin() + 15.0 * (phase * 0.37).cos();
+        let now = now_ms();
+        let mom = momentum.record(now, btc_price);
         let vol_now = vol.update(btc_price, dt_sec);
 
-        let now_s = now_ms() / 1000;
+        let now_s = now / 1000;
         let this_window = now_s / window * window;
         if !window_initialized || this_window != window_start {
             window_start = this_window;
@@ -69,7 +141,7 @@ fn run_sim_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResul
             window_initialized = true;
         }
         let window_end_ms = (window_start + window) * 1000;
-        let tau_seconds = ((window_end_ms.saturating_sub(now_ms())) as f64 / 1000.0).max(0.0);
+        let tau_seconds = ((window_end_ms.saturating_sub(now)) as f64 / 1000.0).max(0.0);
 
         // Bracket the time-aware fair value so the simulated book is sensible.
         let w = uncertainty_width(vol_now, tau_seconds, cfg.width_floor_usd);
@@ -78,7 +150,7 @@ fn run_sim_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResul
         let up_ask = (fair_up + 0.035 + micro_noise).clamp(0.03, 0.97);
         let down_ask = (1.0 - fair_up + 0.035 - micro_noise).clamp(0.03, 0.97);
         let frame = MarketFrame {
-            ts_ms: now_ms(),
+            ts_ms: now,
             market: cfg.market_slug.clone(),
             condition_id: String::new(),
             up_token_id: cfg.polymarket_up_token_id.clone(),
@@ -91,6 +163,10 @@ fn run_sim_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResul
             price_to_beat,
             tau_seconds,
             vol_per_sqrt_sec: vol_now,
+            mom_1s: mom.mom_1s,
+            mom_3s: mom.mom_3s,
+            mom_10s: mom.mom_10s,
+            accel: mom.accel,
             source: "simulated_collector".to_string(),
         };
         match tx.send(frame.clone()) {
@@ -225,6 +301,7 @@ struct LiveMarketState {
     last_btc_ts: u64,
     last_polymarket_ts: u64,
     vol: VolEstimator,
+    momentum: MomentumTracker,
 }
 
 impl LiveMarketState {
@@ -254,6 +331,7 @@ impl LiveMarketState {
             }
         }
         self.vol.update(price, dt_sec);
+        self.momentum.record(now, price);
         self.btc_price = price;
         self.btc_source = source.to_string();
         self.last_btc_ts = now;
@@ -297,6 +375,7 @@ impl LiveMarketState {
                 cfg.vol_min_per_sqrt_sec,
                 cfg.vol_max_per_sqrt_sec,
             ),
+            momentum: MomentumTracker::default(),
         }
     }
 
@@ -315,6 +394,7 @@ impl LiveMarketState {
         }
         let window_end_ms = market.window_end_s.saturating_mul(1000);
         let tau_seconds = (window_end_ms.saturating_sub(now) as f64 / 1000.0).max(0.0);
+        let mom = self.momentum.snapshot();
         Some(MarketFrame {
             ts_ms: now,
             market: market.slug.clone(),
@@ -329,6 +409,10 @@ impl LiveMarketState {
             price_to_beat: market.price_to_beat,
             tau_seconds,
             vol_per_sqrt_sec: self.vol.current(),
+            mom_1s: mom.mom_1s,
+            mom_3s: mom.mom_3s,
+            mom_10s: mom.mom_10s,
+            accel: mom.accel,
             source: if cfg.auto_discover_market {
                 format!("auto_gamma_polymarket_{}", self.btc_source)
             } else {
@@ -995,6 +1079,20 @@ mod tests {
         ]);
         assert_eq!(parse_binance_kline_open(&rows, 1_000_000), Some(101.25));
         assert_eq!(parse_binance_kline_open(&rows, 1_120_000), None);
+    }
+
+    #[test]
+    fn momentum_tracker_reports_recent_price_slopes() {
+        let mut tracker = MomentumTracker::default();
+        tracker.record(1_000, 100.0);
+        tracker.record(2_000, 102.0);
+        tracker.record(4_000, 108.0);
+        let snap = tracker.record(11_000, 120.0);
+
+        assert!((snap.mom_1s - 12.0).abs() < 1e-9);
+        assert!((snap.mom_3s - 12.0).abs() < 1e-9);
+        assert!((snap.mom_10s - 20.0).abs() < 1e-9);
+        assert!(snap.accel > 0.0);
     }
 
     #[test]

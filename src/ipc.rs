@@ -34,6 +34,18 @@ pub struct MarketFrame {
     /// Adaptive BTC dollar volatility per sqrt-second (sigma_$), from collector.
     #[serde(default)]
     pub vol_per_sqrt_sec: f64,
+    /// BTC price change over the last 1 second, in dollars.
+    #[serde(default)]
+    pub mom_1s: f64,
+    /// BTC price change over the last 3 seconds, in dollars.
+    #[serde(default)]
+    pub mom_3s: f64,
+    /// BTC price change over the last 10 seconds, in dollars.
+    #[serde(default)]
+    pub mom_10s: f64,
+    /// Change in 1-second momentum versus the previous BTC tick.
+    #[serde(default)]
+    pub accel: f64,
     pub source: String,
 }
 
@@ -57,6 +69,20 @@ pub struct QuoteIntent {
     pub market_up: f64,
     #[serde(default)]
     pub final_up_shadow: f64,
+    #[serde(default)]
+    pub momentum_up_shadow: f64,
+    #[serde(default)]
+    pub momentum_delta: f64,
+    #[serde(default)]
+    pub momentum_score: f64,
+    #[serde(default)]
+    pub mom_1s: f64,
+    #[serde(default)]
+    pub mom_3s: f64,
+    #[serde(default)]
+    pub mom_10s: f64,
+    #[serde(default)]
+    pub accel: f64,
     #[serde(default)]
     pub market_anchor_weight: f64,
     #[serde(default)]

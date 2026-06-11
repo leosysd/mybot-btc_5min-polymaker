@@ -187,6 +187,38 @@ impl FairSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MomentumShadow {
+    up: f64,
+    delta: f64,
+    score: f64,
+}
+
+fn momentum_shadow(cfg: &Config, frame: &MarketFrame, model_up: f64) -> MomentumShadow {
+    if !cfg.momentum_shadow {
+        return MomentumShadow {
+            up: model_up,
+            delta: 0.0,
+            score: 0.0,
+        };
+    }
+    let trend_per_sec = 0.50 * frame.mom_1s
+        + 0.35 * (frame.mom_3s / 3.0)
+        + 0.15 * (frame.mom_10s / 10.0)
+        + 0.25 * frame.accel;
+    let score = if trend_per_sec.is_finite() {
+        (trend_per_sec / cfg.momentum_scale_usd_per_sec).tanh()
+    } else {
+        0.0
+    };
+    let delta = score * cfg.momentum_weight;
+    MomentumShadow {
+        up: (model_up + delta).clamp(0.0001, 0.9999),
+        delta,
+        score,
+    }
+}
+
 fn side_anchor_weight(cfg: &Config, side_model_fair: f64, spread: f64) -> f64 {
     let max_weight = if side_model_fair < cfg.market_anchor_low_side_below {
         cfg.market_anchor_weight_low
@@ -351,6 +383,7 @@ fn handle_market_frame(
     let width = uncertainty_width(vol, tau, cfg.width_floor_usd);
     let p_model_up = digital_p_up(frame.btc_price, frame.price_to_beat, width);
     let fair = fair_snapshot(cfg, frame, p_model_up);
+    let momentum = momentum_shadow(cfg, frame, p_model_up);
     let p_up = fair.composite_up();
 
     // ── 2. Toxicity feedback: settle matured fills, get any extra widening.
@@ -412,6 +445,7 @@ fn handle_market_frame(
             inventory,
             reason,
             fair,
+            momentum,
         )?;
     }
     if let Some(px) = down_px {
@@ -425,6 +459,7 @@ fn handle_market_frame(
             inventory,
             reason,
             fair,
+            momentum,
         )?;
     }
     Ok(p_up)
@@ -441,6 +476,7 @@ fn send_quote(
     inventory: &Inventory,
     reason: &str,
     fair_snapshot: FairSnapshot,
+    momentum: MomentumShadow,
 ) -> AppResult<()> {
     let size = cfg.quote_size.round().max(1.0);
     if !unpaired_limit_allows(cfg, inventory, side, size) {
@@ -472,6 +508,13 @@ fn send_quote(
         model_up: fair_snapshot.model_up,
         market_up: fair_snapshot.market_up,
         final_up_shadow: fair_snapshot.final_up_shadow(),
+        momentum_up_shadow: momentum.up,
+        momentum_delta: momentum.delta,
+        momentum_score: momentum.score,
+        mom_1s: frame.mom_1s,
+        mom_3s: frame.mom_3s,
+        mom_10s: frame.mom_10s,
+        accel: frame.accel,
         market_anchor_weight: fair_snapshot.side_anchor_weight(side),
         fair_source: fair_snapshot.fair_source(side).to_string(),
         inventory_up: inventory.effective_up(),
@@ -543,6 +586,10 @@ mod tests {
             price_to_beat: 100.0,
             tau_seconds: 120.0,
             vol_per_sqrt_sec: 1.5,
+            mom_1s: 0.0,
+            mom_3s: 0.0,
+            mom_10s: 0.0,
+            accel: 0.0,
             source: "test".to_string(),
         }
     }
@@ -617,6 +664,49 @@ mod tests {
         assert!(
             fair.quote_up() > 0.70,
             "favorite side still stays anchored above the market favorite fair"
+        );
+    }
+
+    #[test]
+    fn momentum_shadow_logs_trend_without_changing_quote_fair() {
+        let cfg = value_buy_quote_test_cfg();
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        };
+        let mut frame = flat_frame(100.0);
+        frame.mom_1s = 12.0;
+        frame.mom_3s = 24.0;
+        frame.mom_10s = 45.0;
+        frame.accel = 5.0;
+        let model_up = digital_p_up(
+            frame.btc_price,
+            frame.price_to_beat,
+            uncertainty_width(
+                frame.vol_per_sqrt_sec,
+                frame.tau_seconds,
+                cfg.width_floor_usd,
+            ),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("value quote");
+        assert!(
+            quote.momentum_up_shadow > quote.model_up,
+            "positive BTC momentum should move the shadow Up probability higher"
+        );
+        assert!((quote.model_up - model_up).abs() < 1e-9);
+        let expected_fair = if quote.side == "Up" {
+            quote.model_up
+        } else {
+            1.0 - quote.model_up
+        };
+        assert!(
+            (quote.fair - expected_fair).abs() < 1e-9,
+            "shadow momentum must not change live quote fair yet"
         );
     }
 

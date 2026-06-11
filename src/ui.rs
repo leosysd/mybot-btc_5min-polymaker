@@ -309,6 +309,7 @@ fn print_latest_market(cfg: &Config) -> AppResult<()> {
             ("UpAsk".to_string(), 7, Align::Right),
             ("DnBid".to_string(), 7, Align::Right),
             ("DnAsk".to_string(), 7, Align::Right),
+            ("Mom1s".to_string(), 8, Align::Right),
             ("来源".to_string(), 20, Align::Left),
         ])
     );
@@ -322,6 +323,7 @@ fn print_latest_market(cfg: &Config) -> AppResult<()> {
                 (format!("{:.3}", r.up_ask), 7, Align::Right),
                 (format_market_px(r.down_bid), 7, Align::Right),
                 (format!("{:.3}", r.down_ask), 7, Align::Right),
+                (format!("{:+.1}", r.mom_1s), 8, Align::Right),
                 (r.source, 20, Align::Left),
             ])
         );
@@ -341,6 +343,7 @@ fn print_latest_quotes(cfg: &Config) -> AppResult<()> {
             ("价格".to_string(), 7, Align::Right),
             ("份额".to_string(), 6, Align::Right),
             ("fair".to_string(), 7, Align::Right),
+            ("MomUp".to_string(), 7, Align::Right),
             ("Up仓".to_string(), 8, Align::Right),
             ("Dn仓".to_string(), 8, Align::Right),
         ])
@@ -354,6 +357,7 @@ fn print_latest_quotes(cfg: &Config) -> AppResult<()> {
                 (format!("{:.3}", r.price), 7, Align::Right),
                 (format!("{:.0}", r.size), 6, Align::Right),
                 (format!("{:.3}", r.fair), 7, Align::Right),
+                (format!("{:.3}", r.momentum_up_shadow), 7, Align::Right),
                 (format!("{:.0}", r.inventory_up), 8, Align::Right),
                 (format!("{:.0}", r.inventory_down), 8, Align::Right),
             ])
@@ -740,6 +744,9 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("MARKET_ANCHOR_WEIGHT_LOW", "模型低胜率边盘口锚定权重"),
         ("MARKET_ANCHOR_LOW_SIDE_BELOW", "低胜率边判定阈值"),
         ("MARKET_ANCHOR_MAX_SPREAD", "盘口健康价差上限"),
+        ("MOMENTUM_SHADOW", "1=记录短线动量影子胜率"),
+        ("MOMENTUM_WEIGHT", "动量最多修正多少胜率"),
+        ("MOMENTUM_SCALE_USD_PER_SEC", "BTC每秒多少美元算强动量"),
     ];
     println!("直接回车表示不修改。");
     for (key, desc) in keys {
@@ -812,6 +819,9 @@ fn print_param_help() {
     println!("  MARKET_ANCHOR_WEIGHT_LOW  模型低胜率边盘口锚定权重");
     println!("  MARKET_ANCHOR_LOW_SIDE_BELOW 低于该模型胜率的一边按LOW权重");
     println!("  MARKET_ANCHOR_MAX_SPREAD 盘口健康价差上限,超过则权重归零");
+    println!("  MOMENTUM_SHADOW       1=记录短线动量影子胜率,不改变报价");
+    println!("  MOMENTUM_WEIGHT       动量最多把Up胜率上/下修多少,0.08=8分");
+    println!("  MOMENTUM_SCALE_USD_PER_SEC BTC每秒多少美元趋势视为强动量");
     println!("  ENABLE_DELTA_HEDGE     0=关。对冲为占位骨架，实单模式禁止开启");
 }
 
@@ -1842,6 +1852,10 @@ mod tests {
             price_to_beat: 99.0,
             tau_seconds,
             vol_per_sqrt_sec: 0.0,
+            mom_1s: 0.0,
+            mom_3s: 0.0,
+            mom_10s: 0.0,
+            accel: 0.0,
             source: String::new(),
         }
     }
@@ -2009,6 +2023,24 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
         "MARKET_ANCHOR_MAX_SPREAD",
         "0.12",
         "盘口健康价差上限；超过该价差则盘口锚定权重降为0。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "MOMENTUM_SHADOW",
+        "1",
+        "1=记录短线动量影子胜率，不改变真实报价。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "MOMENTUM_WEIGHT",
+        "0.08",
+        "动量最多把Up胜率上/下修多少；0.08=最多8分。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "MOMENTUM_SCALE_USD_PER_SEC",
+        "8",
+        "BTC每秒约多少美元趋势视为强动量；越小越敏感。",
     )?;
     Ok(())
 }
