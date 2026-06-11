@@ -238,7 +238,7 @@ fn check_kill_switch(cfg: &Config, stop: &StopFlag, inventory: &Inventory) -> Ap
     }
 
     let total_inventory = inventory.effective_up() + inventory.effective_down();
-    if cfg.max_total_inventory > 0.0 && total_inventory >= cfg.max_total_inventory {
+    if max_total_inventory_exceeded(cfg, inventory) {
         heartbeat(
             cfg,
             "risk-ledger",
@@ -247,4 +247,47 @@ fn check_kill_switch(cfg: &Config, stop: &StopFlag, inventory: &Inventory) -> Ap
         request_stop(stop, cfg)?;
     }
     Ok(())
+}
+
+fn max_total_inventory_exceeded(cfg: &Config, inventory: &Inventory) -> bool {
+    if cfg.max_total_inventory <= 0.0 {
+        return false;
+    }
+    let total_inventory = inventory.effective_up() + inventory.effective_down();
+    total_inventory > cfg.max_total_inventory + 1e-9
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_cfg() -> Config {
+        Config::from_env().expect("config")
+    }
+
+    #[test]
+    fn max_total_inventory_allows_exact_limit() {
+        let mut cfg = test_cfg();
+        cfg.max_total_inventory = 40.0;
+        let inv = Inventory {
+            up_shares: 20.0,
+            down_shares: 20.0,
+            ..Default::default()
+        };
+
+        assert!(!max_total_inventory_exceeded(&cfg, &inv));
+    }
+
+    #[test]
+    fn max_total_inventory_blocks_above_limit() {
+        let mut cfg = test_cfg();
+        cfg.max_total_inventory = 40.0;
+        let inv = Inventory {
+            up_shares: 20.01,
+            down_shares: 20.0,
+            ..Default::default()
+        };
+
+        assert!(max_total_inventory_exceeded(&cfg, &inv));
+    }
 }
