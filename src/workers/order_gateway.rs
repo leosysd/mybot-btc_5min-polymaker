@@ -7,7 +7,7 @@
 //! to `resting` is reflected into the shared inventory's pending immediately
 //! under the lock, so the cap can never be beaten by lag/churn.
 
-use crate::config::Config;
+use crate::config::{Config, MIN_ORDER_SIZE_SHARES};
 use crate::ipc::{
     heartbeat, now_ms, write_json, FillEvent, Inventory, OrderAccepted, OrderCancelled, QuoteIntent,
 };
@@ -35,6 +35,26 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 /// Max time placement stays paused awaiting reconcile before self-clearing, so a
 /// reconcile that can't run (e.g. tokens not yet learned) never deadlocks us.
 const RECONCILE_PAUSE_TIMEOUT: Duration = Duration::from_millis(5_000);
+
+fn min_order_size(cfg: &Config) -> f64 {
+    if cfg.real_orders_enabled() {
+        MIN_ORDER_SIZE_SHARES
+    } else {
+        1.0
+    }
+}
+
+fn cap_quote_to_side_room(cfg: &Config, quote: &mut QuoteIntent, held: f64, pending: f64) -> bool {
+    let min_size = min_order_size(cfg);
+    let room = (cfg.max_side_inventory() - held - pending).floor();
+    if room + 1e-9 < min_size {
+        return false;
+    }
+    if room + 1e-9 < quote.size {
+        quote.size = room;
+    }
+    quote.size + 1e-9 >= min_size
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -266,22 +286,34 @@ pub fn run(
                             )
                         };
                         // Counts OUTSTANDING orders, so churn/lag cannot exceed the cap.
-                        let side_cap_room = cfg.max_side_inventory() - held - pending;
-                        let room = side_cap_room.floor();
-                        // Skip unless there's room for a FULL quote. Posting the
-                        // leftover (e.g. 2 shares when room=2) is below the exchange
-                        // minimum order size and gets rejected ("Size lower than
-                        // minimum: 5"), spamming the log and risking rate limits.
-                        if room < quote.size {
+                        // If a partial fill leaves enough residual room for a valid
+                        // exchange order, trim the next quote to that room so the
+                        // lagging leg can be topped up instead of getting stuck.
+                        let original_size = quote.size;
+                        if !cap_quote_to_side_room(&cfg, &mut quote, held, pending) {
                             heartbeat(
-                            &cfg,
-                            "order-gateway",
-                            format!(
-                                "side cap reached {} held={:.0} pending={:.0} room={:.0} (need {:.0})",
-                                quote.side, held, pending, room, quote.size
-                            ),
-                        )?;
+                                &cfg,
+                                "order-gateway",
+                                format!(
+                                    "side cap reached {} held={:.2} pending={:.2} room={:.0} (min {:.0})",
+                                    quote.side,
+                                    held,
+                                    pending,
+                                    (cfg.max_side_inventory() - held - pending).floor(),
+                                    min_order_size(&cfg)
+                                ),
+                            )?;
                             continue;
+                        }
+                        if quote.size + 1e-9 < original_size {
+                            heartbeat(
+                                &cfg,
+                                "order-gateway",
+                                format!(
+                                    "side cap trims {} size {:.2}->{:.2} held={:.2} pending={:.2}",
+                                    quote.side, original_size, quote.size, held, pending
+                                ),
+                            )?;
                         }
 
                         let incremental_size = if resting.contains_key(&quote.side) {
@@ -586,6 +618,17 @@ fn accept_resting_order(
             return Ok(false);
         }
         quote.size = quote.size.min(capped_size);
+    }
+    if real_orders.is_some() && quote.size + 1e-9 < MIN_ORDER_SIZE_SHARES {
+        heartbeat(
+            cfg,
+            "order-gateway",
+            format!(
+                "skipped below minimum order size {} size={:.2}",
+                quote.side, quote.size
+            ),
+        )?;
+        return Ok(false);
     }
     let exchange_order_id = if let Some(real_orders) = real_orders {
         // None = exchange rejected this quote (e.g. post-only crosses book).
@@ -1515,6 +1558,61 @@ mod tests {
             pnl_if_down: 0.0,
             source: "test".to_string(),
         }
+    }
+
+    fn quote(side: &str, size: f64) -> QuoteIntent {
+        QuoteIntent {
+            quote_id: "q".to_string(),
+            ts_ms: now_ms(),
+            market: "btc-updown-5m-test".to_string(),
+            condition_id: "condition".to_string(),
+            token_id: format!("token-{side}"),
+            side: side.to_string(),
+            price: 0.42,
+            size,
+            fair: 0.50,
+            model_up: 0.50,
+            market_up: 0.50,
+            final_up_shadow: 0.50,
+            momentum_up_shadow: 0.50,
+            momentum_delta: 0.0,
+            momentum_score: 0.0,
+            mom_1s: 0.0,
+            mom_3s: 0.0,
+            mom_10s: 0.0,
+            accel: 0.0,
+            market_anchor_weight: 0.0,
+            fair_source: "test".to_string(),
+            inventory_up: 0.0,
+            inventory_down: 0.0,
+            reason: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn side_cap_trims_residual_room_for_live_top_up() {
+        let mut cfg = test_cfg();
+        cfg.dry_run = false;
+        cfg.enable_real_orders = "I_UNDERSTAND_REAL_MONEY".to_string();
+        cfg.quote_size = 20.0;
+        cfg.inventory_mult = 1.0;
+        let mut q = quote("Down", 20.0);
+
+        assert!(cap_quote_to_side_room(&cfg, &mut q, 9.4, 0.0));
+
+        assert_eq!(q.size, 10.0);
+    }
+
+    #[test]
+    fn side_cap_skips_live_residual_room_below_exchange_minimum() {
+        let mut cfg = test_cfg();
+        cfg.dry_run = false;
+        cfg.enable_real_orders = "I_UNDERSTAND_REAL_MONEY".to_string();
+        cfg.quote_size = 20.0;
+        cfg.inventory_mult = 1.0;
+        let mut q = quote("Down", 20.0);
+
+        assert!(!cap_quote_to_side_room(&cfg, &mut q, 16.4, 0.0));
     }
 
     #[test]

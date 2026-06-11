@@ -435,6 +435,8 @@ QUOTE_SIZE * INVENTORY_MULT
 
 例如 `QUOTE_SIZE=5`、`INVENTORY_MULT=2`，单边最多买 `10` 份。这里会同时计算已成交库存和 pending 未成交报价，避免连续报价把真实仓位打穿。
 
+如果一边被部分成交，剩余空间不足一个完整 `QUOTE_SIZE`，但仍不少于 Polymarket 最小订单 `5` 份，机器人会把下一笔缩小到剩余空间继续补腿。例如 `QUOTE_SIZE=20`、单边上限 `20`、Down 已成交 `9.4` 份时，Down 仍可继续挂 `10` 份补齐；如果只剩 `3` 份空间则不会挂，避免被交易所拒单。
+
 ```text
 MAX_UNPAIRED_SHARES=19
 ```

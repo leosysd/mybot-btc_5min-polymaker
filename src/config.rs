@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 const MAX_LIVE_ORDER_NOTIONAL_CAP_USD: f64 = 60.0;
+pub const MIN_ORDER_SIZE_SHARES: f64 = 5.0;
 
 #[derive(Debug, Clone)]
 pub struct Config {

@@ -2,7 +2,7 @@
 //! sends `QuoteIntent`s to the order gateway. Reads (never writes) the shared
 //! inventory.
 
-use crate::config::Config;
+use crate::config::{Config, MIN_ORDER_SIZE_SHARES};
 use crate::ipc::{heartbeat, now_ms, Inventory, MarketFrame, QuoteIntent};
 use crate::pricing::{
     blend_market_anchor, digital_p_up, half_spread, in_warmup, market_anchor_weight,
@@ -348,6 +348,32 @@ fn unpaired_limit_allows(cfg: &Config, inventory: &Inventory, side: &str, size: 
     projected.abs() <= limit + 1e-9 || projected.abs() < current.abs()
 }
 
+fn min_quote_size(cfg: &Config) -> f64 {
+    if cfg.real_orders_enabled() {
+        MIN_ORDER_SIZE_SHARES
+    } else {
+        1.0
+    }
+}
+
+fn capped_quote_size(cfg: &Config, inventory: &Inventory, side: &str) -> Option<f64> {
+    let full_size = cfg.quote_size.round().max(1.0);
+    let side_inventory = if side == "Up" {
+        inventory.effective_up()
+    } else {
+        inventory.effective_down()
+    };
+    let room = (cfg.max_side_inventory() - side_inventory).floor();
+    let size = full_size.min(room);
+    if size + 1e-9 < min_quote_size(cfg) {
+        return None;
+    }
+    if !unpaired_limit_allows(cfg, inventory, side, size) {
+        return None;
+    }
+    Some(size)
+}
+
 /// Compute the time-aware quotes for one market frame and emit them.
 /// Returns the fair `p_up` used, so the caller can feed the toxicity monitor.
 fn handle_market_frame(
@@ -478,19 +504,9 @@ fn send_quote(
     fair_snapshot: FairSnapshot,
     momentum: MomentumShadow,
 ) -> AppResult<()> {
-    let size = cfg.quote_size.round().max(1.0);
-    if !unpaired_limit_allows(cfg, inventory, side, size) {
+    let Some(size) = capped_quote_size(cfg, inventory, side) else {
         return Ok(());
-    }
-    let side_inventory = if side == "Up" {
-        inventory.effective_up()
-    } else {
-        inventory.effective_down()
     };
-    let left = (cfg.max_side_inventory() - side_inventory).floor();
-    if left + 1e-9 < cfg.quote_size {
-        return Ok(());
-    }
     let quote = QuoteIntent {
         quote_id: format!("{}-{side}-{}", frame.ts_ms, now_ms()),
         ts_ms: now_ms(),
@@ -750,6 +766,62 @@ mod tests {
         assert_eq!(quote.side, "Down");
         assert_eq!(quote.reason, "value_buy");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn value_buy_trims_residual_top_up_to_remaining_side_room() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.dry_run = false;
+        cfg.enable_real_orders = "I_UNDERSTAND_REAL_MONEY".to_string();
+        cfg.quote_size = 20.0;
+        cfg.inventory_mult = 1.0;
+        cfg.max_unpaired_shares = 20.0;
+        cfg.value_min_fair = 0.30;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 20.0,
+            up_cost: 10.0,
+            down_shares: 9.4,
+            down_cost: 4.23,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(90.0), &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("residual Down top-up quote");
+        assert_eq!(quote.side, "Down");
+        assert_eq!(quote.size, 10.0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn value_buy_skips_residual_top_up_below_live_minimum() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.dry_run = false;
+        cfg.enable_real_orders = "I_UNDERSTAND_REAL_MONEY".to_string();
+        cfg.quote_size = 20.0;
+        cfg.inventory_mult = 1.0;
+        cfg.max_unpaired_shares = 20.0;
+        cfg.value_min_fair = 0.30;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 20.0,
+            up_cost: 10.0,
+            down_shares: 16.4,
+            down_cost: 7.38,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(90.0), &inventory, &mut tox).expect("quote");
+
+        assert!(
+            rx.try_recv().is_err(),
+            "live residual below 5 shares must not be quoted"
+        );
     }
 
     #[test]
