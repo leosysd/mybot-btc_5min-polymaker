@@ -1300,13 +1300,28 @@ fn handle_user_trade(
         });
 
     if let Some(makers) = value.get("maker_orders").and_then(Value::as_array) {
+        let mut matched_any_local_order = false;
+        let mut unknown_hint: Option<(String, f64, f64)> = None;
         for maker in makers {
             let Some(order_id) = first_str(maker, &["order_id", "id"]) else {
                 continue;
             };
             if !order_map_contains(order_map, order_id) {
+                if unknown_hint.is_none() {
+                    unknown_hint = Some((
+                        order_id.to_string(),
+                        parse_f64_value(maker.get("price"))
+                            .or_else(|| parse_f64_value(value.get("price")))
+                            .unwrap_or(0.0),
+                        parse_f64_value(maker.get("matched_amount"))
+                            .or_else(|| parse_f64_value(maker.get("size")))
+                            .or_else(|| parse_f64_value(value.get("size")))
+                            .unwrap_or(0.0),
+                    ));
+                }
                 continue;
             }
+            matched_any_local_order = true;
             let key = format!("{trade_id}:{order_id}");
             if !seen_trades.insert(key) {
                 continue;
@@ -1321,6 +1336,14 @@ fn handle_user_trade(
             emit_user_fill(
                 cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size,
             )?;
+        }
+        if !matched_any_local_order {
+            if let Some((order_id, price, size)) = unknown_hint {
+                let key = format!("{trade_id}:unknown-maker-orders");
+                if seen_trades.insert(key) {
+                    emit_unmatched_fill(cfg, ledger_tx, &order_id, price, size)?;
+                }
+            }
         }
         return Ok(());
     }
@@ -1344,6 +1367,25 @@ fn handle_user_trade(
 
 fn order_map_contains(order_map: &SharedOrderMap, order_id: &str) -> bool {
     order_map.lock().unwrap().contains_key(order_id)
+}
+
+fn emit_unmatched_fill(
+    cfg: &Config,
+    ledger_tx: &LedgerTx,
+    order_id: &str,
+    price: f64,
+    size: f64,
+) -> AppResult<()> {
+    eprintln!(
+        "[FILL_UNMATCHED] account fill for unknown order {order_id} size={size} price={price} — forcing reconcile"
+    );
+    let _ = heartbeat(
+        cfg,
+        "order-gateway",
+        format!("UNMATCHED fill {order_id} size={size} — forcing reconcile"),
+    );
+    let _ = ledger_tx.send(LedgerEvent::UnmatchedFill);
+    Ok(())
 }
 
 fn handle_user_order(
@@ -1410,15 +1452,7 @@ fn emit_user_fill(
             // NEVER swallow it silently — that would under-count inventory and let
             // the cap re-open. Log loud and force an immediate on-chain reconcile so
             // risk corrects the shared inventory now, not up to RECONCILE_INTERVAL later.
-            eprintln!(
-                "[FILL_UNMATCHED] account fill for unknown order {order_id} size={size} price={price} — forcing reconcile"
-            );
-            let _ = heartbeat(
-                cfg,
-                "order-gateway",
-                format!("UNMATCHED fill {order_id} size={size} — forcing reconcile"),
-            );
-            let _ = ledger_tx.send(LedgerEvent::UnmatchedFill);
+            emit_unmatched_fill(cfg, ledger_tx, order_id, price, size)?;
             return Ok(());
         }
         FillMatch::Matched(meta) => meta,
@@ -1778,6 +1812,50 @@ mod tests {
         assert!(
             ledger_rx.try_recv().is_err(),
             "unknown maker_orders must not emit unmatched reconcile events"
+        );
+    }
+
+    #[test]
+    fn user_trade_all_unknown_maker_orders_forces_reconcile_once() {
+        let cfg = test_cfg();
+        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        }));
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
+        let (gw_tx, _gw_rx) = std::sync::mpsc::channel();
+        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
+        let mut seen = HashSet::new();
+        let event = serde_json::json!({
+            "id": "trade-lost-local-state",
+            "event_type": "trade",
+            "maker_orders": [
+                {"order_id": "lost-order", "matched_amount": "13", "price": "0.36"}
+            ]
+        });
+
+        handle_user_trade(
+            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+        )
+        .unwrap();
+
+        assert_eq!(
+            inventory.lock().unwrap().up_shares,
+            0.0,
+            "unknown fills must wait for authoritative position reconcile"
+        );
+        assert!(matches!(
+            ledger_rx.try_recv().expect("unknown maker fill"),
+            LedgerEvent::UnmatchedFill
+        ));
+
+        handle_user_trade(
+            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+        )
+        .unwrap();
+        assert!(
+            ledger_rx.try_recv().is_err(),
+            "replayed unknown maker trade should not spam reconcile events"
         );
     }
 
