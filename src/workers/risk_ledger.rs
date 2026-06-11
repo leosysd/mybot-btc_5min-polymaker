@@ -71,10 +71,9 @@ pub fn run(
         if let Some(reconciler) = &position_reconciler {
             let interval_due = cfg.reconcile_interval_ms > 0
                 && last_position_sync.elapsed() >= Duration::from_millis(cfg.reconcile_interval_ms);
-            let pair_ready = !up_token.trim().is_empty()
-                && !down_token.trim().is_empty()
+            let token_ready = (!up_token.trim().is_empty() || !down_token.trim().is_empty())
                 && !current_market.is_empty();
-            if (interval_due || force_reconcile) && pair_ready {
+            if (interval_due || force_reconcile) && token_ready {
                 last_position_sync = Instant::now();
                 // Only reconcile when BOTH tokens belong to the SAME market the
                 // shared inventory is currently on — never mix new/old windows.
@@ -83,13 +82,13 @@ pub fn run(
                     force_reconcile = false;
                     match reconciler.fetch(&up_token, &down_token) {
                         Ok(snap) => {
-                            // Reconcile confirmed the on-chain position → release
-                            // any placement pause set by a prior unmatched fill.
-                            reconcile_gate.store(false, Ordering::Relaxed);
                             let corrected = {
                                 let mut inv = inventory.lock().unwrap();
                                 reconcile_inventory_with_chain(&cfg, &mut inv, &snap)?
                             };
+                            // Reconcile confirmed the exchange-facing position. Release
+                            // any placement pause set by an inventory-dirty event.
+                            reconcile_gate.store(false, Ordering::Relaxed);
                             if corrected {
                                 let inv = inventory.lock().unwrap();
                                 write_json(&cfg.inventory_path(), &*inv)?;
@@ -141,23 +140,34 @@ pub fn run(
                 // The gateway already credited the shared inventory; we enrich the
                 // fill from it for the fills.jsonl log and persist inventory.json.
                 let inv = inventory.lock().unwrap();
+                let fill_matches_current_market = inv.market == fill.market;
                 let enriched = FillEvent {
-                    quote_id: fill.quote_id,
+                    quote_id: fill.quote_id.clone(),
                     ts_ms: now_ms(),
-                    market: fill.market,
-                    side: fill.side,
+                    market: fill.market.clone(),
+                    token_id: fill.token_id.clone(),
+                    side: fill.side.clone(),
                     price: fill.price,
                     size: fill.size,
                     inventory_up: inv.up_shares,
                     inventory_down: inv.down_shares,
                     pnl_if_up: inv.pnl_if_up(),
                     pnl_if_down: inv.pnl_if_down(),
-                    source: fill.source,
+                    source: fill.source.clone(),
                 };
                 log_jsonl(&logger, &cfg.fills_path(), &enriched)?;
                 write_json(&cfg.inventory_path(), &*inv)?;
                 check_kill_switch(&cfg, &stop, &inv)?;
                 drop(inv);
+                if fill_matches_current_market {
+                    learn_token_pair_from_fill(
+                        &mut current_market,
+                        &mut up_token,
+                        &mut down_token,
+                        &fill,
+                    );
+                    force_reconcile = true;
+                }
                 heartbeat(&cfg, "risk-ledger", "fill accounted")?;
             }
             Ok(LedgerEvent::UnmatchedFill) => {
@@ -180,6 +190,27 @@ pub fn run(
         }
     }
     Ok(())
+}
+
+fn learn_token_pair_from_fill(
+    current_market: &mut String,
+    up_token: &mut String,
+    down_token: &mut String,
+    fill: &FillEvent,
+) {
+    if fill.market != *current_market {
+        *current_market = fill.market.clone();
+        up_token.clear();
+        down_token.clear();
+    }
+    if fill.token_id.trim().is_empty() {
+        return;
+    }
+    match fill.side.as_str() {
+        "Up" => *up_token = fill.token_id.clone(),
+        "Down" => *down_token = fill.token_id.clone(),
+        _ => {}
+    }
 }
 
 /// Overwrite locally-derived filled inventory with authoritative on-chain

@@ -117,6 +117,8 @@ pub struct FillEvent {
     pub quote_id: String,
     pub ts_ms: u64,
     pub market: String,
+    #[serde(default)]
+    pub token_id: String,
     pub side: String,
     pub price: f64,
     pub size: f64,

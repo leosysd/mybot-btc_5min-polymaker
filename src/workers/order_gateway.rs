@@ -141,8 +141,12 @@ pub fn run(
     // Per-side cooldown after a rejected order, so we don't spin and hammer the
     // exchange with crossing orders (and risk rate-limiting).
     let mut reject_until: HashMap<String, u64> = HashMap::new();
-    // When set, placement is paused (an unmatched fill is awaiting reconcile).
+    // When set, placement is paused until risk-ledger confirms an authoritative
+    // position reconcile. In real mode this is safety-critical: if inventory is
+    // even briefly uncertain, do not keep live orders resting.
     let mut reconcile_pause_since: Option<Instant> = None;
+    let mut last_pause_heartbeat: Option<Instant> = None;
+    let mut pause_cleanup_done = false;
 
     let loop_result = (|| -> AppResult<()> {
         while !stopping(&stop, &cfg) {
@@ -150,6 +154,16 @@ pub fn run(
             // credited fills / registered cancels into the shared inventory; we
             // just update the resting map and recompute pending here.
             while let Ok(event) = gw_rx.try_recv() {
+                let pause_for_fill = match &event {
+                    GatewayEvent::Fill(fill) if real_orders.is_some() => {
+                        inventory.lock().unwrap().market == fill.market
+                    }
+                    _ => false,
+                };
+                if pause_for_fill {
+                    reconcile_gate.store(true, Ordering::Relaxed);
+                    pause_cleanup_done = false;
+                }
                 apply_gateway_event(&cfg, &inventory, real_orders.as_ref(), &mut resting, event)?;
             }
 
@@ -180,30 +194,58 @@ pub fn run(
                 }
             }
 
-            // P1: placement pause after an unmatched fill, until risk reconciles
-            // (self-clearing after a timeout so it can never deadlock placement).
+            // Placement pause after a fill/inventory-dirty signal, until risk
+            // reconciles. This intentionally does NOT self-clear in real mode: a
+            // stuck reconcile is safer than placing with unknown inventory.
             let placement_paused = if reconcile_gate.load(Ordering::Relaxed) {
                 match reconcile_pause_since {
                     None => {
                         reconcile_pause_since = Some(Instant::now());
                         true
                     }
-                    Some(t) if t.elapsed() < RECONCILE_PAUSE_TIMEOUT => true,
-                    Some(_) => {
-                        reconcile_gate.store(false, Ordering::Relaxed);
-                        reconcile_pause_since = None;
-                        heartbeat(
-                            &cfg,
-                            "order-gateway",
-                            "unmatched-fill pause timed out, resuming placement",
-                        )?;
-                        false
+                    Some(t) => {
+                        let should_report = t.elapsed() >= RECONCILE_PAUSE_TIMEOUT
+                            && last_pause_heartbeat
+                                .is_none_or(|last| last.elapsed() >= RECONCILE_PAUSE_TIMEOUT);
+                        if should_report {
+                            last_pause_heartbeat = Some(Instant::now());
+                            heartbeat(
+                                &cfg,
+                                "order-gateway",
+                                "inventory reconcile still pending; placement remains paused",
+                            )?;
+                        }
+                        true
                     }
                 }
             } else {
                 reconcile_pause_since = None;
+                last_pause_heartbeat = None;
+                pause_cleanup_done = false;
                 false
             };
+
+            if placement_paused && !pause_cleanup_done {
+                if let Some(real_orders) = real_orders.as_ref() {
+                    if !resting.is_empty() {
+                        heartbeat(
+                            &cfg,
+                            "order-gateway",
+                            "inventory dirty: canceling resting orders before reconcile",
+                        )?;
+                        cancel_all_resting_orders(
+                            &cfg,
+                            &inventory,
+                            real_orders,
+                            &order_map,
+                            &mut resting,
+                            &ledger_tx,
+                            "inventory_dirty",
+                        )?;
+                    }
+                }
+                pause_cleanup_done = true;
+            }
 
             match quote_rx.recv_timeout(RECV_TIMEOUT) {
                 Ok(first) => {
@@ -501,6 +543,7 @@ fn simulate_fill(
         quote_id: quote.quote_id.clone(),
         ts_ms: now_ms(),
         market: quote.market.clone(),
+        token_id: quote.token_id.clone(),
         side: quote.side.clone(),
         price: quote.price,
         size: quote.size,
@@ -590,6 +633,7 @@ fn order_map_from_resting(resting: &HashMap<String, RestingOrder>) -> HashMap<St
                     quote_id: order.quote_id.clone(),
                     market: order.market.clone(),
                     condition_id: order.condition_id.clone(),
+                    token_id: order.token_id.clone(),
                     side: order.side.clone(),
                     price: order.price,
                     size: order.size,
@@ -659,6 +703,7 @@ fn accept_resting_order(
                     quote_id: quote.quote_id.clone(),
                     market: quote.market.clone(),
                     condition_id: quote.condition_id.clone(),
+                    token_id: quote.token_id.clone(),
                     side: quote.side.clone(),
                     price: quote.price,
                     size: quote.size,
@@ -1302,22 +1347,27 @@ fn handle_user_trade(
     if let Some(makers) = value.get("maker_orders").and_then(Value::as_array) {
         let mut matched_any_local_order = false;
         let mut unknown_hint: Option<(String, f64, f64)> = None;
+        let mut owned_unknown_hint: Option<(String, f64, f64)> = None;
         for maker in makers {
             let Some(order_id) = first_str(maker, &["order_id", "id"]) else {
                 continue;
             };
             if !order_map_contains(order_map, order_id) {
+                let hint = (
+                    order_id.to_string(),
+                    parse_f64_value(maker.get("price"))
+                        .or_else(|| parse_f64_value(value.get("price")))
+                        .unwrap_or(0.0),
+                    parse_f64_value(maker.get("matched_amount"))
+                        .or_else(|| parse_f64_value(maker.get("size")))
+                        .or_else(|| parse_f64_value(value.get("size")))
+                        .unwrap_or(0.0),
+                );
                 if unknown_hint.is_none() {
-                    unknown_hint = Some((
-                        order_id.to_string(),
-                        parse_f64_value(maker.get("price"))
-                            .or_else(|| parse_f64_value(value.get("price")))
-                            .unwrap_or(0.0),
-                        parse_f64_value(maker.get("matched_amount"))
-                            .or_else(|| parse_f64_value(maker.get("size")))
-                            .or_else(|| parse_f64_value(value.get("size")))
-                            .unwrap_or(0.0),
-                    ));
+                    unknown_hint = Some(hint.clone());
+                }
+                if owned_unknown_hint.is_none() && maker_order_belongs_to_us(cfg, maker) {
+                    owned_unknown_hint = Some(hint);
                 }
                 continue;
             }
@@ -1337,12 +1387,17 @@ fn handle_user_trade(
                 cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size,
             )?;
         }
-        if !matched_any_local_order {
-            if let Some((order_id, price, size)) = unknown_hint {
-                let key = format!("{trade_id}:unknown-maker-orders");
-                if seen_trades.insert(key) {
-                    emit_unmatched_fill(cfg, ledger_tx, &order_id, price, size)?;
-                }
+        let must_reconcile = owned_unknown_hint.or_else(|| {
+            if matched_any_local_order {
+                None
+            } else {
+                unknown_hint
+            }
+        });
+        if let Some((order_id, price, size)) = must_reconcile {
+            let key = format!("{trade_id}:unknown-maker-orders");
+            if seen_trades.insert(key) {
+                emit_unmatched_fill(cfg, ledger_tx, &order_id, price, size)?;
             }
         }
         return Ok(());
@@ -1367,6 +1422,21 @@ fn handle_user_trade(
 
 fn order_map_contains(order_map: &SharedOrderMap, order_id: &str) -> bool {
     order_map.lock().unwrap().contains_key(order_id)
+}
+
+fn maker_order_belongs_to_us(cfg: &Config, maker: &Value) -> bool {
+    let api_key = cfg.poly_api_key.trim();
+    if !api_key.is_empty()
+        && first_str(maker, &["owner", "api_key", "apiKey"])
+            .is_some_and(|owner| owner.eq_ignore_ascii_case(api_key))
+    {
+        return true;
+    }
+
+    let funder = cfg.poly_funder_address.trim();
+    !funder.is_empty()
+        && first_str(maker, &["maker_address", "makerAddress"])
+            .is_some_and(|addr| addr.eq_ignore_ascii_case(funder))
 }
 
 fn emit_unmatched_fill(
@@ -1470,6 +1540,7 @@ fn emit_user_fill(
         quote_id: meta.quote_id,
         ts_ms: now_ms(),
         market: meta.market,
+        token_id: meta.token_id,
         side: meta.side,
         price: fill_price,
         size: fill_size,
@@ -1583,6 +1654,7 @@ mod tests {
             quote_id: quote_id.to_string(),
             ts_ms: now_ms(),
             market: "btc-updown-5m-test".to_string(),
+            token_id: format!("token-{side}"),
             side: side.to_string(),
             price: 0.42,
             size,
@@ -1675,6 +1747,7 @@ mod tests {
                 quote_id: order.quote_id.clone(),
                 market: order.market.clone(),
                 condition_id: order.condition_id.clone(),
+                token_id: order.token_id.clone(),
                 side: order.side.clone(),
                 price: order.price,
                 size: order.size,
@@ -1741,6 +1814,7 @@ mod tests {
                 quote_id: "q1".to_string(),
                 market: "m".to_string(),
                 condition_id: String::new(),
+                token_id: "token-Up".to_string(),
                 side: "Up".to_string(),
                 price: 0.5,
                 size: 5.0,
@@ -1780,6 +1854,7 @@ mod tests {
                 quote_id: "q-ours".to_string(),
                 market: "btc-updown-5m-test".to_string(),
                 condition_id: "condition".to_string(),
+                token_id: "token-Up".to_string(),
                 side: "Up".to_string(),
                 price: 0.42,
                 size: 5.0,
@@ -1813,6 +1888,61 @@ mod tests {
             ledger_rx.try_recv().is_err(),
             "unknown maker_orders must not emit unmatched reconcile events"
         );
+    }
+
+    #[test]
+    fn user_trade_mixed_known_and_owned_unknown_forces_reconcile() {
+        let mut cfg = test_cfg();
+        cfg.poly_api_key = "our-api-key".to_string();
+        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        }));
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
+        order_map.lock().unwrap().insert(
+            "our-known-order".to_string(),
+            QuoteMeta {
+                quote_id: "q-known".to_string(),
+                market: "btc-updown-5m-test".to_string(),
+                condition_id: "condition".to_string(),
+                token_id: "token-Up".to_string(),
+                side: "Up".to_string(),
+                price: 0.42,
+                size: 5.0,
+                credited: false,
+                done: false,
+            },
+        );
+        let (gw_tx, _gw_rx) = std::sync::mpsc::channel();
+        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
+        let mut seen = HashSet::new();
+        let event = serde_json::json!({
+            "id": "trade-mixed-owned",
+            "event_type": "trade",
+            "maker_orders": [
+                {"order_id": "our-known-order", "matched_amount": "5", "price": "0.42"},
+                {
+                    "order_id": "our-missing-order",
+                    "owner": "our-api-key",
+                    "matched_amount": "7.5",
+                    "price": "0.58"
+                }
+            ]
+        });
+
+        handle_user_trade(
+            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            ledger_rx.try_recv().expect("known fill"),
+            LedgerEvent::Filled(fill) if fill.quote_id == "q-known"
+        ));
+        assert!(matches!(
+            ledger_rx.try_recv().expect("owned unknown fill"),
+            LedgerEvent::UnmatchedFill
+        ));
     }
 
     #[test]

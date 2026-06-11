@@ -120,6 +120,7 @@ pub struct QuoteMeta {
     pub quote_id: String,
     pub market: String,
     pub condition_id: String,
+    pub token_id: String,
     pub side: String,
     pub price: f64,
     pub size: f64,
