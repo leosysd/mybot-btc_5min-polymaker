@@ -721,17 +721,17 @@ fn cancel_resting_side(
             recompute_pending_from_resting(&mut inv, resting);
             Ok(true)
         }
-        Ok(CancelOutcome::FilledOrGone) => {
-            // The order filled. Credit its shares to held NOW (before releasing
-            // pending) so held+pending never momentarily reads low — this is the
-            // fix for the live async over-accumulation. Dedup handled inside.
-            credit_filled_on_cancel(inventory, order_map, ledger_tx, &order)?;
-            resting.remove(side);
-            persist_active_orders_if_real(cfg, real_orders, resting)?;
-            let mut inv = inventory.lock().unwrap();
-            recompute_pending_from_resting(&mut inv, resting);
-            Ok(true)
-        }
+        Ok(CancelOutcome::GoneUnverified) => handle_gone_unverified_cancel(
+            cfg,
+            inventory,
+            real_orders,
+            order_map,
+            resting,
+            ledger_tx,
+            side,
+            reason,
+            &order,
+        ),
         Err(err) => {
             // Not confirmed terminal (rejected / transient I/O) — the order may
             // still be live. Keep it counted (conservative for the cap) and do
@@ -744,6 +744,39 @@ fn cancel_resting_side(
             Ok(false)
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_gone_unverified_cancel(
+    cfg: &Config,
+    inventory: &SharedInventory,
+    real_orders: Option<&RealOrderClient>,
+    order_map: Option<&SharedOrderMap>,
+    resting: &mut HashMap<String, RestingOrder>,
+    ledger_tx: &LedgerTx,
+    side: &str,
+    reason: &str,
+    order: &RestingOrder,
+) -> AppResult<bool> {
+    // The exchange says the order is no longer open, but the cancel response
+    // does not tell us the real fill size/price. Do NOT invent a fill from
+    // local remaining size; release pending and force the authoritative
+    // position reconciler to correct held shares.
+    mark_order_reconcile_pending(order_map, order);
+    resting.remove(side);
+    persist_active_orders_if_real(cfg, real_orders, resting)?;
+    let mut inv = inventory.lock().unwrap();
+    recompute_pending_from_resting(&mut inv, resting);
+    drop(inv);
+    let _ = ledger_tx.send(LedgerEvent::UnmatchedFill);
+    heartbeat(
+        cfg,
+        "order-gateway",
+        format!("cancel {reason} found {side} gone; awaiting reconcile"),
+    )?;
+    // Skip placing a replacement in the same quote cycle; the shared inventory
+    // may under-count until risk-ledger reconciles.
+    Ok(false)
 }
 
 /// Cancel any order the exchange reports as open that we don't track locally.
@@ -844,9 +877,9 @@ enum CancelOutcome {
     /// We confirmed the exchange cancelled it (it did NOT fill).
     Cancelled,
     /// The order is gone but NOT because we cancelled it (exchange reports
-    /// already filled / matched / not found) — treat it as FILLED. The caller
-    /// must credit its shares to held to keep held+pending consistent.
-    FilledOrGone,
+    /// already filled / matched / not found). The response is not precise
+    /// enough for local accounting, so the caller must reconcile.
+    GoneUnverified,
 }
 
 fn send_cancel(
@@ -884,23 +917,22 @@ fn send_cancel(
                 order_map.lock().unwrap().remove(exchange_order_id);
             }
         } else {
-            // Gone but we did NOT cancel it => it filled (or vanished). Leave the
-            // order_map entry so the caller can credit it once and flag it for the
-            // user-WS dedup. This closes the async race where a TTL/requote cancel
-            // frees pending before the user-WS fill credits held.
+            // Gone but we did NOT cancel it => it filled, vanished, or the API no
+            // longer exposes it. Do not synthesize a fill here; the caller will
+            // release pending and force an on-chain position reconcile.
             heartbeat(
                 cfg,
                 "order-gateway",
                 format!(
-                    "cancel noop {exchange_order_id}: {} (treat as filled)",
+                    "cancel noop {exchange_order_id}: {} (await reconcile)",
                     ack.reason.unwrap_or_else(|| "not active".to_string())
                 ),
             )?;
-            outcome = CancelOutcome::FilledOrGone;
+            outcome = CancelOutcome::GoneUnverified;
         }
     }
-    // Only record a Cancelled event for a genuine cancel; a FilledOrGone is
-    // recorded as a Fill by the caller (credit_filled_on_cancel).
+    // Only record a Cancelled event for a genuine cancel; GoneUnverified is
+    // reconciled by risk-ledger instead of being logged as a synthetic fill.
     if matches!(outcome, CancelOutcome::Cancelled) {
         let cancel = OrderCancelled {
             ts_ms: now_ms(),
@@ -920,64 +952,24 @@ fn send_cancel(
     Ok(outcome)
 }
 
-/// Credit a fill discovered by the cancel path (the exchange said the order is
-/// already gone/filled). Credits the order's REMAINING (not-yet-WS-credited)
-/// shares to held under the lock, flags the order_map entry so the async
-/// user-WS fill won't double-count, and records the fill for jsonl/kill-switch.
-/// No-op if the order_map entry is already gone or already credited (the user-WS
-/// path handled it).
-fn credit_filled_on_cancel(
-    inventory: &SharedInventory,
-    order_map: Option<&SharedOrderMap>,
-    ledger_tx: &LedgerTx,
-    order: &RestingOrder,
-) -> AppResult<()> {
+/// Mark an ambiguous cancel as handed off to reconcile. We deliberately do not
+/// credit local held inventory here because the cancel response does not carry
+/// authoritative fill size/price. The order-map entry is kept as an echo guard:
+/// if the user-WS later replays this order, it will be ignored instead of being
+/// double-counted after reconcile.
+fn mark_order_reconcile_pending(order_map: Option<&SharedOrderMap>, order: &RestingOrder) {
     let Some(order_map) = order_map else {
-        return Ok(());
+        return;
     };
     let Some(id) = order.exchange_order_id.as_deref() else {
-        return Ok(());
+        return;
     };
-    let (size, price, side, market) = {
-        let mut map = order_map.lock().unwrap();
-        match map.get_mut(id) {
-            Some(meta) if !meta.credited && meta.size > 0.001 => {
-                meta.credited = true;
-                (
-                    meta.size,
-                    meta.price,
-                    meta.side.clone(),
-                    meta.market.clone(),
-                )
-            }
-            // Gone or already credited => the user-WS path fully handled it.
-            _ => return Ok(()),
-        }
-    };
-    {
-        let mut inv = inventory.lock().unwrap();
-        // Don't wipe the current window's inventory with a stale-market credit.
-        if inv.market.is_empty() {
-            reset_inventory_for_market(&mut inv, &market);
-        }
-        if inv.market == market {
-            inv.add_fill(&market, &side, price, size);
-        }
+    let mut map = order_map.lock().unwrap();
+    if let Some(meta) = map.get_mut(id) {
+        meta.credited = true;
+        meta.done = true;
+        meta.size = 0.0;
     }
-    let _ = ledger_tx.send(LedgerEvent::Filled(FillEvent {
-        quote_id: order.quote_id.clone(),
-        ts_ms: now_ms(),
-        market,
-        side,
-        price,
-        size,
-        inventory_up: 0.0,
-        inventory_down: 0.0,
-        pnl_if_up: 0.0,
-        pnl_if_down: 0.0,
-        source: "cancel_detected_fill".to_string(),
-    }));
-    Ok(())
 }
 
 fn apply_fill_to_resting_map(
@@ -1446,8 +1438,8 @@ enum FillMatch {
 
 /// Look up + reduce an order_map entry for a user-WS fill, ATOMICALLY under one
 /// lock. Checking the `credited` flag and reducing the size in the same critical
-/// section closes the cross-thread race where `credit_filled_on_cancel` could
-/// flip `credited` between a separate check and a separate reduce, double-crediting.
+/// section closes the cross-thread race where cancel/reconcile handoff could
+/// flip `credited` between a separate check and a separate reduce, double-counting.
 fn match_and_reduce_order(
     order_map: &SharedOrderMap,
     order_id: &str,
@@ -1526,11 +1518,13 @@ mod tests {
     }
 
     #[test]
-    fn cancel_detected_fill_credited_once_not_double_counted() {
-        // Reproduces the live async race: a TTL/requote cancel finds the order
-        // already filled and credits held; the user-WS fill for the SAME order
-        // then arrives and must NOT double-credit (that race drove the live
-        // over-accumulation to 28 shares against a cap of 5).
+    fn ambiguous_cancel_does_not_synthesize_fill_and_forces_reconcile() {
+        let mut cfg = test_cfg();
+        cfg.run_dir = std::env::temp_dir().join(format!(
+            "polymaker-cancel-reconcile-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
         let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
             market: "btc-updown-5m-test".to_string(),
             ..Default::default()
@@ -1538,6 +1532,11 @@ mod tests {
         let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
         let order = resting_order("Up", "q1", 5.0);
         let id = order.exchange_order_id.clone().unwrap();
+        let mut resting = HashMap::from([("Up".to_string(), order.clone())]);
+        {
+            let mut inv = inventory.lock().unwrap();
+            recompute_pending_from_resting(&mut inv, &resting);
+        }
         order_map.lock().unwrap().insert(
             id.clone(),
             QuoteMeta {
@@ -1551,47 +1550,51 @@ mod tests {
                 done: false,
             },
         );
-        let (ledger_tx, _rx) = std::sync::mpsc::channel();
+        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
 
-        // 1) cancel path discovers the fill and credits it once.
-        credit_filled_on_cancel(&inventory, Some(&order_map), &ledger_tx, &order).unwrap();
-        assert_eq!(inventory.lock().unwrap().up_shares, 5.0, "credited once");
-        assert!(order_map
-            .lock()
-            .unwrap()
-            .get(&id)
-            .map(|m| m.credited)
-            .unwrap_or(false));
+        let may_replace = handle_gone_unverified_cancel(
+            &cfg,
+            &inventory,
+            None,
+            Some(&order_map),
+            &mut resting,
+            &ledger_tx,
+            "Up",
+            "requote",
+            &order,
+        )
+        .unwrap();
 
-        // 2) the async user-WS fill for the SAME order arrives — the atomic
-        // match+dedup must report AlreadyCredited and NOT credit again.
+        assert!(
+            !may_replace,
+            "must not place a replacement in the same cycle"
+        );
+        assert!(resting.is_empty(), "pending order is no longer open");
+        {
+            let inv = inventory.lock().unwrap();
+            assert_eq!(inv.up_shares, 0.0, "must not synthesize held shares");
+            assert_eq!(inv.pending_up, 0.0, "pending is released");
+        }
+        assert!(matches!(
+            ledger_rx.try_recv().unwrap(),
+            LedgerEvent::UnmatchedFill
+        ));
+
+        // A later user-WS replay for the same order is ignored; risk-ledger's
+        // position reconcile is now the single source of truth for this case.
         assert!(
             matches!(
                 match_and_reduce_order(&order_map, &id, 5.0),
                 FillMatch::AlreadyCredited
             ),
-            "should be recognised as pre-credited"
+            "should be recognised as reconcile-pending"
         );
         assert_eq!(
             inventory.lock().unwrap().up_shares,
-            5.0,
-            "must NOT be double-counted"
+            0.0,
+            "must still not be locally credited"
         );
-        // Entry is KEPT as an echo guard (credited), not removed — further echoes
-        // for it stay benign until the per-window prune.
-        assert!(
-            order_map
-                .lock()
-                .unwrap()
-                .get(&id)
-                .map(|m| m.credited)
-                .unwrap_or(false),
-            "entry kept as echo guard"
-        );
-
-        // 3) a stray second credit attempt is a no-op (already credited).
-        credit_filled_on_cancel(&inventory, Some(&order_map), &ledger_tx, &order).unwrap();
-        assert_eq!(inventory.lock().unwrap().up_shares, 5.0, "still once");
+        let _ = std::fs::remove_dir_all(&cfg.run_dir);
     }
 
     #[test]

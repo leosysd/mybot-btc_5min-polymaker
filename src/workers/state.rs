@@ -78,7 +78,8 @@ pub enum LedgerEvent {
     Cancelled(OrderCancelled),
     Filled(FillEvent),
     /// An account fill arrived that the gateway could not match to a known order
-    /// (pre-insert race or restart/state gap). Tells risk to force an immediate
+    /// (pre-insert race or restart/state gap), or a cancel found an order already
+    /// gone without a reliable fill size. Tells risk to force an immediate
     /// on-chain position reconcile so the shared inventory is corrected at once.
     UnmatchedFill,
 }
@@ -122,9 +123,10 @@ pub struct QuoteMeta {
     pub side: String,
     pub price: f64,
     pub size: f64,
-    /// Set true when this order's fill was already credited to held via the
-    /// cancel-detected-fill path (a TTL/requote cancel found it already filled).
-    /// The async user-WS fill then skips re-crediting to avoid double-counting.
+    /// Set true when this order should not be credited through the user-WS path:
+    /// either it was already credited by an older cancel-detected-fill path, or
+    /// an ambiguous cancel handed it off to on-chain reconcile. The async user-WS
+    /// fill then skips re-crediting to avoid double-counting.
     pub credited: bool,
     /// Set true once the order is FULLY filled via the user-WS. The entry is then
     /// kept (not removed) as an "echo guard": later trade-status echoes / WS
