@@ -2,6 +2,8 @@ use crate::AppResult;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+const MAX_LIVE_ORDER_NOTIONAL_CAP_USD: f64 = 60.0;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub base_dir: PathBuf,
@@ -368,8 +370,13 @@ impl Config {
         if self.poly_private_key.trim().is_empty() {
             return Err("实单需要 POLY_PRIVATE_KEY，且只能放在 VPS 的 .env 里".into());
         }
-        if self.live_order_notional_cap <= 0.0 || self.live_order_notional_cap > 25.0 {
-            return Err("实单 LIVE_ORDER_NOTIONAL_CAP 必须在 (0, 25]，先小额验证".into());
+        if self.live_order_notional_cap <= 0.0
+            || self.live_order_notional_cap > MAX_LIVE_ORDER_NOTIONAL_CAP_USD
+        {
+            return Err(format!(
+                "实单 LIVE_ORDER_NOTIONAL_CAP 必须在 (0, {MAX_LIVE_ORDER_NOTIONAL_CAP_USD:.0}]"
+            )
+            .into());
         }
         if self.poly_chain_id != 137 {
             return Err("当前只支持 Polygon 主网 POLY_CHAIN_ID=137".into());

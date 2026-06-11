@@ -330,7 +330,7 @@ DATA_MODE=live
 LIVE_ORDER_NOTIONAL_CAP=5
 ```
 
-实单只发 post-only BUY limit，不主动吃单；`LIVE_ORDER_NOTIONAL_CAP` 必须在 `(0, 25]`，先小额验证。
+实单只发 post-only BUY limit，不主动吃单；`LIVE_ORDER_NOTIONAL_CAP` 必须在 `(0, 60]`，先小额验证。
 
 ```text
 DATA_MODE=sim
