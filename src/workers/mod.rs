@@ -116,8 +116,10 @@ fn run_bot(cfg: Config, seconds: Option<u64>) -> AppResult<()> {
     // Supervise: heartbeat, watch the on-disk STOP file and the optional seconds
     // limit, and notice any worker thread that finished (panicked or returned).
     let started = Instant::now();
+    let mut stop_requested = false;
     loop {
         if state::stopping(&stop, &cfg) {
+            stop_requested = true;
             break;
         }
         if let Some(limit) = seconds {
@@ -129,17 +131,23 @@ fn run_bot(cfg: Config, seconds: Option<u64>) -> AppResult<()> {
         // supervisor (PM2 / `polymaker start`) restarts the single process — far
         // simpler and safer than restarting one thread mid-flight with shared
         // state half-updated.
-        if handles.iter().any(|(_, h)| h.is_finished()) {
-            eprintln!("[supervisor] a worker thread finished; stopping bot");
+        if let Some((role, _)) = handles.iter().find(|(_, h)| h.is_finished()) {
+            eprintln!("[supervisor] worker thread finished first: {role}; stopping bot");
             break;
         }
         let _ = heartbeat(&cfg, "supervisor", "running");
         thread::sleep(Duration::from_millis(500));
     }
 
-    // Signal stop to all threads (in-process flag + on-disk STOP file) and join.
+    // Signal stop to all threads and join. Only preserve/write STOP when an
+    // explicit stop was requested; a normal worker-finished shutdown should let
+    // PM2 restart cleanly without inheriting a stale STOP file from cleanup.
     stop.store(true, Ordering::Relaxed);
-    let _ = state::write_stop_file(&cfg);
+    if stop_requested {
+        let _ = state::write_stop_file(&cfg);
+    } else {
+        let _ = std::fs::remove_file(cfg.stop_file());
+    }
 
     for (role, handle) in handles {
         match handle.join() {
