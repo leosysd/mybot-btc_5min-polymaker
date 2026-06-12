@@ -16,6 +16,10 @@ use std::time::Duration;
 use super::state::{request_stop, stopping, MarketRx, QuoteTx, SharedInventory, StopFlag};
 
 const RECV_TIMEOUT: Duration = Duration::from_millis(250);
+/// If the process starts after a market is already underway, skip that whole
+/// first window. A tiny grace lets a process that is already up at the boundary
+/// join the fresh window; normal QUOTE_WARMUP_SECS still blocks early trading.
+const STARTUP_JOIN_GRACE_SECS: f64 = 3.0;
 
 pub fn run(
     cfg: Config,
@@ -33,6 +37,7 @@ pub fn run(
         cfg.tox_max_widen,
     );
     let mut last_p_up = 0.5_f64;
+    let mut startup_gate = StartupMarketGate::default();
     let (mut prev_up, mut prev_down) = {
         let inv = inventory.lock().unwrap();
         (inv.up_shares, inv.down_shares)
@@ -63,6 +68,35 @@ pub fn run(
                     heartbeat(&cfg, "quote-engine", "skipped stale market frame")?;
                     continue;
                 }
+                match startup_gate.check(&cfg, &frame) {
+                    StartupGateAction::Allow => {}
+                    StartupGateAction::Skip {
+                        elapsed_secs,
+                        first_notice,
+                    } => {
+                        if first_notice {
+                            heartbeat(
+                                &cfg,
+                                "quote-engine",
+                                format!(
+                                    "startup mid-window guard: skipping {} elapsed={elapsed_secs:.1}s; waiting next market",
+                                    frame.market
+                                ),
+                            )?;
+                        }
+                        continue;
+                    }
+                    StartupGateAction::Release { skipped_market } => {
+                        heartbeat(
+                            &cfg,
+                            "quote-engine",
+                            format!(
+                                "startup mid-window guard released: {} -> {}",
+                                skipped_market, frame.market
+                            ),
+                        )?;
+                    }
+                }
                 let inv_snapshot = inventory.lock().unwrap().clone();
                 last_p_up = handle_market_frame(&cfg, &quote_tx, &frame, &inv_snapshot, &mut tox)?;
                 heartbeat(&cfg, "quote-engine", "quoted")?;
@@ -88,6 +122,76 @@ pub fn run(
 
 fn collector_owns_market_silence(cfg: &Config) -> bool {
     cfg.data_mode == "live" && cfg.auto_discover_market
+}
+
+#[derive(Debug, Default)]
+struct StartupMarketGate {
+    initialized: bool,
+    skipped_market: Option<String>,
+    skipped_elapsed_secs: f64,
+    skip_reported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum StartupGateAction {
+    Allow,
+    Skip {
+        elapsed_secs: f64,
+        first_notice: bool,
+    },
+    Release {
+        skipped_market: String,
+    },
+}
+
+impl StartupMarketGate {
+    fn check(&mut self, cfg: &Config, frame: &MarketFrame) -> StartupGateAction {
+        if !uses_live_auto_market(cfg) {
+            return StartupGateAction::Allow;
+        }
+
+        if !self.initialized {
+            self.initialized = true;
+            if let Some(elapsed_secs) = startup_market_elapsed_secs(cfg, frame) {
+                if elapsed_secs > STARTUP_JOIN_GRACE_SECS {
+                    self.skipped_market = Some(frame.market.clone());
+                    self.skipped_elapsed_secs = elapsed_secs;
+                }
+            }
+        }
+
+        match self.skipped_market.as_deref() {
+            Some(skipped) if skipped == frame.market => {
+                let first_notice = !self.skip_reported;
+                self.skip_reported = true;
+                StartupGateAction::Skip {
+                    elapsed_secs: self.skipped_elapsed_secs,
+                    first_notice,
+                }
+            }
+            Some(_) => {
+                let skipped_market = self.skipped_market.take().unwrap_or_default();
+                self.skip_reported = false;
+                StartupGateAction::Release { skipped_market }
+            }
+            None => StartupGateAction::Allow,
+        }
+    }
+}
+
+fn uses_live_auto_market(cfg: &Config) -> bool {
+    cfg.data_mode == "live" && cfg.auto_discover_market
+}
+
+fn startup_market_elapsed_secs(cfg: &Config, frame: &MarketFrame) -> Option<f64> {
+    let window = cfg.market_window_secs as f64;
+    if window <= 0.0 || !window.is_finite() || frame.market.trim().is_empty() {
+        return None;
+    }
+    if frame.tau_seconds <= 0.0 || !frame.tau_seconds.is_finite() {
+        return None;
+    }
+    Some((window - frame.tau_seconds).clamp(0.0, window))
 }
 
 fn valid_market_px(px: f64) -> bool {
@@ -608,6 +712,67 @@ mod tests {
             accel: 0.0,
             source: "test".to_string(),
         }
+    }
+
+    #[test]
+    fn startup_gate_skips_first_live_market_when_started_mid_window() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.data_mode = "live".to_string();
+        cfg.auto_discover_market = true;
+        cfg.market_window_secs = 300;
+
+        let mut gate = StartupMarketGate::default();
+        let mut frame = flat_frame(100.0);
+        frame.market = "btc-updown-5m-1000".to_string();
+        frame.tau_seconds = 240.0;
+
+        assert_eq!(
+            gate.check(&cfg, &frame),
+            StartupGateAction::Skip {
+                elapsed_secs: 60.0,
+                first_notice: true,
+            }
+        );
+        assert_eq!(
+            gate.check(&cfg, &frame),
+            StartupGateAction::Skip {
+                elapsed_secs: 60.0,
+                first_notice: false,
+            }
+        );
+
+        frame.market = "btc-updown-5m-1300".to_string();
+        frame.tau_seconds = 299.0;
+        assert_eq!(
+            gate.check(&cfg, &frame),
+            StartupGateAction::Release {
+                skipped_market: "btc-updown-5m-1000".to_string(),
+            }
+        );
+        assert_eq!(gate.check(&cfg, &frame), StartupGateAction::Allow);
+    }
+
+    #[test]
+    fn startup_gate_allows_fresh_open_and_non_live_modes() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.data_mode = "live".to_string();
+        cfg.auto_discover_market = true;
+        cfg.market_window_secs = 300;
+
+        let mut fresh = flat_frame(100.0);
+        fresh.tau_seconds = 298.0;
+        assert_eq!(
+            StartupMarketGate::default().check(&cfg, &fresh),
+            StartupGateAction::Allow
+        );
+
+        let mut mid = flat_frame(100.0);
+        mid.tau_seconds = 200.0;
+        cfg.data_mode = "sim".to_string();
+        assert_eq!(
+            StartupMarketGate::default().check(&cfg, &mid),
+            StartupGateAction::Allow
+        );
     }
 
     #[test]
