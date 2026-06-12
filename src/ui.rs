@@ -309,7 +309,6 @@ fn print_latest_market(cfg: &Config) -> AppResult<()> {
             ("UpAsk".to_string(), 7, Align::Right),
             ("DnBid".to_string(), 7, Align::Right),
             ("DnAsk".to_string(), 7, Align::Right),
-            ("Mom1s".to_string(), 8, Align::Right),
             ("来源".to_string(), 20, Align::Left),
         ])
     );
@@ -323,7 +322,6 @@ fn print_latest_market(cfg: &Config) -> AppResult<()> {
                 (format!("{:.3}", r.up_ask), 7, Align::Right),
                 (format_market_px(r.down_bid), 7, Align::Right),
                 (format!("{:.3}", r.down_ask), 7, Align::Right),
-                (format!("{:+.1}", r.mom_1s), 8, Align::Right),
                 (r.source, 20, Align::Left),
             ])
         );
@@ -343,7 +341,6 @@ fn print_latest_quotes(cfg: &Config) -> AppResult<()> {
             ("价格".to_string(), 7, Align::Right),
             ("份额".to_string(), 6, Align::Right),
             ("fair".to_string(), 7, Align::Right),
-            ("MomUp".to_string(), 7, Align::Right),
             ("Up仓".to_string(), 8, Align::Right),
             ("Dn仓".to_string(), 8, Align::Right),
         ])
@@ -357,7 +354,6 @@ fn print_latest_quotes(cfg: &Config) -> AppResult<()> {
                 (format!("{:.3}", r.price), 7, Align::Right),
                 (format!("{:.0}", r.size), 6, Align::Right),
                 (format!("{:.3}", r.fair), 7, Align::Right),
-                (format!("{:.3}", r.momentum_up_shadow), 7, Align::Right),
                 (format!("{:.0}", r.inventory_up), 8, Align::Right),
                 (format!("{:.0}", r.inventory_down), 8, Align::Right),
             ])
@@ -725,35 +721,18 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("REQUOTE_THRESHOLD_TICKS", "价差变化多少tick才撤旧换新"),
         ("INVENTORY_SKEW", "库存偏移强度"),
         ("INVENTORY_MULT", "单边最大库存倍数"),
-        (
-            "MAX_UNPAIRED_SHARES",
-            "最大未配平份额,正数至少按QUOTE_SIZE执行",
-        ),
+        ("MAX_UNPAIRED_SHARES", "最大未配平份额"),
         ("MIN_BID", "最低挂买价"),
         ("MAX_BID", "最高挂买价"),
         ("MAX_LOSS", "最坏情景最大亏损"),
-        (
-            "MAX_TOTAL_INVENTORY",
-            "Up+Down最大总库存,正数至少按双边容量执行",
-        ),
-        (
-            "LIVE_ORDER_NOTIONAL_CAP",
-            "实单单笔名义金额上限,低于份额需求会自动抬高",
-        ),
+        ("MAX_TOTAL_INVENTORY", "Up+Down最大总库存"),
+        ("LIVE_ORDER_NOTIONAL_CAP", "实单单笔名义金额上限"),
         ("MARKET_INTERVAL_MS", "模拟行情间隔毫秒"),
         ("STALE_AFTER_MS", "行情过期毫秒"),
         ("WS_STALE_AFTER_MS", "live WS断流停止毫秒"),
         ("VALUE_MIN_EDGE", "价值买入最低安全垫: fair - bid"),
         ("VALUE_AGGRESSION_TICKS", "价值买入相对买一抬高多少tick"),
         ("VALUE_MIN_FAIR", "价值买入最低模型胜率过滤"),
-        (
-            "STRATEGY_MODE",
-            "selective=趋势强边优先; value_buy=旧版双边",
-        ),
-        ("EDGE_HIGH", "强边/震荡最低安全垫"),
-        ("EDGE_LOW", "弱边最低安全垫"),
-        ("TREND_MIN_GAP", "模型和盘口同向离50%的趋势阈值"),
-        ("RANGE_MAX_GAP", "离50%多少以内按震荡双边处理"),
         ("ENABLE_MARKET_ANCHOR", "1=真实报价使用盘口锚定融合胜率"),
         ("MARKET_ANCHOR_SHADOW", "1=记录影子融合胜率,不改报价"),
         ("MARKET_ANCHOR_WEIGHT", "盘口锚定兼容默认权重"),
@@ -761,9 +740,6 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("MARKET_ANCHOR_WEIGHT_LOW", "模型低胜率边盘口锚定权重"),
         ("MARKET_ANCHOR_LOW_SIDE_BELOW", "低胜率边判定阈值"),
         ("MARKET_ANCHOR_MAX_SPREAD", "盘口健康价差上限"),
-        ("MOMENTUM_SHADOW", "1=记录短线动量影子胜率"),
-        ("MOMENTUM_WEIGHT", "动量最多修正多少胜率"),
-        ("MOMENTUM_SCALE_USD_PER_SEC", "BTC每秒多少美元算强动量"),
     ];
     println!("直接回车表示不修改。");
     for (key, desc) in keys {
@@ -803,9 +779,9 @@ fn print_param_help() {
     println!("  REQUOTE_*         旧报价和新报价差多少 tick 才撤旧换新");
     println!("  INVENTORY_SKEW    库存偏移，多仓侧降价、少仓侧抬价");
     println!("  INVENTORY_MULT    单边最大库存 = QUOTE_SIZE * INVENTORY_MULT");
-    println!("  MAX_UNPAIRED_*    最大未配平份额；正数会至少按 QUOTE_SIZE 执行");
+    println!("  MAX_UNPAIRED_*    最大未配平份额，超过后只允许挂落后的一边");
     println!("  MAX_LOSS          最坏结算情景亏损达到阈值就停止");
-    println!("  MAX_TOTAL_*       Up+Down 已成交+pending 达到阈值就停止；正数会至少按双边容量执行");
+    println!("  MAX_TOTAL_*       Up+Down 已成交+pending 达到阈值就停止");
     println!("  ENABLE_REAL_*     实单确认串；菜单2切实单时会自动写入");
     println!("  POLY_PRIVATE_*    私钥；菜单2可隐藏输入，别提交到GitHub");
     println!("  POLY_SIGNATURE_*  钱包签名类型；deposit wallet 通常是 poly1271 + funder");
@@ -829,21 +805,13 @@ fn print_param_help() {
     println!("  VALUE_MIN_EDGE         最低安全垫: 买价必须 <= 模型fair-该值");
     println!("  VALUE_AGGRESSION_TICKS 相对当前买一抬高多少tick,仍受安全垫限制");
     println!("  VALUE_MIN_FAIR         最低模型胜率过滤,低于则不挂这一边");
-    println!("  STRATEGY_MODE          selective=趋势强边优先、震荡双边; value_buy=旧版双边");
-    println!("  EDGE_HIGH              selective强边/震荡安全垫,默认1分");
-    println!("  EDGE_LOW               selective弱边安全垫,默认8分,减少低胜率边先成交");
-    println!("  TREND_MIN_GAP          模型和盘口同向离50%超过该值才按趋势强边处理");
-    println!("  RANGE_MAX_GAP          综合胜率离50%不超过该值按震荡局双边报价");
-    println!("  ENABLE_MARKET_ANCHOR   1=真实报价使用盘口锚定融合胜率;默认1");
+    println!("  ENABLE_MARKET_ANCHOR   1=真实报价使用盘口锚定融合胜率;默认0");
     println!("  MARKET_ANCHOR_SHADOW   1=只记录FinalUp影子胜率,不改变报价");
     println!("  MARKET_ANCHOR_WEIGHT   兼容默认权重;HIGH/LOW未设置时使用它");
     println!("  MARKET_ANCHOR_WEIGHT_HIGH 模型高胜率边盘口锚定权重");
     println!("  MARKET_ANCHOR_WEIGHT_LOW  模型低胜率边盘口锚定权重");
     println!("  MARKET_ANCHOR_LOW_SIDE_BELOW 低于该模型胜率的一边按LOW权重");
     println!("  MARKET_ANCHOR_MAX_SPREAD 盘口健康价差上限,超过则权重归零");
-    println!("  MOMENTUM_SHADOW       1=记录短线动量影子胜率,不改变报价");
-    println!("  MOMENTUM_WEIGHT       动量最多把Up胜率上/下修多少,0.08=8分");
-    println!("  MOMENTUM_SCALE_USD_PER_SEC BTC每秒多少美元趋势视为强动量");
     println!("  ENABLE_DELTA_HEDGE     0=关。对冲为占位骨架，实单模式禁止开启");
 }
 
@@ -1874,10 +1842,6 @@ mod tests {
             price_to_beat: 99.0,
             tau_seconds,
             vol_per_sqrt_sec: 0.0,
-            mom_1s: 0.0,
-            mom_3s: 0.0,
-            mom_10s: 0.0,
-            accel: 0.0,
             source: String::new(),
         }
     }
@@ -1967,12 +1931,12 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "VOL_MAX_PER_SQRT_SEC", "60")?;
     upsert_env_if_missing(path, "WIDTH_FLOOR_USD", "3")?;
     upsert_env_if_missing(path, "BASE_HALF_SPREAD", "0.012")?;
-    upsert_env_if_missing(path, "MIN_LOCK_EDGE", "0.06")?;
+    upsert_env_if_missing(path, "MIN_LOCK_EDGE", "0.02")?;
     upsert_env_if_missing(path, "LATENCY_SEC", "0.4")?;
     upsert_env_if_missing(path, "K_ADVERSE", "1")?;
     upsert_env_if_missing(path, "MIN_HALF_SPREAD", "0.005")?;
     upsert_env_if_missing(path, "MAX_HALF_SPREAD", "0.25")?;
-    upsert_env_if_missing(path, "ENDGAME_PULL_SECS", "15")?;
+    upsert_env_if_missing(path, "ENDGAME_PULL_SECS", "12")?;
     upsert_env_if_missing(path, "INVENTORY_SKEW_TIME_BOOST", "2")?;
     upsert_env_if_missing(path, "TOX_HORIZON_MS", "2500")?;
     upsert_env_if_missing(path, "TOX_DECAY", "0.5")?;
@@ -2001,44 +1965,14 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing_with_comment(
         path,
         "VALUE_MIN_FAIR",
-        "0.20",
+        "0.05",
         "最低模型胜率过滤：低于这个fair的一边不挂单。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
-        "STRATEGY_MODE",
-        "selective",
-        "selective=趋势强边优先、震荡双边；value_buy=旧版双边价值挂单。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "EDGE_HIGH",
-        "0.01",
-        "selective强边/震荡最低安全垫：fair-bid至少1分，提高高胜率边成交率。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "EDGE_LOW",
-        "0.08",
-        "selective弱边最低安全垫：fair-bid至少8分，减少低胜率边先成交。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "TREND_MIN_GAP",
-        "0.12",
-        "模型和盘口同向离50%超过该值时判定趋势局。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "RANGE_MAX_GAP",
-        "0.08",
-        "综合胜率离50%不超过该值时判定震荡局，允许双边快速锁仓。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
         "ENABLE_MARKET_ANCHOR",
-        "1",
-        "1=真实报价使用盘口锚定融合胜率，缓解模型慢一步。",
+        "0",
+        "1=真实报价使用盘口锚定融合胜率；默认0只记录影子值。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
@@ -2055,13 +1989,13 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing_with_comment(
         path,
         "MARKET_ANCHOR_WEIGHT_HIGH",
-        "0.35",
+        "0.30",
         "模型高胜率边盘口融合权重；低一些可保留模型优势。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
         "MARKET_ANCHOR_WEIGHT_LOW",
-        "0.85",
+        "0.60",
         "模型低胜率对边盘口融合权重；高一些可避免低边挂价离谱。",
     )?;
     upsert_env_if_missing_with_comment(
@@ -2075,24 +2009,6 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
         "MARKET_ANCHOR_MAX_SPREAD",
         "0.12",
         "盘口健康价差上限；超过该价差则盘口锚定权重降为0。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "MOMENTUM_SHADOW",
-        "1",
-        "1=记录短线动量影子胜率，不改变真实报价。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "MOMENTUM_WEIGHT",
-        "0.08",
-        "动量最多把Up胜率上/下修多少；0.08=最多8分。",
-    )?;
-    upsert_env_if_missing_with_comment(
-        path,
-        "MOMENTUM_SCALE_USD_PER_SEC",
-        "8",
-        "BTC每秒约多少美元趋势视为强动量；越小越敏感。",
     )?;
     Ok(())
 }

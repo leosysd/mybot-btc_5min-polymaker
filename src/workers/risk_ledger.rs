@@ -20,11 +20,6 @@ use super::state::{
 };
 
 const RECV_TIMEOUT: Duration = Duration::from_millis(250);
-const POSITION_RECONCILE_POLL_INTERVAL: Duration = Duration::from_millis(500);
-/// How long suspect (maybe-filled) shares keep occupying cap room before a
-/// caught-up reconcile that found no fill releases them. Generous versus the
-/// usual Polygon mine + Data API indexing lag of a few seconds.
-const SUSPECT_AGE_OUT_MS: u64 = 20_000;
 
 pub fn run(
     cfg: Config,
@@ -67,118 +62,46 @@ pub fn run(
     let mut current_market = String::new();
     let mut up_token = String::new();
     let mut down_token = String::new();
-    // P2: after a real fill (or an ambiguous cancel that parked suspect shares),
-    // poll the authoritative Data API until it catches up to the locally
-    // credited inventory and all suspect shares are resolved. This runs in the
-    // BACKGROUND — placement is never paused; suspect shares occupying cap room
-    // are what prevent repeat buying while the position is uncertain.
-    let mut next_forced_reconcile: Option<Instant> = None;
+    // P2: set when the gateway reports an unmatched account fill — forces an
+    // immediate reconcile on the next loop, bypassing the interval timer.
+    let mut force_reconcile = false;
 
     while !stopping(&stop, &cfg) {
         // Periodic on-chain position reconciliation (real mode only).
         if let Some(reconciler) = &position_reconciler {
-            let now = Instant::now();
             let interval_due = cfg.reconcile_interval_ms > 0
                 && last_position_sync.elapsed() >= Duration::from_millis(cfg.reconcile_interval_ms);
-            let force_due = next_forced_reconcile.is_some_and(|due| now >= due);
-            let periodic_allowed = interval_due && next_forced_reconcile.is_none();
-            let token_ready = (!up_token.trim().is_empty() || !down_token.trim().is_empty())
+            let pair_ready = !up_token.trim().is_empty()
+                && !down_token.trim().is_empty()
                 && !current_market.is_empty();
-            if (periodic_allowed || force_due) && token_ready {
-                last_position_sync = now;
+            if (interval_due || force_reconcile) && pair_ready {
+                last_position_sync = Instant::now();
                 // Only reconcile when BOTH tokens belong to the SAME market the
                 // shared inventory is currently on — never mix new/old windows.
                 let market_matches = { inventory.lock().unwrap().market == current_market };
                 if market_matches {
+                    force_reconcile = false;
                     match reconciler.fetch(&up_token, &down_token) {
                         Ok(snap) => {
-                            let mut stale_market = false;
-                            let (corrected, caught_up, local_up, local_down) = {
+                            // Reconcile confirmed the on-chain position → release
+                            // any placement pause set by a prior unmatched fill.
+                            reconcile_gate.store(false, Ordering::Relaxed);
+                            let corrected = {
                                 let mut inv = inventory.lock().unwrap();
-                                // Re-check under the lock: the gateway may have
-                                // switched windows while fetch() was in flight.
-                                // NEVER apply an old window's snapshot to the new
-                                // window's freshly-reset inventory.
-                                if inv.market != current_market {
-                                    stale_market = true;
-                                    (false, true, inv.up_shares, inv.down_shares)
-                                } else {
-                                    let pre_up = inv.up_shares;
-                                    let pre_down = inv.down_shares;
-                                    let mut dirty =
-                                        reconcile_inventory_with_chain(&cfg, &mut inv, &snap)?;
-                                    // A raise means the chain confirmed the real
-                                    // position — suspects on that side are absorbed.
-                                    if inv.up_shares > pre_up + 1e-9 && inv.suspect_up > 0.0 {
-                                        inv.suspect_up = 0.0;
-                                        dirty = true;
-                                    }
-                                    if inv.down_shares > pre_down + 1e-9 && inv.suspect_down > 0.0 {
-                                        inv.suspect_down = 0.0;
-                                        dirty = true;
-                                    }
-                                    // No raise after a generous indexing margin →
-                                    // conclude the suspected fill never happened
-                                    // and release the parked cap room.
-                                    if inv.has_suspects()
-                                        && now_ms().saturating_sub(inv.suspect_since_ms)
-                                            > SUSPECT_AGE_OUT_MS
-                                    {
-                                        inv.clear_suspects();
-                                        dirty = true;
-                                    }
-                                    let caught_up = snapshot_covers_inventory(
-                                        &snap,
-                                        &inv,
-                                        &up_token,
-                                        &down_token,
-                                    ) && !inv.has_suspects();
-                                    (dirty, caught_up, inv.up_shares, inv.down_shares)
-                                }
+                                reconcile_inventory_with_chain(&cfg, &mut inv, &snap)?
                             };
-                            if stale_market {
-                                next_forced_reconcile = None;
-                                reconcile_gate.store(false, Ordering::Relaxed);
-                                continue;
-                            }
                             if corrected {
                                 let inv = inventory.lock().unwrap();
                                 write_json(&cfg.inventory_path(), &*inv)?;
                                 check_kill_switch(&cfg, &stop, &inv)?;
                             }
-                            if force_due && !caught_up {
-                                next_forced_reconcile =
-                                    Some(Instant::now() + POSITION_RECONCILE_POLL_INTERVAL);
-                                heartbeat(
-                                    &cfg,
-                                    "risk-ledger",
-                                    format!(
-                                        "position reconcile waiting: api up={:.2} down={:.2}, local up={:.2} down={:.2}",
-                                        snap.up_shares, snap.down_shares, local_up, local_down
-                                    ),
-                                )?;
-                            } else {
-                                // Reconcile confirmed the exchange-facing position.
-                                // Release any placement pause set by an inventory-dirty event.
-                                next_forced_reconcile = None;
-                                reconcile_gate.store(false, Ordering::Relaxed);
-                            }
                         }
-                        Err(err) => {
-                            if force_due {
-                                next_forced_reconcile =
-                                    Some(Instant::now() + POSITION_RECONCILE_POLL_INTERVAL);
-                            }
-                            heartbeat(
-                                &cfg,
-                                "risk-ledger",
-                                format!("position reconcile failed: {err}"),
-                            )?;
-                        }
+                        Err(err) => heartbeat(
+                            &cfg,
+                            "risk-ledger",
+                            format!("position reconcile failed: {err}"),
+                        )?,
                     }
-                } else if force_due {
-                    next_forced_reconcile = None;
-                    reconcile_gate.store(false, Ordering::Relaxed);
                 }
             }
         }
@@ -192,8 +115,6 @@ pub fn run(
                     current_market = accepted.quote.market.clone();
                     up_token.clear();
                     down_token.clear();
-                    next_forced_reconcile = None;
-                    reconcile_gate.store(false, Ordering::Relaxed);
                 }
                 if !accepted.quote.token_id.trim().is_empty() {
                     match accepted.quote.side.as_str() {
@@ -220,50 +141,36 @@ pub fn run(
                 // The gateway already credited the shared inventory; we enrich the
                 // fill from it for the fills.jsonl log and persist inventory.json.
                 let inv = inventory.lock().unwrap();
-                let fill_matches_current_market = inv.market == fill.market;
                 let enriched = FillEvent {
-                    quote_id: fill.quote_id.clone(),
+                    quote_id: fill.quote_id,
                     ts_ms: now_ms(),
-                    market: fill.market.clone(),
-                    token_id: fill.token_id.clone(),
-                    side: fill.side.clone(),
+                    market: fill.market,
+                    side: fill.side,
                     price: fill.price,
                     size: fill.size,
                     inventory_up: inv.up_shares,
                     inventory_down: inv.down_shares,
                     pnl_if_up: inv.pnl_if_up(),
                     pnl_if_down: inv.pnl_if_down(),
-                    source: fill.source.clone(),
+                    source: fill.source,
                 };
                 log_jsonl(&logger, &cfg.fills_path(), &enriched)?;
                 write_json(&cfg.inventory_path(), &*inv)?;
                 check_kill_switch(&cfg, &stop, &inv)?;
                 drop(inv);
-                if fill_matches_current_market {
-                    learn_token_pair_from_fill(
-                        &mut current_market,
-                        &mut up_token,
-                        &mut down_token,
-                        &fill,
-                    );
-                    // Background verification only — a matched fill is exact
-                    // accounting, so placement is NOT paused (pausing cancelled
-                    // the opposite leg and froze the bot one-sided).
-                    next_forced_reconcile = Some(Instant::now());
-                }
                 heartbeat(&cfg, "risk-ledger", "fill accounted")?;
             }
             Ok(LedgerEvent::UnmatchedFill) => {
-                // Gateway saw an account fill it couldn't match to a known order
-                // (or an ambiguous cancel parked suspect shares). Placement is
-                // NOT paused — the suspect shares already occupy cap room, which
-                // is what prevents repeat buying. Force an immediate on-chain
-                // reconcile to resolve them.
-                next_forced_reconcile = Some(Instant::now());
+                // Gateway saw an account fill it couldn't match to a known order.
+                // PAUSE gateway placement (the shared inventory under-counts the
+                // real position until we reconcile) and force an immediate
+                // on-chain reconcile; the gate is released once it succeeds.
+                reconcile_gate.store(true, Ordering::Relaxed);
+                force_reconcile = true;
                 heartbeat(
                     &cfg,
                     "risk-ledger",
-                    "unmatched fill -> forcing background reconcile (no pause)",
+                    "unmatched fill -> pausing placement + forcing reconcile",
                 )?;
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -273,27 +180,6 @@ pub fn run(
         }
     }
     Ok(())
-}
-
-fn learn_token_pair_from_fill(
-    current_market: &mut String,
-    up_token: &mut String,
-    down_token: &mut String,
-    fill: &FillEvent,
-) {
-    if fill.market != *current_market {
-        *current_market = fill.market.clone();
-        up_token.clear();
-        down_token.clear();
-    }
-    if fill.token_id.trim().is_empty() {
-        return;
-    }
-    match fill.side.as_str() {
-        "Up" => *up_token = fill.token_id.clone(),
-        "Down" => *down_token = fill.token_id.clone(),
-        _ => {}
-    }
 }
 
 /// Overwrite locally-derived filled inventory with authoritative on-chain
@@ -339,18 +225,6 @@ fn reconcile_inventory_with_chain(
     Ok(changed)
 }
 
-fn snapshot_covers_inventory(
-    snap: &PositionSnapshot,
-    inventory: &Inventory,
-    up_token: &str,
-    down_token: &str,
-) -> bool {
-    const TOL: f64 = 0.5;
-    let up_ok = up_token.trim().is_empty() || snap.up_shares + TOL >= inventory.up_shares;
-    let down_ok = down_token.trim().is_empty() || snap.down_shares + TOL >= inventory.down_shares;
-    up_ok && down_ok
-}
-
 fn check_kill_switch(cfg: &Config, stop: &StopFlag, inventory: &Inventory) -> AppResult<()> {
     let worst_pnl = inventory.pnl_if_up().min(inventory.pnl_if_down());
     if cfg.max_loss > 0.0 && worst_pnl <= -cfg.max_loss {
@@ -364,7 +238,7 @@ fn check_kill_switch(cfg: &Config, stop: &StopFlag, inventory: &Inventory) -> Ap
     }
 
     let total_inventory = inventory.effective_up() + inventory.effective_down();
-    if max_total_inventory_exceeded(cfg, inventory) {
+    if cfg.max_total_inventory > 0.0 && total_inventory >= cfg.max_total_inventory {
         heartbeat(
             cfg,
             "risk-ledger",
@@ -373,96 +247,4 @@ fn check_kill_switch(cfg: &Config, stop: &StopFlag, inventory: &Inventory) -> Ap
         request_stop(stop, cfg)?;
     }
     Ok(())
-}
-
-fn max_total_inventory_exceeded(cfg: &Config, inventory: &Inventory) -> bool {
-    let max_total_inventory = cfg.effective_max_total_inventory();
-    if max_total_inventory <= 0.0 {
-        return false;
-    }
-    let total_inventory = inventory.effective_up() + inventory.effective_down();
-    total_inventory > max_total_inventory + 1e-9
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_cfg() -> Config {
-        Config::from_env().expect("config")
-    }
-
-    #[test]
-    fn max_total_inventory_allows_exact_limit() {
-        let mut cfg = test_cfg();
-        cfg.max_total_inventory = 40.0;
-        let inv = Inventory {
-            up_shares: 20.0,
-            down_shares: 20.0,
-            ..Default::default()
-        };
-
-        assert!(!max_total_inventory_exceeded(&cfg, &inv));
-    }
-
-    #[test]
-    fn max_total_inventory_blocks_above_limit() {
-        let mut cfg = test_cfg();
-        cfg.max_total_inventory = 40.0;
-        let inv = Inventory {
-            up_shares: 20.01,
-            down_shares: 20.0,
-            ..Default::default()
-        };
-
-        assert!(max_total_inventory_exceeded(&cfg, &inv));
-    }
-
-    #[test]
-    fn snapshot_must_catch_up_before_releasing_reconcile_gate() {
-        let inv = Inventory {
-            up_shares: 20.0,
-            down_shares: 5.0,
-            ..Default::default()
-        };
-        let stale = PositionSnapshot {
-            up_shares: 15.0,
-            down_shares: 5.0,
-            ..Default::default()
-        };
-        let fresh = PositionSnapshot {
-            up_shares: 20.0,
-            down_shares: 5.0,
-            ..Default::default()
-        };
-
-        assert!(!snapshot_covers_inventory(
-            &stale,
-            &inv,
-            "up-token",
-            "down-token"
-        ));
-        assert!(snapshot_covers_inventory(
-            &fresh,
-            &inv,
-            "up-token",
-            "down-token"
-        ));
-    }
-
-    #[test]
-    fn snapshot_ignores_unknown_token_side() {
-        let inv = Inventory {
-            up_shares: 20.0,
-            down_shares: 5.0,
-            ..Default::default()
-        };
-        let snap = PositionSnapshot {
-            up_shares: 20.0,
-            down_shares: 0.0,
-            ..Default::default()
-        };
-
-        assert!(snapshot_covers_inventory(&snap, &inv, "up-token", ""));
-    }
 }

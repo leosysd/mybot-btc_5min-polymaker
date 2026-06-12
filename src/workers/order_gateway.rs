@@ -7,7 +7,7 @@
 //! to `resting` is reflected into the shared inventory's pending immediately
 //! under the lock, so the cap can never be beaten by lag/churn.
 
-use crate::config::{Config, MIN_ORDER_SIZE_SHARES};
+use crate::config::Config;
 use crate::ipc::{
     heartbeat, now_ms, write_json, FillEvent, Inventory, OrderAccepted, OrderCancelled, QuoteIntent,
 };
@@ -26,8 +26,8 @@ use tungstenite::{connect, Message};
 use super::collector::parse_f64_value;
 use super::state::{
     held_shares, is_ws_timeout, opposite_avg_cost, pending_shares, recompute_pending_from_resting,
-    reset_inventory_for_market, sleep_ms, stopping, suspect_shares, tune_ws_socket, GatewayEvent,
-    GatewayRx, GatewayTx, LedgerEvent, LedgerTx, QuoteMeta, QuoteRx, ReconcileGate, RestingOrder,
+    reset_inventory_for_market, sleep_ms, stopping, tune_ws_socket, GatewayEvent, GatewayRx,
+    GatewayTx, LedgerEvent, LedgerTx, QuoteMeta, QuoteRx, ReconcileGate, RestingOrder,
     SharedInventory, SharedOrderMap, StopFlag,
 };
 
@@ -35,26 +35,6 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 /// Max time placement stays paused awaiting reconcile before self-clearing, so a
 /// reconcile that can't run (e.g. tokens not yet learned) never deadlocks us.
 const RECONCILE_PAUSE_TIMEOUT: Duration = Duration::from_millis(5_000);
-
-fn min_order_size(cfg: &Config) -> f64 {
-    if cfg.real_orders_enabled() {
-        MIN_ORDER_SIZE_SHARES
-    } else {
-        1.0
-    }
-}
-
-fn cap_quote_to_side_room(cfg: &Config, quote: &mut QuoteIntent, held: f64, pending: f64) -> bool {
-    let min_size = min_order_size(cfg);
-    let room = (cfg.max_side_inventory() - held - pending).floor();
-    if room + 1e-9 < min_size {
-        return false;
-    }
-    if room + 1e-9 < quote.size {
-        quote.size = room;
-    }
-    quote.size + 1e-9 >= min_size
-}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -123,7 +103,6 @@ pub fn run(
             Arc::clone(&order_map),
             gw_tx.clone(),
             ledger_tx.clone(),
-            Arc::clone(&reconcile_gate),
         )?;
     }
 
@@ -142,24 +121,14 @@ pub fn run(
     // Per-side cooldown after a rejected order, so we don't spin and hammer the
     // exchange with crossing orders (and risk rate-limiting).
     let mut reject_until: HashMap<String, u64> = HashMap::new();
-    // When set, placement is paused until risk-ledger confirms an authoritative
-    // position reconcile. In real mode this is safety-critical: if inventory is
-    // even briefly uncertain, do not keep live orders resting.
+    // When set, placement is paused (an unmatched fill is awaiting reconcile).
     let mut reconcile_pause_since: Option<Instant> = None;
-    let mut reconcile_pause_market: Option<String> = None;
-    let mut last_pause_heartbeat: Option<Instant> = None;
-    let mut pause_cleanup_done = false;
 
     let loop_result = (|| -> AppResult<()> {
         while !stopping(&stop, &cfg) {
             // Drain internal events from the user-WS thread first: it already
             // credited fills / registered cancels into the shared inventory; we
             // just update the resting map and recompute pending here.
-            // NOTE: a matched fill is EXACT accounting (size/price from the user
-            // WS) — it must NOT pause placement or sweep orders. Pausing here
-            // cancelled the opposite resting leg on every fill, which destroyed
-            // pairing and left the bot one-sided. Risk-ledger still runs a
-            // background verification reconcile after each fill, without a gate.
             while let Ok(event) = gw_rx.try_recv() {
                 apply_gateway_event(&cfg, &inventory, real_orders.as_ref(), &mut resting, event)?;
             }
@@ -191,57 +160,30 @@ pub fn run(
                 }
             }
 
-            // Placement pause after a fill/inventory-dirty signal, until risk
-            // reconciles. This intentionally does NOT self-clear in real mode: a
-            // stuck reconcile is safer than placing with unknown inventory.
+            // P1: placement pause after an unmatched fill, until risk reconciles
+            // (self-clearing after a timeout so it can never deadlock placement).
             let placement_paused = if reconcile_gate.load(Ordering::Relaxed) {
                 match reconcile_pause_since {
                     None => {
                         reconcile_pause_since = Some(Instant::now());
-                        if reconcile_pause_market.is_none() {
-                            let market = inventory.lock().unwrap().market.clone();
-                            if !market.trim().is_empty() {
-                                reconcile_pause_market = Some(market);
-                            }
-                        }
                         true
                     }
-                    Some(t) => {
-                        let should_report = t.elapsed() >= RECONCILE_PAUSE_TIMEOUT
-                            && last_pause_heartbeat
-                                .is_none_or(|last| last.elapsed() >= RECONCILE_PAUSE_TIMEOUT);
-                        if should_report {
-                            last_pause_heartbeat = Some(Instant::now());
-                            heartbeat(
-                                &cfg,
-                                "order-gateway",
-                                "inventory reconcile still pending; placement remains paused",
-                            )?;
-                        }
-                        true
+                    Some(t) if t.elapsed() < RECONCILE_PAUSE_TIMEOUT => true,
+                    Some(_) => {
+                        reconcile_gate.store(false, Ordering::Relaxed);
+                        reconcile_pause_since = None;
+                        heartbeat(
+                            &cfg,
+                            "order-gateway",
+                            "unmatched-fill pause timed out, resuming placement",
+                        )?;
+                        false
                     }
                 }
             } else {
                 reconcile_pause_since = None;
-                reconcile_pause_market = None;
-                last_pause_heartbeat = None;
-                pause_cleanup_done = false;
                 false
             };
-
-            if placement_paused && !pause_cleanup_done {
-                if let Some(real_orders) = real_orders.as_ref() {
-                    pause_cleanup_done = sweep_exchange_orders_before_reconcile(
-                        &cfg,
-                        &inventory,
-                        real_orders,
-                        &order_map,
-                        &mut resting,
-                    )?;
-                } else {
-                    pause_cleanup_done = true;
-                }
-            }
 
             match quote_rx.recv_timeout(RECV_TIMEOUT) {
                 Ok(first) => {
@@ -263,63 +205,16 @@ pub fn run(
                             }
                         }
                     }
-                    let freshest_market = newest_quote_market(&latest);
-                    if let Some(market) = freshest_market.as_deref() {
-                        latest.retain(|_, q| q.market == market);
-                    }
                     // Channel drained above (no backlog); if paused, place nothing.
                     if placement_paused {
-                        if let Some(market) = freshest_market.as_deref() {
-                            if reconcile_pause_allows_market_switch(
-                                reconcile_pause_market.as_deref(),
-                                market,
-                            ) {
-                                let old_market = reconcile_pause_market.take().unwrap_or_default();
-                                reconcile_gate.store(false, Ordering::Relaxed);
-                                reconcile_pause_since = None;
-                                last_pause_heartbeat = None;
-                                pause_cleanup_done = false;
-                                heartbeat(
-                                    &cfg,
-                                    "order-gateway",
-                                    format!(
-                                        "reconcile pause released on market switch: {old_market} -> {market}"
-                                    ),
-                                )?;
-                            } else {
-                                heartbeat(
-                                    &cfg,
-                                    "order-gateway",
-                                    "placement paused: awaiting reconcile after unmatched fill",
-                                )?;
-                                continue;
-                            }
-                        } else {
-                            heartbeat(
-                                &cfg,
-                                "order-gateway",
-                                "placement paused: awaiting reconcile after unmatched fill",
-                            )?;
-                            continue;
-                        }
-                    }
-                    if reconcile_gate.load(Ordering::Relaxed) {
                         heartbeat(
                             &cfg,
                             "order-gateway",
-                            "placement paused: reconcile gate still set",
+                            "placement paused: awaiting reconcile after unmatched fill",
                         )?;
                         continue;
                     }
                     for (_qside, mut quote) in latest.into_iter() {
-                        if reconcile_gate.load(Ordering::Relaxed) {
-                            heartbeat(
-                                &cfg,
-                                "order-gateway",
-                                "placement paused: fill detected during quote cycle",
-                            )?;
-                            break;
-                        }
                         let age = now_ms().saturating_sub(quote.ts_ms);
                         if age > cfg.stale_after_ms {
                             heartbeat(
@@ -362,48 +257,31 @@ pub fn run(
                         // thread is the sole writer of pending/fills (synchronously),
                         // held+pending is always current here — this is what stops the
                         // over-accumulation runaway.
-                        let (held, pending, suspect, opp_avg) = {
+                        let (held, pending, opp_avg) = {
                             let inv = inventory.lock().unwrap();
                             (
                                 held_shares(&inv, &quote.market, &quote.side),
                                 pending_shares(&inv, &quote.market, &quote.side),
-                                suspect_shares(&inv, &quote.market, &quote.side),
                                 opposite_avg_cost(&inv, &quote.market, &quote.side),
                             )
                         };
                         // Counts OUTSTANDING orders, so churn/lag cannot exceed the cap.
-                        // Suspect (maybe-filled, unreconciled) shares occupy room too:
-                        // this — not a placement pause — is what prevents repeat
-                        // buying into an under-counted position. If a partial fill
-                        // leaves enough residual room for a valid exchange order,
-                        // trim the next quote to that room so the lagging leg can be
-                        // topped up instead of getting stuck.
-                        let original_size = quote.size;
-                        if !cap_quote_to_side_room(&cfg, &mut quote, held, pending + suspect) {
+                        let side_cap_room = cfg.max_side_inventory() - held - pending;
+                        let room = side_cap_room.floor();
+                        // Skip unless there's room for a FULL quote. Posting the
+                        // leftover (e.g. 2 shares when room=2) is below the exchange
+                        // minimum order size and gets rejected ("Size lower than
+                        // minimum: 5"), spamming the log and risking rate limits.
+                        if room < quote.size {
                             heartbeat(
-                                &cfg,
-                                "order-gateway",
-                                format!(
-                                    "side cap reached {} held={:.2} pending={:.2} suspect={:.2} room={:.0} (min {:.0})",
-                                    quote.side,
-                                    held,
-                                    pending,
-                                    suspect,
-                                    (cfg.max_side_inventory() - held - pending - suspect).floor(),
-                                    min_order_size(&cfg)
-                                ),
-                            )?;
+                            &cfg,
+                            "order-gateway",
+                            format!(
+                                "side cap reached {} held={:.0} pending={:.0} room={:.0} (need {:.0})",
+                                quote.side, held, pending, room, quote.size
+                            ),
+                        )?;
                             continue;
-                        }
-                        if quote.size + 1e-9 < original_size {
-                            heartbeat(
-                                &cfg,
-                                "order-gateway",
-                                format!(
-                                    "side cap trims {} size {:.2}->{:.2} held={:.2} pending={:.2} suspect={:.2}",
-                                    quote.side, original_size, quote.size, held, pending, suspect
-                                ),
-                            )?;
                         }
 
                         let incremental_size = if resting.contains_key(&quote.side) {
@@ -427,9 +305,7 @@ pub fn run(
                                 "order-gateway",
                                 format!(
                                     "unpaired cap blocks {} size={:.0} limit={:.0}",
-                                    quote.side,
-                                    quote.size,
-                                    cfg.effective_max_unpaired_shares()
+                                    quote.side, quote.size, cfg.max_unpaired_shares
                                 ),
                             )?;
                             continue;
@@ -437,22 +313,8 @@ pub fn run(
 
                         // Gateway-authoritative cost-basis lock: cap THIS leg's price
                         // by the OPPOSITE side's real average fill, so completing a
-                        // pair can never breach 1 - MIN_LOCK_EDGE. Selective rescue
-                        // quotes intentionally act as stop-loss hedges for a wrong
-                        // one-sided position, so they must not be capped into an
-                        // unfillable price.
-                        let rescue_quote = quote.reason.starts_with("selective_rescue_");
-                        if rescue_quote {
-                            heartbeat(
-                                &cfg,
-                                "order-gateway",
-                                format!(
-                                    "rescue bypasses lock {} px={:.3} fair={:.3}",
-                                    quote.side, quote.price, quote.fair
-                                ),
-                            )?;
-                        }
-                        if let Some(opp) = opp_avg.filter(|_| !rescue_quote) {
+                        // pair can never breach 1 - MIN_LOCK_EDGE.
+                        if let Some(opp) = opp_avg {
                             let cap = floor_to_tick(1.0 - cfg.min_lock_edge - opp, cfg.tick_size);
                             if quote.price > cap {
                                 if cap < cfg.min_bid {
@@ -504,10 +366,6 @@ pub fn run(
                             // Old order not confirmed cancelled — it may still be live.
                             // Don't place a second order on this side (would risk a
                             // double-fill past the cap); retry on the next cycle.
-                            continue;
-                        }
-                        if reconcile_gate.load(Ordering::Relaxed) {
-                            heartbeat(&cfg, "order-gateway", "placement paused before order post")?;
                             continue;
                         }
                         if !accept_resting_order(
@@ -611,7 +469,6 @@ fn simulate_fill(
         quote_id: quote.quote_id.clone(),
         ts_ms: now_ms(),
         market: quote.market.clone(),
-        token_id: quote.token_id.clone(),
         side: quote.side.clone(),
         price: quote.price,
         size: quote.size,
@@ -642,24 +499,6 @@ fn should_keep_resting(cfg: &Config, old: Option<&RestingOrder>, quote: &QuoteIn
     (old.price - quote.price).abs() < threshold && (old.size - quote.size).abs() < 0.001
 }
 
-fn newest_quote_market(latest: &HashMap<String, QuoteIntent>) -> Option<String> {
-    latest
-        .values()
-        .max_by_key(|quote| quote.ts_ms)
-        .map(|quote| quote.market.clone())
-        .filter(|market| !market.trim().is_empty())
-}
-
-fn reconcile_pause_allows_market_switch(paused_market: Option<&str>, quote_market: &str) -> bool {
-    let quote_market = quote_market.trim();
-    if quote_market.is_empty() {
-        return false;
-    }
-    paused_market
-        .map(str::trim)
-        .is_some_and(|market| !market.is_empty() && market != quote_market)
-}
-
 fn unpaired_limit_allows_quote(
     cfg: &Config,
     inv: &Inventory,
@@ -667,16 +506,12 @@ fn unpaired_limit_allows_quote(
     side: &str,
     incremental_size: f64,
 ) -> bool {
-    let limit = cfg.effective_max_unpaired_shares();
+    let limit = cfg.max_unpaired_shares;
     if limit <= 0.0 || incremental_size <= 0.0 {
         return true;
     }
-    let up = held_shares(inv, market, "Up")
-        + pending_shares(inv, market, "Up")
-        + suspect_shares(inv, market, "Up");
-    let down = held_shares(inv, market, "Down")
-        + pending_shares(inv, market, "Down")
-        + suspect_shares(inv, market, "Down");
+    let up = held_shares(inv, market, "Up") + pending_shares(inv, market, "Up");
+    let down = held_shares(inv, market, "Down") + pending_shares(inv, market, "Down");
     let current = up - down;
     let projected = match side {
         "Up" => current + incremental_size,
@@ -723,11 +558,9 @@ fn order_map_from_resting(resting: &HashMap<String, RestingOrder>) -> HashMap<St
                     quote_id: order.quote_id.clone(),
                     market: order.market.clone(),
                     condition_id: order.condition_id.clone(),
-                    token_id: order.token_id.clone(),
                     side: order.side.clone(),
                     price: order.price,
                     size: order.size,
-                    original_size: order.size,
                     credited: false,
                     done: false,
                 },
@@ -746,25 +579,13 @@ fn accept_resting_order(
     ledger_tx: &LedgerTx,
     mut quote: QuoteIntent,
 ) -> AppResult<bool> {
-    let live_order_notional_cap = cfg.effective_live_order_notional_cap();
-    if live_order_notional_cap > 0.0 && quote.price > 0.0 {
-        let capped_size = (live_order_notional_cap / quote.price).floor();
+    if cfg.live_order_notional_cap > 0.0 && quote.price > 0.0 {
+        let capped_size = (cfg.live_order_notional_cap / quote.price).floor();
         if capped_size < 1.0 {
             heartbeat(cfg, "order-gateway", "skipped live notional cap")?;
             return Ok(false);
         }
         quote.size = quote.size.min(capped_size);
-    }
-    if real_orders.is_some() && quote.size + 1e-9 < MIN_ORDER_SIZE_SHARES {
-        heartbeat(
-            cfg,
-            "order-gateway",
-            format!(
-                "skipped below minimum order size {} size={:.2}",
-                quote.side, quote.size
-            ),
-        )?;
-        return Ok(false);
     }
     let exchange_order_id = if let Some(real_orders) = real_orders {
         // None = exchange rejected this quote (e.g. post-only crosses book).
@@ -795,11 +616,9 @@ fn accept_resting_order(
                     quote_id: quote.quote_id.clone(),
                     market: quote.market.clone(),
                     condition_id: quote.condition_id.clone(),
-                    token_id: quote.token_id.clone(),
                     side: quote.side.clone(),
                     price: quote.price,
                     size: quote.size,
-                    original_size: quote.size,
                     credited: false,
                     done: false,
                 },
@@ -902,17 +721,17 @@ fn cancel_resting_side(
             recompute_pending_from_resting(&mut inv, resting);
             Ok(true)
         }
-        Ok(CancelOutcome::GoneUnverified) => handle_gone_unverified_cancel(
-            cfg,
-            inventory,
-            real_orders,
-            order_map,
-            resting,
-            ledger_tx,
-            side,
-            reason,
-            &order,
-        ),
+        Ok(CancelOutcome::FilledOrGone) => {
+            // The order filled. Credit its shares to held NOW (before releasing
+            // pending) so held+pending never momentarily reads low — this is the
+            // fix for the live async over-accumulation. Dedup handled inside.
+            credit_filled_on_cancel(inventory, order_map, ledger_tx, &order)?;
+            resting.remove(side);
+            persist_active_orders_if_real(cfg, real_orders, resting)?;
+            let mut inv = inventory.lock().unwrap();
+            recompute_pending_from_resting(&mut inv, resting);
+            Ok(true)
+        }
         Err(err) => {
             // Not confirmed terminal (rejected / transient I/O) — the order may
             // still be live. Keep it counted (conservative for the cap) and do
@@ -925,48 +744,6 @@ fn cancel_resting_side(
             Ok(false)
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_gone_unverified_cancel(
-    cfg: &Config,
-    inventory: &SharedInventory,
-    real_orders: Option<&RealOrderClient>,
-    order_map: Option<&SharedOrderMap>,
-    resting: &mut HashMap<String, RestingOrder>,
-    ledger_tx: &LedgerTx,
-    side: &str,
-    reason: &str,
-    order: &RestingOrder,
-) -> AppResult<bool> {
-    // The exchange says the order is no longer open, but the cancel response
-    // does not tell us the real fill size/price. Do NOT invent a fill from
-    // local remaining size — and do NOT pause placement either (pausing froze
-    // the bot one-sided). Instead park the remaining size as SUSPECT shares:
-    // they keep occupying side-cap room (so this side cannot be re-bought over
-    // an unaccounted fill) while quoting continues, and the forced on-chain
-    // reconcile either absorbs them into held (it filled) or ages them out.
-    mark_order_reconcile_pending(order_map, order);
-    resting.remove(side);
-    persist_active_orders_if_real(cfg, real_orders, resting)?;
-    let mut inv = inventory.lock().unwrap();
-    recompute_pending_from_resting(&mut inv, resting);
-    if inv.market == order.market {
-        inv.add_suspect(side, order.size);
-    }
-    drop(inv);
-    let _ = ledger_tx.send(LedgerEvent::UnmatchedFill);
-    heartbeat(
-        cfg,
-        "order-gateway",
-        format!(
-            "cancel {reason} found {side} gone; parked {:.2} as suspect, reconciling in background",
-            order.size
-        ),
-    )?;
-    // Skip placing a replacement in the same quote cycle; the next cycle quotes
-    // normally with the suspect shares counted into the cap.
-    Ok(false)
 }
 
 /// Cancel any order the exchange reports as open that we don't track locally.
@@ -1059,43 +836,6 @@ fn cancel_all_resting_orders(
     Ok(())
 }
 
-fn sweep_exchange_orders_before_reconcile(
-    cfg: &Config,
-    inventory: &SharedInventory,
-    real_orders: &RealOrderClient,
-    order_map: &SharedOrderMap,
-    resting: &mut HashMap<String, RestingOrder>,
-) -> AppResult<bool> {
-    heartbeat(
-        cfg,
-        "order-gateway",
-        "inventory dirty: sweeping exchange open orders before reconcile",
-    )?;
-    match real_orders.cancel_all() {
-        Ok(n) => {
-            heartbeat(
-                cfg,
-                "order-gateway",
-                format!("inventory dirty: exchange sweep canceled {n}"),
-            )?;
-            resting.clear();
-            order_map.lock().unwrap().clear();
-            persist_active_orders_if_real(cfg, Some(real_orders), resting)?;
-            let mut inv = inventory.lock().unwrap();
-            recompute_pending_from_resting(&mut inv, resting);
-            Ok(true)
-        }
-        Err(err) => {
-            heartbeat(
-                cfg,
-                "order-gateway",
-                format!("inventory dirty: exchange sweep failed: {err}"),
-            )?;
-            Ok(false)
-        }
-    }
-}
-
 /// Returns Ok(true) if the cancel reached a CONFIRMED-terminal state (canceled,
 /// already-gone, filled, etc.) so the caller may release the order's pending.
 /// Returns Err if the cancel was actively rejected (order may still be live).
@@ -1104,9 +844,9 @@ enum CancelOutcome {
     /// We confirmed the exchange cancelled it (it did NOT fill).
     Cancelled,
     /// The order is gone but NOT because we cancelled it (exchange reports
-    /// already filled / matched / not found). The response is not precise
-    /// enough for local accounting, so the caller must reconcile.
-    GoneUnverified,
+    /// already filled / matched / not found) — treat it as FILLED. The caller
+    /// must credit its shares to held to keep held+pending consistent.
+    FilledOrGone,
 }
 
 fn send_cancel(
@@ -1144,22 +884,23 @@ fn send_cancel(
                 order_map.lock().unwrap().remove(exchange_order_id);
             }
         } else {
-            // Gone but we did NOT cancel it => it filled, vanished, or the API no
-            // longer exposes it. Do not synthesize a fill here; the caller will
-            // release pending and force an on-chain position reconcile.
+            // Gone but we did NOT cancel it => it filled (or vanished). Leave the
+            // order_map entry so the caller can credit it once and flag it for the
+            // user-WS dedup. This closes the async race where a TTL/requote cancel
+            // frees pending before the user-WS fill credits held.
             heartbeat(
                 cfg,
                 "order-gateway",
                 format!(
-                    "cancel noop {exchange_order_id}: {} (await reconcile)",
+                    "cancel noop {exchange_order_id}: {} (treat as filled)",
                     ack.reason.unwrap_or_else(|| "not active".to_string())
                 ),
             )?;
-            outcome = CancelOutcome::GoneUnverified;
+            outcome = CancelOutcome::FilledOrGone;
         }
     }
-    // Only record a Cancelled event for a genuine cancel; GoneUnverified is
-    // reconciled by risk-ledger instead of being logged as a synthetic fill.
+    // Only record a Cancelled event for a genuine cancel; a FilledOrGone is
+    // recorded as a Fill by the caller (credit_filled_on_cancel).
     if matches!(outcome, CancelOutcome::Cancelled) {
         let cancel = OrderCancelled {
             ts_ms: now_ms(),
@@ -1179,24 +920,64 @@ fn send_cancel(
     Ok(outcome)
 }
 
-/// Mark an ambiguous cancel as handed off to reconcile. We deliberately do not
-/// credit local held inventory here because the cancel response does not carry
-/// authoritative fill size/price. The order-map entry is kept as an echo guard:
-/// if the user-WS later replays this order, it will be ignored instead of being
-/// double-counted after reconcile.
-fn mark_order_reconcile_pending(order_map: Option<&SharedOrderMap>, order: &RestingOrder) {
+/// Credit a fill discovered by the cancel path (the exchange said the order is
+/// already gone/filled). Credits the order's REMAINING (not-yet-WS-credited)
+/// shares to held under the lock, flags the order_map entry so the async
+/// user-WS fill won't double-count, and records the fill for jsonl/kill-switch.
+/// No-op if the order_map entry is already gone or already credited (the user-WS
+/// path handled it).
+fn credit_filled_on_cancel(
+    inventory: &SharedInventory,
+    order_map: Option<&SharedOrderMap>,
+    ledger_tx: &LedgerTx,
+    order: &RestingOrder,
+) -> AppResult<()> {
     let Some(order_map) = order_map else {
-        return;
+        return Ok(());
     };
     let Some(id) = order.exchange_order_id.as_deref() else {
-        return;
+        return Ok(());
     };
-    let mut map = order_map.lock().unwrap();
-    if let Some(meta) = map.get_mut(id) {
-        meta.credited = true;
-        meta.done = true;
-        meta.size = 0.0;
+    let (size, price, side, market) = {
+        let mut map = order_map.lock().unwrap();
+        match map.get_mut(id) {
+            Some(meta) if !meta.credited && meta.size > 0.001 => {
+                meta.credited = true;
+                (
+                    meta.size,
+                    meta.price,
+                    meta.side.clone(),
+                    meta.market.clone(),
+                )
+            }
+            // Gone or already credited => the user-WS path fully handled it.
+            _ => return Ok(()),
+        }
+    };
+    {
+        let mut inv = inventory.lock().unwrap();
+        // Don't wipe the current window's inventory with a stale-market credit.
+        if inv.market.is_empty() {
+            reset_inventory_for_market(&mut inv, &market);
+        }
+        if inv.market == market {
+            inv.add_fill(&market, &side, price, size);
+        }
     }
+    let _ = ledger_tx.send(LedgerEvent::Filled(FillEvent {
+        quote_id: order.quote_id.clone(),
+        ts_ms: now_ms(),
+        market,
+        side,
+        price,
+        size,
+        inventory_up: 0.0,
+        inventory_down: 0.0,
+        pnl_if_up: 0.0,
+        pnl_if_down: 0.0,
+        source: "cancel_detected_fill".to_string(),
+    }));
+    Ok(())
 }
 
 fn apply_fill_to_resting_map(
@@ -1257,7 +1038,6 @@ fn start_user_channel(
     order_map: SharedOrderMap,
     gw_tx: GatewayTx,
     ledger_tx: LedgerTx,
-    reconcile_gate: ReconcileGate,
 ) -> AppResult<()> {
     let cfg = cfg.clone();
     thread::spawn(move || {
@@ -1269,7 +1049,6 @@ fn start_user_channel(
             order_map,
             gw_tx,
             ledger_tx,
-            reconcile_gate,
         )
     });
     Ok(())
@@ -1284,7 +1063,6 @@ fn user_channel_loop(
     order_map: SharedOrderMap,
     gw_tx: GatewayTx,
     ledger_tx: LedgerTx,
-    reconcile_gate: ReconcileGate,
 ) {
     // Trade dedup MUST persist across reconnects: when the user WS drops and
     // reconnects, the exchange can replay recent (partial) fills. A per-
@@ -1299,7 +1077,6 @@ fn user_channel_loop(
             &order_map,
             &gw_tx,
             &ledger_tx,
-            &reconcile_gate,
             &mut seen_trades,
         ) {
             let _ = heartbeat(&cfg, "order-gateway", format!("user ws reconnect: {err}"));
@@ -1317,7 +1094,6 @@ fn user_channel_once(
     order_map: &SharedOrderMap,
     gw_tx: &GatewayTx,
     ledger_tx: &LedgerTx,
-    reconcile_gate: &ReconcileGate,
     seen_trades: &mut HashSet<String>,
 ) -> AppResult<()> {
     let (mut socket, _) = connect(cfg.polymarket_user_ws_url.as_str())?;
@@ -1390,7 +1166,6 @@ fn user_channel_once(
                         order_map,
                         gw_tx,
                         ledger_tx,
-                        reconcile_gate,
                         seen_trades,
                         &value,
                     )?;
@@ -1427,7 +1202,6 @@ fn apply_user_channel_message(
     order_map: &SharedOrderMap,
     gw_tx: &GatewayTx,
     ledger_tx: &LedgerTx,
-    reconcile_gate: &ReconcileGate,
     seen_trades: &mut HashSet<String>,
     value: &Value,
 ) -> AppResult<()> {
@@ -1439,7 +1213,6 @@ fn apply_user_channel_message(
                 order_map,
                 gw_tx,
                 ledger_tx,
-                reconcile_gate,
                 seen_trades,
                 item,
             )?;
@@ -1458,12 +1231,11 @@ fn apply_user_channel_message(
             order_map,
             gw_tx,
             ledger_tx,
-            reconcile_gate,
             seen_trades,
             value,
         )?;
     } else if event_type == "order" {
-        handle_user_order(cfg, inventory, order_map, gw_tx, ledger_tx, value)?;
+        handle_user_order(cfg, order_map, gw_tx, ledger_tx, value)?;
     }
     Ok(())
 }
@@ -1475,7 +1247,6 @@ fn handle_user_trade(
     order_map: &SharedOrderMap,
     gw_tx: &GatewayTx,
     ledger_tx: &LedgerTx,
-    reconcile_gate: &ReconcileGate,
     seen_trades: &mut HashSet<String>,
     value: &Value,
 ) -> AppResult<()> {
@@ -1494,33 +1265,13 @@ fn handle_user_trade(
         });
 
     if let Some(makers) = value.get("maker_orders").and_then(Value::as_array) {
-        let mut matched_any_local_order = false;
-        let mut unknown_hint: Option<(String, f64, f64)> = None;
-        let mut owned_unknown_hint: Option<(String, f64, f64)> = None;
         for maker in makers {
             let Some(order_id) = first_str(maker, &["order_id", "id"]) else {
                 continue;
             };
             if !order_map_contains(order_map, order_id) {
-                let hint = (
-                    order_id.to_string(),
-                    parse_f64_value(maker.get("price"))
-                        .or_else(|| parse_f64_value(value.get("price")))
-                        .unwrap_or(0.0),
-                    parse_f64_value(maker.get("matched_amount"))
-                        .or_else(|| parse_f64_value(maker.get("size")))
-                        .or_else(|| parse_f64_value(value.get("size")))
-                        .unwrap_or(0.0),
-                );
-                if unknown_hint.is_none() {
-                    unknown_hint = Some(hint.clone());
-                }
-                if owned_unknown_hint.is_none() && maker_order_belongs_to_us(cfg, maker) {
-                    owned_unknown_hint = Some(hint);
-                }
                 continue;
             }
-            matched_any_local_order = true;
             let key = format!("{trade_id}:{order_id}");
             if !seen_trades.insert(key) {
                 continue;
@@ -1533,29 +1284,8 @@ fn handle_user_trade(
                 .or_else(|| parse_f64_value(value.get("price")))
                 .unwrap_or(0.0);
             emit_user_fill(
-                cfg,
-                inventory,
-                order_map,
-                gw_tx,
-                ledger_tx,
-                reconcile_gate,
-                order_id,
-                price,
-                size,
+                cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size,
             )?;
-        }
-        let must_reconcile = owned_unknown_hint.or_else(|| {
-            if matched_any_local_order {
-                None
-            } else {
-                unknown_hint
-            }
-        });
-        if let Some((order_id, price, size)) = must_reconcile {
-            let key = format!("{trade_id}:unknown-maker-orders");
-            if seen_trades.insert(key) {
-                emit_unmatched_fill(cfg, ledger_tx, &order_id, price, size)?;
-            }
         }
         return Ok(());
     }
@@ -1571,15 +1301,7 @@ fn handle_user_trade(
         let price = parse_f64_value(value.get("price")).unwrap_or(0.0);
         let size = parse_f64_value(value.get("size")).unwrap_or(0.0);
         emit_user_fill(
-            cfg,
-            inventory,
-            order_map,
-            gw_tx,
-            ledger_tx,
-            reconcile_gate,
-            order_id,
-            price,
-            size,
+            cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size,
         )?;
     }
     Ok(())
@@ -1589,43 +1311,8 @@ fn order_map_contains(order_map: &SharedOrderMap, order_id: &str) -> bool {
     order_map.lock().unwrap().contains_key(order_id)
 }
 
-fn maker_order_belongs_to_us(cfg: &Config, maker: &Value) -> bool {
-    let api_key = cfg.poly_api_key.trim();
-    if !api_key.is_empty()
-        && first_str(maker, &["owner", "api_key", "apiKey"])
-            .is_some_and(|owner| owner.eq_ignore_ascii_case(api_key))
-    {
-        return true;
-    }
-
-    let funder = cfg.poly_funder_address.trim();
-    !funder.is_empty()
-        && first_str(maker, &["maker_address", "makerAddress"])
-            .is_some_and(|addr| addr.eq_ignore_ascii_case(funder))
-}
-
-fn emit_unmatched_fill(
-    cfg: &Config,
-    ledger_tx: &LedgerTx,
-    order_id: &str,
-    price: f64,
-    size: f64,
-) -> AppResult<()> {
-    eprintln!(
-        "[FILL_UNMATCHED] account fill for unknown order {order_id} size={size} price={price} — forcing reconcile"
-    );
-    let _ = heartbeat(
-        cfg,
-        "order-gateway",
-        format!("UNMATCHED fill {order_id} size={size} — forcing reconcile"),
-    );
-    let _ = ledger_tx.send(LedgerEvent::UnmatchedFill);
-    Ok(())
-}
-
 fn handle_user_order(
     cfg: &Config,
-    inventory: &SharedInventory,
     order_map: &SharedOrderMap,
     gw_tx: &GatewayTx,
     ledger_tx: &LedgerTx,
@@ -1640,41 +1327,19 @@ fn handle_user_order(
     let Some(order_id) = first_str(value, &["id", "order_id"]) else {
         return Ok(());
     };
-    // The cancel event's `size_matched` is the order's AUTHORITATIVE total
-    // matched size. Credit exactly the part we have not accounted yet (the
-    // in-flight partial whose trade event raced this cancel), then KEEP the
-    // entry marked done as an echo guard — removing it here orphaned late
-    // trade events into "unknown fill" reconciles.
-    let size_matched = parse_f64_value(value.get("size_matched")).unwrap_or(0.0);
-    let (meta, remaining_cancelled, uncredited) = {
-        let mut map = order_map.lock().unwrap();
-        let Some(entry) = map.get_mut(order_id) else {
-            return Ok(());
-        };
-        let credited_so_far = (entry.original_size - entry.size).max(0.0);
-        let uncredited = if entry.credited || entry.done {
-            // Already fully accounted (or handed to reconcile) — no top-up.
-            0.0
-        } else {
-            (size_matched - credited_so_far).max(0.0).min(entry.size)
-        };
-        let snapshot = entry.clone();
-        let remaining_cancelled = (entry.size - uncredited).max(0.0);
-        entry.size = (entry.size - uncredited).max(0.0);
-        entry.done = true;
-        (snapshot, remaining_cancelled, uncredited)
+    let Some(meta) = order_map.lock().unwrap().remove(order_id) else {
+        return Ok(());
     };
-    if uncredited > 0.001 {
-        credit_user_fill(
-            cfg, inventory, gw_tx, ledger_tx, &meta, meta.price, uncredited,
-        )?;
-    }
+    let size = parse_f64_value(value.get("size_matched"))
+        .or_else(|| parse_f64_value(value.get("size")))
+        .unwrap_or(meta.size)
+        .max(meta.size);
     let cancel = OrderCancelled {
         ts_ms: now_ms(),
         quote_id: meta.quote_id,
         market: meta.market,
         side: meta.side,
-        size: remaining_cancelled,
+        size,
         reason: "user_ws_cancel".to_string(),
         source: "polymarket_user_ws".to_string(),
     };
@@ -1693,7 +1358,6 @@ fn emit_user_fill(
     order_map: &SharedOrderMap,
     gw_tx: &GatewayTx,
     ledger_tx: &LedgerTx,
-    _reconcile_gate: &ReconcileGate,
     order_id: &str,
     price: f64,
     size: f64,
@@ -1711,7 +1375,15 @@ fn emit_user_fill(
             // NEVER swallow it silently — that would under-count inventory and let
             // the cap re-open. Log loud and force an immediate on-chain reconcile so
             // risk corrects the shared inventory now, not up to RECONCILE_INTERVAL later.
-            emit_unmatched_fill(cfg, ledger_tx, order_id, price, size)?;
+            eprintln!(
+                "[FILL_UNMATCHED] account fill for unknown order {order_id} size={size} price={price} — forcing reconcile"
+            );
+            let _ = heartbeat(
+                cfg,
+                "order-gateway",
+                format!("UNMATCHED fill {order_id} size={size} — forcing reconcile"),
+            );
+            let _ = ledger_tx.send(LedgerEvent::UnmatchedFill);
             return Ok(());
         }
         FillMatch::Matched(meta) => meta,
@@ -1725,31 +1397,11 @@ fn emit_user_fill(
     if fill_size <= 0.001 {
         return Ok(());
     }
-    // A matched fill is EXACT accounting — no placement pause; risk-ledger runs
-    // a background verification reconcile on the Filled event it receives below.
-    credit_user_fill(
-        cfg, inventory, gw_tx, ledger_tx, &meta, fill_price, fill_size,
-    )
-}
-
-/// Credit an authoritative user-WS fill (exact size/price) into the shared
-/// inventory and notify the gateway loop + risk-ledger. Shared by the trade
-/// path and the cancel path's `size_matched` top-up.
-fn credit_user_fill(
-    cfg: &Config,
-    inventory: &SharedInventory,
-    gw_tx: &GatewayTx,
-    ledger_tx: &LedgerTx,
-    meta: &QuoteMeta,
-    fill_price: f64,
-    fill_size: f64,
-) -> AppResult<()> {
     let fill = FillEvent {
-        quote_id: meta.quote_id.clone(),
+        quote_id: meta.quote_id,
         ts_ms: now_ms(),
-        market: meta.market.clone(),
-        token_id: meta.token_id.clone(),
-        side: meta.side.clone(),
+        market: meta.market,
+        side: meta.side,
         price: fill_price,
         size: fill_size,
         inventory_up: 0.0,
@@ -1794,8 +1446,8 @@ enum FillMatch {
 
 /// Look up + reduce an order_map entry for a user-WS fill, ATOMICALLY under one
 /// lock. Checking the `credited` flag and reducing the size in the same critical
-/// section closes the cross-thread race where cancel/reconcile handoff could
-/// flip `credited` between a separate check and a separate reduce, double-counting.
+/// section closes the cross-thread race where `credit_filled_on_cancel` could
+/// flip `credited` between a separate check and a separate reduce, double-crediting.
 fn match_and_reduce_order(
     order_map: &SharedOrderMap,
     order_id: &str,
@@ -1862,7 +1514,6 @@ mod tests {
             quote_id: quote_id.to_string(),
             ts_ms: now_ms(),
             market: "btc-updown-5m-test".to_string(),
-            token_id: format!("token-{side}"),
             side: side.to_string(),
             price: 0.42,
             size,
@@ -1874,101 +1525,12 @@ mod tests {
         }
     }
 
-    fn quote(side: &str, size: f64) -> QuoteIntent {
-        QuoteIntent {
-            quote_id: "q".to_string(),
-            ts_ms: now_ms(),
-            market: "btc-updown-5m-test".to_string(),
-            condition_id: "condition".to_string(),
-            token_id: format!("token-{side}"),
-            side: side.to_string(),
-            price: 0.42,
-            size,
-            fair: 0.50,
-            model_up: 0.50,
-            market_up: 0.50,
-            final_up_shadow: 0.50,
-            momentum_up_shadow: 0.50,
-            momentum_delta: 0.0,
-            momentum_score: 0.0,
-            mom_1s: 0.0,
-            mom_3s: 0.0,
-            mom_10s: 0.0,
-            accel: 0.0,
-            market_anchor_weight: 0.0,
-            fair_source: "test".to_string(),
-            inventory_up: 0.0,
-            inventory_down: 0.0,
-            reason: "test".to_string(),
-        }
-    }
-
     #[test]
-    fn reconcile_pause_releases_only_after_market_switch() {
-        assert!(!reconcile_pause_allows_market_switch(
-            Some("btc-updown-5m-1000"),
-            "btc-updown-5m-1000"
-        ));
-        assert!(reconcile_pause_allows_market_switch(
-            Some("btc-updown-5m-1000"),
-            "btc-updown-5m-1300"
-        ));
-        assert!(!reconcile_pause_allows_market_switch(
-            None,
-            "btc-updown-5m-1300"
-        ));
-    }
-
-    #[test]
-    fn newest_quote_market_selects_latest_window() {
-        let mut up = quote("Up", 5.0);
-        up.market = "btc-updown-5m-old".to_string();
-        up.ts_ms = 100;
-        let mut down = quote("Down", 5.0);
-        down.market = "btc-updown-5m-new".to_string();
-        down.ts_ms = 200;
-        let latest = HashMap::from([("Up".to_string(), up), ("Down".to_string(), down)]);
-
-        assert_eq!(
-            newest_quote_market(&latest),
-            Some("btc-updown-5m-new".to_string())
-        );
-    }
-
-    #[test]
-    fn side_cap_trims_residual_room_for_live_top_up() {
-        let mut cfg = test_cfg();
-        cfg.dry_run = false;
-        cfg.enable_real_orders = "I_UNDERSTAND_REAL_MONEY".to_string();
-        cfg.quote_size = 20.0;
-        cfg.inventory_mult = 1.0;
-        let mut q = quote("Down", 20.0);
-
-        assert!(cap_quote_to_side_room(&cfg, &mut q, 9.4, 0.0));
-
-        assert_eq!(q.size, 10.0);
-    }
-
-    #[test]
-    fn side_cap_skips_live_residual_room_below_exchange_minimum() {
-        let mut cfg = test_cfg();
-        cfg.dry_run = false;
-        cfg.enable_real_orders = "I_UNDERSTAND_REAL_MONEY".to_string();
-        cfg.quote_size = 20.0;
-        cfg.inventory_mult = 1.0;
-        let mut q = quote("Down", 20.0);
-
-        assert!(!cap_quote_to_side_room(&cfg, &mut q, 16.4, 0.0));
-    }
-
-    #[test]
-    fn ambiguous_cancel_does_not_synthesize_fill_and_forces_reconcile() {
-        let mut cfg = test_cfg();
-        cfg.run_dir = std::env::temp_dir().join(format!(
-            "polymaker-cancel-reconcile-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
+    fn cancel_detected_fill_credited_once_not_double_counted() {
+        // Reproduces the live async race: a TTL/requote cancel finds the order
+        // already filled and credits held; the user-WS fill for the SAME order
+        // then arrives and must NOT double-credit (that race drove the live
+        // over-accumulation to 28 shares against a cap of 5).
         let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
             market: "btc-updown-5m-test".to_string(),
             ..Default::default()
@@ -1976,188 +1538,60 @@ mod tests {
         let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
         let order = resting_order("Up", "q1", 5.0);
         let id = order.exchange_order_id.clone().unwrap();
-        let mut resting = HashMap::from([("Up".to_string(), order.clone())]);
-        {
-            let mut inv = inventory.lock().unwrap();
-            recompute_pending_from_resting(&mut inv, &resting);
-        }
         order_map.lock().unwrap().insert(
             id.clone(),
             QuoteMeta {
                 quote_id: order.quote_id.clone(),
                 market: order.market.clone(),
                 condition_id: order.condition_id.clone(),
-                token_id: order.token_id.clone(),
                 side: order.side.clone(),
                 price: order.price,
                 size: order.size,
-                original_size: order.size,
                 credited: false,
                 done: false,
             },
         );
-        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
+        let (ledger_tx, _rx) = std::sync::mpsc::channel();
 
-        let may_replace = handle_gone_unverified_cancel(
-            &cfg,
-            &inventory,
-            None,
-            Some(&order_map),
-            &mut resting,
-            &ledger_tx,
-            "Up",
-            "requote",
-            &order,
-        )
-        .unwrap();
+        // 1) cancel path discovers the fill and credits it once.
+        credit_filled_on_cancel(&inventory, Some(&order_map), &ledger_tx, &order).unwrap();
+        assert_eq!(inventory.lock().unwrap().up_shares, 5.0, "credited once");
+        assert!(order_map
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|m| m.credited)
+            .unwrap_or(false));
 
-        assert!(
-            !may_replace,
-            "must not place a replacement in the same cycle"
-        );
-        assert!(resting.is_empty(), "pending order is no longer open");
-        {
-            let inv = inventory.lock().unwrap();
-            assert_eq!(inv.up_shares, 0.0, "must not synthesize held shares");
-            assert_eq!(inv.pending_up, 0.0, "pending is released");
-            assert_eq!(
-                inv.suspect_up, 5.0,
-                "remaining size parked as suspect to keep occupying cap room"
-            );
-        }
-        // The suspect shares must block re-buying that side at the cap, without
-        // any placement pause: held=0 but pending+suspect consumes the room.
-        {
-            let inv = inventory.lock().unwrap();
-            let mut cfg2 = test_cfg();
-            cfg2.quote_size = 5.0;
-            cfg2.inventory_mult = 1.0;
-            let mut q = quote("Up", 5.0);
-            let suspect = suspect_shares(&inv, "btc-updown-5m-test", "Up");
-            assert!(
-                !cap_quote_to_side_room(&cfg2, &mut q, inv.up_shares, inv.pending_up + suspect),
-                "suspect shares must consume side-cap room"
-            );
-        }
-        assert!(matches!(
-            ledger_rx.try_recv().unwrap(),
-            LedgerEvent::UnmatchedFill
-        ));
-
-        // A later user-WS replay for the same order is ignored; risk-ledger's
-        // position reconcile is now the single source of truth for this case.
+        // 2) the async user-WS fill for the SAME order arrives — the atomic
+        // match+dedup must report AlreadyCredited and NOT credit again.
         assert!(
             matches!(
                 match_and_reduce_order(&order_map, &id, 5.0),
                 FillMatch::AlreadyCredited
             ),
-            "should be recognised as reconcile-pending"
+            "should be recognised as pre-credited"
         );
         assert_eq!(
             inventory.lock().unwrap().up_shares,
-            0.0,
-            "must still not be locally credited"
+            5.0,
+            "must NOT be double-counted"
         );
-        let _ = std::fs::remove_dir_all(&cfg.run_dir);
-    }
-
-    #[test]
-    fn user_ws_cancel_credits_unaccounted_matched_size_exactly_once() {
-        // A user-WS cancel event carries the order's authoritative total
-        // `size_matched`. The in-flight partial whose trade event raced the
-        // cancel must be credited from it — exactly once: a later trade-event
-        // replay for the same order must be recognised as already accounted.
-        let cfg = test_cfg();
-        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
-            market: "btc-updown-5m-test".to_string(),
-            ..Default::default()
-        }));
-        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
-        order_map.lock().unwrap().insert(
-            "ex-c".to_string(),
-            QuoteMeta {
-                quote_id: "q1".to_string(),
-                market: "btc-updown-5m-test".to_string(),
-                condition_id: "condition".to_string(),
-                token_id: "token-Up".to_string(),
-                side: "Up".to_string(),
-                price: 0.42,
-                size: 5.0,
-                original_size: 5.0,
-                credited: false,
-                done: false,
-            },
+        // Entry is KEPT as an echo guard (credited), not removed — further echoes
+        // for it stay benign until the per-window prune.
+        assert!(
+            order_map
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|m| m.credited)
+                .unwrap_or(false),
+            "entry kept as echo guard"
         );
-        let (gw_tx, gw_rx) = std::sync::mpsc::channel();
-        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
-        let event = serde_json::json!({
-            "id": "ex-c",
-            "type": "order",
-            "status": "canceled",
-            "size_matched": "2"
-        });
 
-        handle_user_order(&cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &event).unwrap();
-
-        {
-            let inv = inventory.lock().unwrap();
-            assert_eq!(inv.up_shares, 2.0, "credit exactly the unaccounted match");
-            assert!((inv.up_cost - 0.84).abs() < 1e-9, "cost at the maker price");
-        }
-        {
-            let map = order_map.lock().unwrap();
-            let meta = map.get("ex-c").expect("entry kept as echo guard");
-            assert!(meta.done, "entry marked done, not removed");
-        }
-        assert!(matches!(
-            gw_rx.try_recv().expect("fill event for resting/pending"),
-            GatewayEvent::Fill(f) if (f.size - 2.0).abs() < 1e-9
-        ));
-        assert!(matches!(
-            ledger_rx.try_recv().expect("ledger fill"),
-            LedgerEvent::Filled(f) if (f.size - 2.0).abs() < 1e-9
-        ));
-        assert!(matches!(
-            gw_rx.try_recv().expect("cancel event follows"),
-            GatewayEvent::Cancelled(c) if (c.size - 3.0).abs() < 1e-9
-        ));
-
-        // The late trade event for the SAME partial must not double-credit.
-        assert!(matches!(
-            match_and_reduce_order(&order_map, "ex-c", 2.0),
-            FillMatch::AlreadyCredited
-        ));
-        assert_eq!(inventory.lock().unwrap().up_shares, 2.0);
-
-        // A cancel for an order whose fills were all already credited via trade
-        // events must not credit anything more.
-        order_map.lock().unwrap().insert(
-            "ex-d".to_string(),
-            QuoteMeta {
-                quote_id: "q2".to_string(),
-                market: "btc-updown-5m-test".to_string(),
-                condition_id: "condition".to_string(),
-                token_id: "token-Up".to_string(),
-                side: "Up".to_string(),
-                price: 0.42,
-                size: 3.0, // 2 of original 5 already credited
-                original_size: 5.0,
-                credited: false,
-                done: false,
-            },
-        );
-        let event2 = serde_json::json!({
-            "id": "ex-d",
-            "type": "order",
-            "status": "canceled",
-            "size_matched": "2"
-        });
-        handle_user_order(&cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &event2).unwrap();
-        assert_eq!(
-            inventory.lock().unwrap().up_shares,
-            2.0,
-            "size_matched already accounted -> no top-up"
-        );
+        // 3) a stray second credit attempt is a no-op (already credited).
+        credit_filled_on_cancel(&inventory, Some(&order_map), &ledger_tx, &order).unwrap();
+        assert_eq!(inventory.lock().unwrap().up_shares, 5.0, "still once");
     }
 
     #[test]
@@ -2172,11 +1606,9 @@ mod tests {
                 quote_id: "q1".to_string(),
                 market: "m".to_string(),
                 condition_id: String::new(),
-                token_id: "token-Up".to_string(),
                 side: "Up".to_string(),
                 price: 0.5,
                 size: 5.0,
-                original_size: 5.0,
                 credited: false,
                 done: false,
             },
@@ -2213,18 +1645,15 @@ mod tests {
                 quote_id: "q-ours".to_string(),
                 market: "btc-updown-5m-test".to_string(),
                 condition_id: "condition".to_string(),
-                token_id: "token-Up".to_string(),
                 side: "Up".to_string(),
                 price: 0.42,
                 size: 5.0,
-                original_size: 5.0,
                 credited: false,
                 done: false,
             },
         );
         let (gw_tx, _gw_rx) = std::sync::mpsc::channel();
         let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
-        let reconcile_gate: ReconcileGate = Arc::new(AtomicBool::new(false));
         let mut seen = HashSet::new();
         let event = serde_json::json!({
             "id": "trade-1",
@@ -2236,22 +1665,11 @@ mod tests {
         });
 
         handle_user_trade(
-            &cfg,
-            &inventory,
-            &order_map,
-            &gw_tx,
-            &ledger_tx,
-            &reconcile_gate,
-            &mut seen,
-            &event,
+            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
         )
         .unwrap();
 
         assert_eq!(inventory.lock().unwrap().up_shares, 5.0);
-        assert!(
-            !reconcile_gate.load(Ordering::Relaxed),
-            "a matched fill is exact accounting and must NOT pause placement"
-        );
         assert!(matches!(
             ledger_rx.try_recv().expect("known maker fill"),
             LedgerEvent::Filled(fill) if fill.quote_id == "q-ours" && (fill.size - 5.0).abs() < 1e-9
@@ -2259,129 +1677,6 @@ mod tests {
         assert!(
             ledger_rx.try_recv().is_err(),
             "unknown maker_orders must not emit unmatched reconcile events"
-        );
-    }
-
-    #[test]
-    fn user_trade_mixed_known_and_owned_unknown_forces_reconcile() {
-        let mut cfg = test_cfg();
-        cfg.poly_api_key = "our-api-key".to_string();
-        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
-            market: "btc-updown-5m-test".to_string(),
-            ..Default::default()
-        }));
-        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
-        order_map.lock().unwrap().insert(
-            "our-known-order".to_string(),
-            QuoteMeta {
-                quote_id: "q-known".to_string(),
-                market: "btc-updown-5m-test".to_string(),
-                condition_id: "condition".to_string(),
-                token_id: "token-Up".to_string(),
-                side: "Up".to_string(),
-                price: 0.42,
-                size: 5.0,
-                original_size: 5.0,
-                credited: false,
-                done: false,
-            },
-        );
-        let (gw_tx, _gw_rx) = std::sync::mpsc::channel();
-        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
-        let reconcile_gate: ReconcileGate = Arc::new(AtomicBool::new(false));
-        let mut seen = HashSet::new();
-        let event = serde_json::json!({
-            "id": "trade-mixed-owned",
-            "event_type": "trade",
-            "maker_orders": [
-                {"order_id": "our-known-order", "matched_amount": "5", "price": "0.42"},
-                {
-                    "order_id": "our-missing-order",
-                    "owner": "our-api-key",
-                    "matched_amount": "7.5",
-                    "price": "0.58"
-                }
-            ]
-        });
-
-        handle_user_trade(
-            &cfg,
-            &inventory,
-            &order_map,
-            &gw_tx,
-            &ledger_tx,
-            &reconcile_gate,
-            &mut seen,
-            &event,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            ledger_rx.try_recv().expect("known fill"),
-            LedgerEvent::Filled(fill) if fill.quote_id == "q-known"
-        ));
-        assert!(matches!(
-            ledger_rx.try_recv().expect("owned unknown fill"),
-            LedgerEvent::UnmatchedFill
-        ));
-    }
-
-    #[test]
-    fn user_trade_all_unknown_maker_orders_forces_reconcile_once() {
-        let cfg = test_cfg();
-        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
-            market: "btc-updown-5m-test".to_string(),
-            ..Default::default()
-        }));
-        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
-        let (gw_tx, _gw_rx) = std::sync::mpsc::channel();
-        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
-        let reconcile_gate: ReconcileGate = Arc::new(AtomicBool::new(false));
-        let mut seen = HashSet::new();
-        let event = serde_json::json!({
-            "id": "trade-lost-local-state",
-            "event_type": "trade",
-            "maker_orders": [
-                {"order_id": "lost-order", "matched_amount": "13", "price": "0.36"}
-            ]
-        });
-
-        handle_user_trade(
-            &cfg,
-            &inventory,
-            &order_map,
-            &gw_tx,
-            &ledger_tx,
-            &reconcile_gate,
-            &mut seen,
-            &event,
-        )
-        .unwrap();
-
-        assert_eq!(
-            inventory.lock().unwrap().up_shares,
-            0.0,
-            "unknown fills must wait for authoritative position reconcile"
-        );
-        assert!(matches!(
-            ledger_rx.try_recv().expect("unknown maker fill"),
-            LedgerEvent::UnmatchedFill
-        ));
-
-        handle_user_trade(
-            &cfg,
-            &inventory,
-            &order_map,
-            &gw_tx,
-            &ledger_tx,
-            &reconcile_gate,
-            &mut seen,
-            &event,
-        )
-        .unwrap();
-        assert!(
-            ledger_rx.try_recv().is_err(),
-            "replayed unknown maker trade should not spam reconcile events"
         );
     }
 

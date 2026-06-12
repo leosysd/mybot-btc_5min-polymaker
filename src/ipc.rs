@@ -2,13 +2,10 @@ use crate::config::Config;
 use crate::AppResult;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-static JSON_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketFrame {
@@ -34,18 +31,6 @@ pub struct MarketFrame {
     /// Adaptive BTC dollar volatility per sqrt-second (sigma_$), from collector.
     #[serde(default)]
     pub vol_per_sqrt_sec: f64,
-    /// BTC price change over the last 1 second, in dollars.
-    #[serde(default)]
-    pub mom_1s: f64,
-    /// BTC price change over the last 3 seconds, in dollars.
-    #[serde(default)]
-    pub mom_3s: f64,
-    /// BTC price change over the last 10 seconds, in dollars.
-    #[serde(default)]
-    pub mom_10s: f64,
-    /// Change in 1-second momentum versus the previous BTC tick.
-    #[serde(default)]
-    pub accel: f64,
     pub source: String,
 }
 
@@ -69,20 +54,6 @@ pub struct QuoteIntent {
     pub market_up: f64,
     #[serde(default)]
     pub final_up_shadow: f64,
-    #[serde(default)]
-    pub momentum_up_shadow: f64,
-    #[serde(default)]
-    pub momentum_delta: f64,
-    #[serde(default)]
-    pub momentum_score: f64,
-    #[serde(default)]
-    pub mom_1s: f64,
-    #[serde(default)]
-    pub mom_3s: f64,
-    #[serde(default)]
-    pub mom_10s: f64,
-    #[serde(default)]
-    pub accel: f64,
     #[serde(default)]
     pub market_anchor_weight: f64,
     #[serde(default)]
@@ -117,8 +88,6 @@ pub struct FillEvent {
     pub quote_id: String,
     pub ts_ms: u64,
     pub market: String,
-    #[serde(default)]
-    pub token_id: String,
     pub side: String,
     pub price: f64,
     pub size: f64,
@@ -141,19 +110,6 @@ pub struct Inventory {
     pub pending_up: f64,
     #[serde(default)]
     pub pending_down: f64,
-    /// "Suspect" shares: an ambiguous cancel found the order gone (it MAY have
-    /// filled) but the response carries no authoritative size/price. We park the
-    /// order's remaining size here so it keeps occupying side-cap room (no
-    /// re-buying into an under-counted position) WITHOUT pausing placement and
-    /// WITHOUT polluting cost/PnL. Resolved by the on-chain reconcile: a raise
-    /// absorbs it into held; a caught-up snapshot with no raise ages it out.
-    #[serde(default)]
-    pub suspect_up: f64,
-    #[serde(default)]
-    pub suspect_down: f64,
-    /// Timestamp of the most recent suspect addition (for reconcile age-out).
-    #[serde(default)]
-    pub suspect_since_ms: u64,
 }
 
 impl Default for Inventory {
@@ -167,9 +123,6 @@ impl Default for Inventory {
             down_cost: 0.0,
             pending_up: 0.0,
             pending_down: 0.0,
-            suspect_up: 0.0,
-            suspect_down: 0.0,
-            suspect_since_ms: 0,
         }
     }
 }
@@ -204,47 +157,18 @@ impl Inventory {
         (self.down_shares - self.down_cost) - self.up_cost
     }
 
-    /// Exposure used by caps/skew: filled + outstanding orders + suspect
-    /// (maybe-filled, awaiting reconcile). Suspect counts here so the cap can
-    /// never re-open room over a fill we have not accounted yet.
     pub fn effective_up(&self) -> f64 {
-        self.up_shares + self.pending_up + self.suspect_up
+        self.up_shares + self.pending_up
     }
 
     pub fn effective_down(&self) -> f64 {
-        self.down_shares + self.pending_down + self.suspect_down
-    }
-
-    pub fn add_suspect(&mut self, side: &str, size: f64) {
-        if size <= 0.0 {
-            return;
-        }
-        match side {
-            "Up" => self.suspect_up += size,
-            "Down" => self.suspect_down += size,
-            _ => return,
-        }
-        self.suspect_since_ms = now_ms();
-        self.ts_ms = now_ms();
-    }
-
-    pub fn has_suspects(&self) -> bool {
-        self.suspect_up > 0.001 || self.suspect_down > 0.001
-    }
-
-    pub fn clear_suspects(&mut self) {
-        self.suspect_up = 0.0;
-        self.suspect_down = 0.0;
-        self.suspect_since_ms = 0;
-        self.ts_ms = now_ms();
+        self.down_shares + self.pending_down
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{now_ms, read_json, write_json, Inventory};
-    use serde_json::{json, Value};
-    use std::thread;
+    use super::Inventory;
 
     #[test]
     fn add_fill_clears_old_market_inventory() {
@@ -262,32 +186,6 @@ mod tests {
         assert_eq!(inv.up_cost, 0.0);
         assert_eq!(inv.down_shares, 10.0);
         assert_eq!(inv.down_cost, 2.5);
-    }
-
-    #[test]
-    fn concurrent_write_json_uses_unique_temp_files() {
-        let path = std::env::temp_dir().join(format!(
-            "polymaker-write-json-{}-{}.json",
-            std::process::id(),
-            now_ms()
-        ));
-        let mut handles = Vec::new();
-        for worker in 0..24 {
-            let path = path.clone();
-            handles.push(thread::spawn(move || {
-                for seq in 0..25 {
-                    write_json(&path, &json!({ "worker": worker, "seq": seq })).unwrap();
-                }
-            }));
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        let value = read_json::<Value>(&path).unwrap().expect("final json");
-        assert!(value.get("worker").is_some());
-        assert!(value.get("seq").is_some());
-        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -307,47 +205,17 @@ pub fn now_ms() -> u64 {
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("json");
-    let mut last_collision = None;
-    for _ in 0..16 {
-        let nonce = JSON_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&tmp) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                last_collision = Some(err);
-                continue;
-            }
-            Err(err) => return Err(err.into()),
-        };
-        let result = (|| -> AppResult<()> {
-            serde_json::to_writer_pretty(&mut file, value)?;
-            file.write_all(b"\n")?;
-            drop(file);
-            std::fs::rename(&tmp, path)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        return result;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = File::create(&tmp)?;
+        serde_json::to_writer_pretty(&mut file, value)?;
+        file.write_all(b"\n")?;
     }
-    Err(format!(
-        "failed to create unique temp file for {} after collisions: {:?}",
-        path.display(),
-        last_collision
-    )
-    .into())
+    std::fs::rename(tmp, path)?;
+    Ok(())
 }
 
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> AppResult<Option<T>> {

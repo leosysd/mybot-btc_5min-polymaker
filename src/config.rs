@@ -2,9 +2,6 @@ use crate::AppResult;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-const MAX_LIVE_ORDER_NOTIONAL_CAP_USD: f64 = 60.0;
-pub const MIN_ORDER_SIZE_SHARES: f64 = 5.0;
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub base_dir: PathBuf,
@@ -71,11 +68,6 @@ pub struct Config {
     pub value_min_edge: f64,
     pub value_aggression_ticks: f64,
     pub value_min_fair: f64,
-    pub strategy_mode: String,
-    pub edge_high: f64,
-    pub edge_low: f64,
-    pub trend_min_gap: f64,
-    pub range_max_gap: f64,
     pub enable_market_anchor: bool,
     pub market_anchor_shadow: bool,
     pub market_anchor_weight: f64,
@@ -83,9 +75,6 @@ pub struct Config {
     pub market_anchor_weight_low: f64,
     pub market_anchor_low_side_below: f64,
     pub market_anchor_max_spread: f64,
-    pub momentum_shadow: bool,
-    pub momentum_weight: f64,
-    pub momentum_scale_usd_per_sec: f64,
     pub enable_real_orders: String,
     pub polymarket_clob_host: String,
     pub poly_private_key: String,
@@ -166,12 +155,12 @@ impl Config {
             vol_max_per_sqrt_sec: get_f64(&file_env, "VOL_MAX_PER_SQRT_SEC", 60.0),
             width_floor_usd: get_f64(&file_env, "WIDTH_FLOOR_USD", 3.0),
             base_half_spread: get_f64(&file_env, "BASE_HALF_SPREAD", 0.012),
-            min_lock_edge: get_f64(&file_env, "MIN_LOCK_EDGE", 0.06),
+            min_lock_edge: get_f64(&file_env, "MIN_LOCK_EDGE", 0.02),
             latency_sec: get_f64(&file_env, "LATENCY_SEC", 0.4),
             k_adverse: get_f64(&file_env, "K_ADVERSE", 1.0),
             min_half_spread: get_f64(&file_env, "MIN_HALF_SPREAD", 0.005),
             max_half_spread: get_f64(&file_env, "MAX_HALF_SPREAD", 0.25),
-            endgame_pull_secs: get_f64(&file_env, "ENDGAME_PULL_SECS", 15.0),
+            endgame_pull_secs: get_f64(&file_env, "ENDGAME_PULL_SECS", 12.0),
             inventory_skew_time_boost: get_f64(&file_env, "INVENTORY_SKEW_TIME_BOOST", 2.0),
             tox_horizon_ms: get_u64(&file_env, "TOX_HORIZON_MS", 2500),
             tox_decay: get_f64(&file_env, "TOX_DECAY", 0.5),
@@ -187,22 +176,22 @@ impl Config {
             quote_warmup_secs: get_f64(&file_env, "QUOTE_WARMUP_SECS", 25.0),
             value_min_edge: get_f64(&file_env, "VALUE_MIN_EDGE", 0.03),
             value_aggression_ticks: get_f64(&file_env, "VALUE_AGGRESSION_TICKS", 1.0),
-            value_min_fair: get_f64(&file_env, "VALUE_MIN_FAIR", 0.20),
-            strategy_mode: get(&file_env, "STRATEGY_MODE", "selective"),
-            edge_high: get_f64(&file_env, "EDGE_HIGH", 0.01),
-            edge_low: get_f64(&file_env, "EDGE_LOW", 0.08),
-            trend_min_gap: get_f64(&file_env, "TREND_MIN_GAP", 0.12),
-            range_max_gap: get_f64(&file_env, "RANGE_MAX_GAP", 0.08),
-            enable_market_anchor: get_bool(&file_env, "ENABLE_MARKET_ANCHOR", true),
+            value_min_fair: get_f64(&file_env, "VALUE_MIN_FAIR", 0.05),
+            enable_market_anchor: get_bool(&file_env, "ENABLE_MARKET_ANCHOR", false),
             market_anchor_shadow: get_bool(&file_env, "MARKET_ANCHOR_SHADOW", true),
             market_anchor_weight,
-            market_anchor_weight_high: get_f64(&file_env, "MARKET_ANCHOR_WEIGHT_HIGH", 0.35),
-            market_anchor_weight_low: get_f64(&file_env, "MARKET_ANCHOR_WEIGHT_LOW", 0.85),
+            market_anchor_weight_high: get_f64(
+                &file_env,
+                "MARKET_ANCHOR_WEIGHT_HIGH",
+                market_anchor_weight,
+            ),
+            market_anchor_weight_low: get_f64(
+                &file_env,
+                "MARKET_ANCHOR_WEIGHT_LOW",
+                market_anchor_weight,
+            ),
             market_anchor_low_side_below: get_f64(&file_env, "MARKET_ANCHOR_LOW_SIDE_BELOW", 0.50),
             market_anchor_max_spread: get_f64(&file_env, "MARKET_ANCHOR_MAX_SPREAD", 0.12),
-            momentum_shadow: get_bool(&file_env, "MOMENTUM_SHADOW", true),
-            momentum_weight: get_f64(&file_env, "MOMENTUM_WEIGHT", 0.08),
-            momentum_scale_usd_per_sec: get_f64(&file_env, "MOMENTUM_SCALE_USD_PER_SEC", 8.0),
             enable_real_orders: get(&file_env, "ENABLE_REAL_ORDERS", ""),
             polymarket_clob_host: get(
                 &file_env,
@@ -305,21 +294,6 @@ impl Config {
         if !(0.0..=1.0).contains(&self.value_min_fair) || !self.value_min_fair.is_finite() {
             return Err("VALUE_MIN_FAIR must be a finite probability in [0, 1]".into());
         }
-        if !matches!(self.strategy_mode.as_str(), "value_buy" | "selective") {
-            return Err("STRATEGY_MODE must be value_buy or selective".into());
-        }
-        if self.edge_high < 0.0 || self.edge_high >= 1.0 || !self.edge_high.is_finite() {
-            return Err("EDGE_HIGH must be finite and in [0, 1)".into());
-        }
-        if self.edge_low < self.edge_high || self.edge_low >= 1.0 || !self.edge_low.is_finite() {
-            return Err("EDGE_LOW must be finite and >= EDGE_HIGH and < 1".into());
-        }
-        if !(0.0..=0.5).contains(&self.trend_min_gap) || !self.trend_min_gap.is_finite() {
-            return Err("TREND_MIN_GAP must be finite and in [0, 0.5]".into());
-        }
-        if !(0.0..=0.5).contains(&self.range_max_gap) || !self.range_max_gap.is_finite() {
-            return Err("RANGE_MAX_GAP must be finite and in [0, 0.5]".into());
-        }
         if !(0.0..=1.0).contains(&self.market_anchor_weight)
             || !self.market_anchor_weight.is_finite()
         {
@@ -347,12 +321,6 @@ impl Config {
             || !self.market_anchor_max_spread.is_finite()
         {
             return Err("MARKET_ANCHOR_MAX_SPREAD must be finite and in (0, 1]".into());
-        }
-        if !(0.0..=0.5).contains(&self.momentum_weight) || !self.momentum_weight.is_finite() {
-            return Err("MOMENTUM_WEIGHT must be finite and in [0, 0.5]".into());
-        }
-        if self.momentum_scale_usd_per_sec <= 0.0 || !self.momentum_scale_usd_per_sec.is_finite() {
-            return Err("MOMENTUM_SCALE_USD_PER_SEC must be positive".into());
         }
         Ok(())
     }
@@ -400,13 +368,8 @@ impl Config {
         if self.poly_private_key.trim().is_empty() {
             return Err("实单需要 POLY_PRIVATE_KEY，且只能放在 VPS 的 .env 里".into());
         }
-        if self.live_order_notional_cap <= 0.0
-            || self.live_order_notional_cap > MAX_LIVE_ORDER_NOTIONAL_CAP_USD
-        {
-            return Err(format!(
-                "实单 LIVE_ORDER_NOTIONAL_CAP 必须在 (0, {MAX_LIVE_ORDER_NOTIONAL_CAP_USD:.0}]"
-            )
-            .into());
+        if self.live_order_notional_cap <= 0.0 || self.live_order_notional_cap > 25.0 {
+            return Err("实单 LIVE_ORDER_NOTIONAL_CAP 必须在 (0, 25]，先小额验证".into());
         }
         if self.poly_chain_id != 137 {
             return Err("当前只支持 Polygon 主网 POLY_CHAIN_ID=137".into());
@@ -474,78 +437,6 @@ impl Config {
 
     pub fn max_side_inventory(&self) -> f64 {
         (self.quote_size * self.inventory_mult).round().max(0.0)
-    }
-
-    /// Effective unpaired cap used by quote/gateway logic.
-    ///
-    /// `MAX_UNPAIRED_SHARES=0` keeps the existing "disabled" behavior. Positive
-    /// values are treated as a user cap, but never below one full quote; otherwise
-    /// changing `QUOTE_SIZE` upward can make the first order impossible.
-    pub fn effective_max_unpaired_shares(&self) -> f64 {
-        if self.max_unpaired_shares <= 0.0 {
-            0.0
-        } else {
-            self.max_unpaired_shares
-                .max(self.quote_size.round().max(1.0))
-        }
-    }
-
-    /// Effective total inventory stop. `0` still disables it; otherwise the stop
-    /// cannot be below the bot's own configured two-sided capacity.
-    pub fn effective_max_total_inventory(&self) -> f64 {
-        if self.max_total_inventory <= 0.0 {
-            0.0
-        } else {
-            self.max_total_inventory
-                .max((self.max_side_inventory() * 2.0).round())
-        }
-    }
-
-    /// Effective single-order notional cap. In real mode the hard safety ceiling
-    /// remains $60, but a stale low value no longer silently truncates every order
-    /// after `QUOTE_SIZE` is raised.
-    pub fn effective_live_order_notional_cap(&self) -> f64 {
-        if self.live_order_notional_cap <= 0.0 {
-            0.0
-        } else {
-            let desired = self.quote_size.round().max(1.0) * self.max_bid.clamp(0.01, 1.0);
-            self.live_order_notional_cap
-                .max(desired)
-                .min(MAX_LIVE_ORDER_NOTIONAL_CAP_USD)
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Config;
-
-    #[test]
-    fn sizing_caps_scale_with_quote_size_when_old_values_are_too_small() {
-        let mut cfg = Config::from_env().expect("config");
-        cfg.quote_size = 50.0;
-        cfg.inventory_mult = 2.0;
-        cfg.max_bid = 0.70;
-        cfg.max_unpaired_shares = 20.0;
-        cfg.max_total_inventory = 50.0;
-        cfg.live_order_notional_cap = 20.0;
-
-        assert_eq!(cfg.max_side_inventory(), 100.0);
-        assert_eq!(cfg.effective_max_unpaired_shares(), 50.0);
-        assert_eq!(cfg.effective_max_total_inventory(), 200.0);
-        assert!((cfg.effective_live_order_notional_cap() - 35.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn zero_still_disables_optional_caps() {
-        let mut cfg = Config::from_env().expect("config");
-        cfg.max_unpaired_shares = 0.0;
-        cfg.max_total_inventory = 0.0;
-        cfg.live_order_notional_cap = 0.0;
-
-        assert_eq!(cfg.effective_max_unpaired_shares(), 0.0);
-        assert_eq!(cfg.effective_max_total_inventory(), 0.0);
-        assert_eq!(cfg.effective_live_order_notional_cap(), 0.0);
     }
 }
 
