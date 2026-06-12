@@ -2,10 +2,13 @@ use crate::config::Config;
 use crate::AppResult;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static JSON_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketFrame {
@@ -168,7 +171,9 @@ impl Inventory {
 
 #[cfg(test)]
 mod tests {
-    use super::Inventory;
+    use super::{now_ms, read_json, write_json, Inventory};
+    use serde_json::{json, Value};
+    use std::thread;
 
     #[test]
     fn add_fill_clears_old_market_inventory() {
@@ -186,6 +191,32 @@ mod tests {
         assert_eq!(inv.up_cost, 0.0);
         assert_eq!(inv.down_shares, 10.0);
         assert_eq!(inv.down_cost, 2.5);
+    }
+
+    #[test]
+    fn concurrent_write_json_uses_unique_temp_files() {
+        let path = std::env::temp_dir().join(format!(
+            "polymaker-write-json-{}-{}.json",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut handles = Vec::new();
+        for worker in 0..24 {
+            let path = path.clone();
+            handles.push(thread::spawn(move || {
+                for seq in 0..25 {
+                    write_json(&path, &json!({ "worker": worker, "seq": seq })).unwrap();
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let value = read_json::<Value>(&path).unwrap().expect("final json");
+        assert!(value.get("worker").is_some());
+        assert!(value.get("seq").is_some());
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -205,17 +236,47 @@ pub fn now_ms() -> u64 {
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp)?;
-        serde_json::to_writer_pretty(&mut file, value)?;
-        file.write_all(b"\n")?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("json");
+    let mut last_collision = None;
+    for _ in 0..16 {
+        let nonce = JSON_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), nonce));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_collision = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        let result = (|| -> AppResult<()> {
+            serde_json::to_writer_pretty(&mut file, value)?;
+            file.write_all(b"\n")?;
+            drop(file);
+            std::fs::rename(&tmp, path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        return result;
     }
-    std::fs::rename(tmp, path)?;
-    Ok(())
+    Err(format!(
+        "failed to create unique temp file for {} after collisions: {:?}",
+        path.display(),
+        last_collision
+    )
+    .into())
 }
 
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> AppResult<Option<T>> {
