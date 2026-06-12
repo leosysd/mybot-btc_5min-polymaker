@@ -433,12 +433,43 @@ fn value_buy_px_with_edge(
     )
 }
 
+fn selective_buy_px(
+    cfg: &Config,
+    frame: &MarketFrame,
+    side_is_up: bool,
+    fair: f64,
+    edge: f64,
+) -> Option<f64> {
+    if fair < cfg.value_min_fair {
+        return None;
+    }
+    let edge_cap = fair - edge;
+    if edge_cap < cfg.min_bid {
+        return None;
+    }
+    let desired = edge_cap.min(cfg.max_bid);
+    let ask = if side_is_up {
+        frame.up_ask
+    } else {
+        frame.down_ask
+    };
+    post_only_bid(
+        desired,
+        ask,
+        cfg.tick_size,
+        cfg.min_bid,
+        cfg.max_bid,
+        cfg.post_only_margin_ticks,
+    )
+}
+
 fn value_buy_quotes(
     cfg: &Config,
     frame: &MarketFrame,
     phase: Phase,
     fair: FairSnapshot,
     model: ModelQuote,
+    inventory: &Inventory,
 ) -> (Option<f64>, Option<f64>, &'static str) {
     if phase == Phase::Pull {
         return (None, None, "value_buy_pull");
@@ -449,13 +480,13 @@ fn value_buy_quotes(
         return (up_px, down_px, "value_buy");
     }
 
-    let plan = selective_plan(cfg, fair);
-    let up_px = plan.up_edge.and_then(|edge| {
-        value_buy_px_with_edge(cfg, frame, true, fair.quote_up(), model.up_bid, edge)
-    });
-    let down_px = plan.down_edge.and_then(|edge| {
-        value_buy_px_with_edge(cfg, frame, false, fair.quote_down(), model.down_bid, edge)
-    });
+    let plan = selective_plan(cfg, fair, inventory);
+    let up_px = plan
+        .up_edge
+        .and_then(|edge| selective_buy_px(cfg, frame, true, fair.quote_up(), edge));
+    let down_px = plan
+        .down_edge
+        .and_then(|edge| selective_buy_px(cfg, frame, false, fair.quote_down(), edge));
     (up_px, down_px, plan.reason)
 }
 
@@ -466,7 +497,7 @@ struct SelectivePlan {
     reason: &'static str,
 }
 
-fn selective_plan(cfg: &Config, fair: FairSnapshot) -> SelectivePlan {
+fn selective_plan(cfg: &Config, fair: FairSnapshot, inventory: &Inventory) -> SelectivePlan {
     let high = cfg.edge_high;
     let low = cfg.edge_low.max(high);
     let model_bias = fair.model_up - 0.5;
@@ -478,6 +509,33 @@ fn selective_plan(cfg: &Config, fair: FairSnapshot) -> SelectivePlan {
     let final_bias = fair.composite_up() - 0.5;
     let trend = cfg.trend_min_gap;
     let range = cfg.range_max_gap;
+    let rescue_fair = 0.65;
+    let rescue_gap = cfg.quote_size * 0.5;
+    let up_lag = inventory.effective_down() - inventory.effective_up();
+    let down_lag = inventory.effective_up() - inventory.effective_down();
+
+    if up_lag >= rescue_gap
+        && fair.quote_up() >= rescue_fair
+        && model_bias >= trend
+        && market_bias >= trend
+    {
+        return SelectivePlan {
+            up_edge: Some(high),
+            down_edge: None,
+            reason: "selective_rescue_up",
+        };
+    }
+    if down_lag >= rescue_gap
+        && fair.quote_down() >= rescue_fair
+        && model_bias <= -trend
+        && market_bias <= -trend
+    {
+        return SelectivePlan {
+            up_edge: None,
+            down_edge: Some(high),
+            reason: "selective_rescue_down",
+        };
+    }
 
     if model_bias * market_bias < 0.0 && model_bias.abs() > range && market_bias.abs() > range {
         return SelectivePlan {
@@ -655,7 +713,7 @@ fn handle_market_frame(
     });
 
     let phase = phase_for(tau, cfg.endgame_pull_secs);
-    let (up_px, down_px, reason) = value_buy_quotes(cfg, frame, phase, fair, model);
+    let (up_px, down_px, reason) = value_buy_quotes(cfg, frame, phase, fair, model, inventory);
     if let Some(px) = up_px {
         send_quote(
             cfg,
@@ -971,7 +1029,9 @@ mod tests {
             down_bid: 0.18,
         };
 
-        let (up_px, down_px, reason) = value_buy_quotes(&cfg, &frame, Phase::Normal, fair, model);
+        let inventory = Inventory::default();
+        let (up_px, down_px, reason) =
+            value_buy_quotes(&cfg, &frame, Phase::Normal, fair, model, &inventory);
 
         assert_eq!(reason, "selective_trend_up");
         let up_px = up_px.expect("strong Up should quote");
@@ -998,7 +1058,9 @@ mod tests {
             down_bid: 0.48,
         };
 
-        let (up_px, down_px, reason) = value_buy_quotes(&cfg, &frame, Phase::Normal, fair, model);
+        let inventory = Inventory::default();
+        let (up_px, down_px, reason) =
+            value_buy_quotes(&cfg, &frame, Phase::Normal, fair, model, &inventory);
 
         assert_eq!(reason, "selective_range");
         assert!(up_px.is_some());
@@ -1019,10 +1081,42 @@ mod tests {
             down_bid: 0.33,
         };
 
-        let (up_px, down_px, reason) = value_buy_quotes(&cfg, &frame, Phase::Normal, fair, model);
+        let inventory = Inventory::default();
+        let (up_px, down_px, reason) =
+            value_buy_quotes(&cfg, &frame, Phase::Normal, fair, model, &inventory);
 
         assert_eq!(reason, "selective_disagree");
         assert!(up_px.is_none());
+        assert!(down_px.is_none());
+    }
+
+    #[test]
+    fn selective_rescue_quotes_lagging_strong_side_near_fair() {
+        let cfg = selective_quote_test_cfg();
+        let mut frame = flat_frame(112.0);
+        frame.up_bid = 0.94;
+        frame.up_ask = 0.95;
+        frame.down_bid = 0.05;
+        frame.down_ask = 0.06;
+        let fair = fair_snapshot(&cfg, &frame, 0.98);
+        let model = ModelQuote {
+            up_bid: 0.29,
+            down_bid: 0.05,
+        };
+        let inventory = Inventory {
+            down_shares: 40.0,
+            down_cost: 25.6,
+            ..Default::default()
+        };
+
+        let (up_px, down_px, reason) =
+            value_buy_quotes(&cfg, &frame, Phase::Normal, fair, model, &inventory);
+
+        assert_eq!(reason, "selective_rescue_up");
+        assert!(
+            up_px >= Some(0.80),
+            "rescue must not inherit stale 0.29 model bid"
+        );
         assert!(down_px.is_none());
     }
 

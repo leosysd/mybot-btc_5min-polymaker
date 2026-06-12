@@ -437,8 +437,22 @@ pub fn run(
 
                         // Gateway-authoritative cost-basis lock: cap THIS leg's price
                         // by the OPPOSITE side's real average fill, so completing a
-                        // pair can never breach 1 - MIN_LOCK_EDGE.
-                        if let Some(opp) = opp_avg {
+                        // pair can never breach 1 - MIN_LOCK_EDGE. Selective rescue
+                        // quotes intentionally act as stop-loss hedges for a wrong
+                        // one-sided position, so they must not be capped into an
+                        // unfillable price.
+                        let rescue_quote = quote.reason.starts_with("selective_rescue_");
+                        if rescue_quote {
+                            heartbeat(
+                                &cfg,
+                                "order-gateway",
+                                format!(
+                                    "rescue bypasses lock {} px={:.3} fair={:.3}",
+                                    quote.side, quote.price, quote.fair
+                                ),
+                            )?;
+                        }
+                        if let Some(opp) = opp_avg.filter(|_| !rescue_quote) {
                             let cap = floor_to_tick(1.0 - cfg.min_lock_edge - opp, cfg.tick_size);
                             if quote.price > cap {
                                 if cap < cfg.min_bid {
