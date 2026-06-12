@@ -32,11 +32,12 @@ pub type SharedInventory = Arc<Mutex<Inventory>>;
 /// on-disk STOP file) and checked by every worker loop.
 pub type StopFlag = Arc<AtomicBool>;
 
-/// Set TRUE by risk when the gateway reports an unmatched account fill, to pause
-/// the gateway's order placement until an on-chain reconcile confirms the true
-/// position (cleared by risk after a successful reconcile). The gateway also
-/// self-clears it after a timeout so a reconcile that can't run never deadlocks
-/// placement. Prevents placing into an under-counted `held` during the gap.
+/// Legacy placement-pause flag. Nothing sets it anymore: fills no longer pause
+/// placement (pausing cancelled the OPPOSITE leg and froze the bot one-sided).
+/// Ambiguous/maybe-filled orders are instead parked as `suspect` shares in the
+/// shared inventory, which keep occupying side-cap room (so an under-counted
+/// position cannot be re-bought) while quoting continues on both sides. The
+/// gateway's pause machinery is kept as an emergency hook.
 pub type ReconcileGate = Arc<AtomicBool>;
 
 /// Returns true if the bot should stop: either the in-process flag is set OR the
@@ -124,6 +125,10 @@ pub struct QuoteMeta {
     pub side: String,
     pub price: f64,
     pub size: f64,
+    /// Size at placement. `size` shrinks as fills are credited, so
+    /// `original_size - size` is exactly what we have already accounted —
+    /// used to credit a user-WS cancel's `size_matched` without double-counting.
+    pub original_size: f64,
     /// Set true when this order should not be credited through the user-WS path:
     /// either it was already credited by an older cancel-detected-fill path, or
     /// an ambiguous cancel handed it off to on-chain reconcile. The async user-WS
@@ -223,6 +228,20 @@ pub fn pending_shares(inv: &Inventory, market: &str, side: &str) -> f64 {
     match side {
         "Up" => inv.pending_up,
         "Down" => inv.pending_down,
+        _ => 0.0,
+    }
+}
+
+/// Suspect (maybe-filled, awaiting reconcile) shares on `side` for `market`.
+/// Counted into side-cap room exactly like pending, so an ambiguous cancel can
+/// never re-open room for repeat buying while the true fill is unconfirmed.
+pub fn suspect_shares(inv: &Inventory, market: &str, side: &str) -> f64 {
+    if inv.market != market {
+        return 0.0;
+    }
+    match side {
+        "Up" => inv.suspect_up,
+        "Down" => inv.suspect_down,
         _ => 0.0,
     }
 }

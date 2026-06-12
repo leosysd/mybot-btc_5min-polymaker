@@ -141,6 +141,19 @@ pub struct Inventory {
     pub pending_up: f64,
     #[serde(default)]
     pub pending_down: f64,
+    /// "Suspect" shares: an ambiguous cancel found the order gone (it MAY have
+    /// filled) but the response carries no authoritative size/price. We park the
+    /// order's remaining size here so it keeps occupying side-cap room (no
+    /// re-buying into an under-counted position) WITHOUT pausing placement and
+    /// WITHOUT polluting cost/PnL. Resolved by the on-chain reconcile: a raise
+    /// absorbs it into held; a caught-up snapshot with no raise ages it out.
+    #[serde(default)]
+    pub suspect_up: f64,
+    #[serde(default)]
+    pub suspect_down: f64,
+    /// Timestamp of the most recent suspect addition (for reconcile age-out).
+    #[serde(default)]
+    pub suspect_since_ms: u64,
 }
 
 impl Default for Inventory {
@@ -154,6 +167,9 @@ impl Default for Inventory {
             down_cost: 0.0,
             pending_up: 0.0,
             pending_down: 0.0,
+            suspect_up: 0.0,
+            suspect_down: 0.0,
+            suspect_since_ms: 0,
         }
     }
 }
@@ -188,12 +204,39 @@ impl Inventory {
         (self.down_shares - self.down_cost) - self.up_cost
     }
 
+    /// Exposure used by caps/skew: filled + outstanding orders + suspect
+    /// (maybe-filled, awaiting reconcile). Suspect counts here so the cap can
+    /// never re-open room over a fill we have not accounted yet.
     pub fn effective_up(&self) -> f64 {
-        self.up_shares + self.pending_up
+        self.up_shares + self.pending_up + self.suspect_up
     }
 
     pub fn effective_down(&self) -> f64 {
-        self.down_shares + self.pending_down
+        self.down_shares + self.pending_down + self.suspect_down
+    }
+
+    pub fn add_suspect(&mut self, side: &str, size: f64) {
+        if size <= 0.0 {
+            return;
+        }
+        match side {
+            "Up" => self.suspect_up += size,
+            "Down" => self.suspect_down += size,
+            _ => return,
+        }
+        self.suspect_since_ms = now_ms();
+        self.ts_ms = now_ms();
+    }
+
+    pub fn has_suspects(&self) -> bool {
+        self.suspect_up > 0.001 || self.suspect_down > 0.001
+    }
+
+    pub fn clear_suspects(&mut self) {
+        self.suspect_up = 0.0;
+        self.suspect_down = 0.0;
+        self.suspect_since_ms = 0;
+        self.ts_ms = now_ms();
     }
 }
 

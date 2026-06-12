@@ -21,6 +21,10 @@ use super::state::{
 
 const RECV_TIMEOUT: Duration = Duration::from_millis(250);
 const POSITION_RECONCILE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How long suspect (maybe-filled) shares keep occupying cap room before a
+/// caught-up reconcile that found no fill releases them. Generous versus the
+/// usual Polygon mine + Data API indexing lag of a few seconds.
+const SUSPECT_AGE_OUT_MS: u64 = 20_000;
 
 pub fn run(
     cfg: Config,
@@ -63,10 +67,11 @@ pub fn run(
     let mut current_market = String::new();
     let mut up_token = String::new();
     let mut down_token = String::new();
-    // P2: after a real fill, keep placement paused until the authoritative Data
-    // API position catches up to the locally credited inventory. We poll instead
-    // of sleeping a fixed number of seconds, so fast snapshots release quickly
-    // while stale snapshots keep the gateway safely paused.
+    // P2: after a real fill (or an ambiguous cancel that parked suspect shares),
+    // poll the authoritative Data API until it catches up to the locally
+    // credited inventory and all suspect shares are resolved. This runs in the
+    // BACKGROUND — placement is never paused; suspect shares occupying cap room
+    // are what prevent repeat buying while the position is uncertain.
     let mut next_forced_reconcile: Option<Instant> = None;
 
     while !stopping(&stop, &cfg) {
@@ -87,14 +92,55 @@ pub fn run(
                 if market_matches {
                     match reconciler.fetch(&up_token, &down_token) {
                         Ok(snap) => {
+                            let mut stale_market = false;
                             let (corrected, caught_up, local_up, local_down) = {
                                 let mut inv = inventory.lock().unwrap();
-                                let corrected =
-                                    reconcile_inventory_with_chain(&cfg, &mut inv, &snap)?;
-                                let caught_up =
-                                    snapshot_covers_inventory(&snap, &inv, &up_token, &down_token);
-                                (corrected, caught_up, inv.up_shares, inv.down_shares)
+                                // Re-check under the lock: the gateway may have
+                                // switched windows while fetch() was in flight.
+                                // NEVER apply an old window's snapshot to the new
+                                // window's freshly-reset inventory.
+                                if inv.market != current_market {
+                                    stale_market = true;
+                                    (false, true, inv.up_shares, inv.down_shares)
+                                } else {
+                                    let pre_up = inv.up_shares;
+                                    let pre_down = inv.down_shares;
+                                    let mut dirty =
+                                        reconcile_inventory_with_chain(&cfg, &mut inv, &snap)?;
+                                    // A raise means the chain confirmed the real
+                                    // position — suspects on that side are absorbed.
+                                    if inv.up_shares > pre_up + 1e-9 && inv.suspect_up > 0.0 {
+                                        inv.suspect_up = 0.0;
+                                        dirty = true;
+                                    }
+                                    if inv.down_shares > pre_down + 1e-9 && inv.suspect_down > 0.0 {
+                                        inv.suspect_down = 0.0;
+                                        dirty = true;
+                                    }
+                                    // No raise after a generous indexing margin →
+                                    // conclude the suspected fill never happened
+                                    // and release the parked cap room.
+                                    if inv.has_suspects()
+                                        && now_ms().saturating_sub(inv.suspect_since_ms)
+                                            > SUSPECT_AGE_OUT_MS
+                                    {
+                                        inv.clear_suspects();
+                                        dirty = true;
+                                    }
+                                    let caught_up = snapshot_covers_inventory(
+                                        &snap,
+                                        &inv,
+                                        &up_token,
+                                        &down_token,
+                                    ) && !inv.has_suspects();
+                                    (dirty, caught_up, inv.up_shares, inv.down_shares)
+                                }
                             };
+                            if stale_market {
+                                next_forced_reconcile = None;
+                                reconcile_gate.store(false, Ordering::Relaxed);
+                                continue;
+                            }
                             if corrected {
                                 let inv = inventory.lock().unwrap();
                                 write_json(&cfg.inventory_path(), &*inv)?;
@@ -200,22 +246,24 @@ pub fn run(
                         &mut down_token,
                         &fill,
                     );
-                    reconcile_gate.store(true, Ordering::Relaxed);
+                    // Background verification only — a matched fill is exact
+                    // accounting, so placement is NOT paused (pausing cancelled
+                    // the opposite leg and froze the bot one-sided).
                     next_forced_reconcile = Some(Instant::now());
                 }
                 heartbeat(&cfg, "risk-ledger", "fill accounted")?;
             }
             Ok(LedgerEvent::UnmatchedFill) => {
-                // Gateway saw an account fill it couldn't match to a known order.
-                // PAUSE gateway placement (the shared inventory under-counts the
-                // real position until we reconcile) and force an immediate
-                // on-chain reconcile; the gate is released once it succeeds.
-                reconcile_gate.store(true, Ordering::Relaxed);
+                // Gateway saw an account fill it couldn't match to a known order
+                // (or an ambiguous cancel parked suspect shares). Placement is
+                // NOT paused — the suspect shares already occupy cap room, which
+                // is what prevents repeat buying. Force an immediate on-chain
+                // reconcile to resolve them.
                 next_forced_reconcile = Some(Instant::now());
                 heartbeat(
                     &cfg,
                     "risk-ledger",
-                    "unmatched fill -> pausing placement + forcing reconcile",
+                    "unmatched fill -> forcing background reconcile (no pause)",
                 )?;
             }
             Err(RecvTimeoutError::Timeout) => {
