@@ -328,11 +328,12 @@ fn check_kill_switch(cfg: &Config, stop: &StopFlag, inventory: &Inventory) -> Ap
 }
 
 fn max_total_inventory_exceeded(cfg: &Config, inventory: &Inventory) -> bool {
-    if cfg.max_total_inventory <= 0.0 {
+    let max_total_inventory = cfg.effective_max_total_inventory();
+    if max_total_inventory <= 0.0 {
         return false;
     }
     let total_inventory = inventory.effective_up() + inventory.effective_down();
-    total_inventory > cfg.max_total_inventory + 1e-9
+    total_inventory > max_total_inventory + 1e-9
 }
 
 #[cfg(test)]

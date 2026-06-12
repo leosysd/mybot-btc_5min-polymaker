@@ -458,6 +458,78 @@ impl Config {
     pub fn max_side_inventory(&self) -> f64 {
         (self.quote_size * self.inventory_mult).round().max(0.0)
     }
+
+    /// Effective unpaired cap used by quote/gateway logic.
+    ///
+    /// `MAX_UNPAIRED_SHARES=0` keeps the existing "disabled" behavior. Positive
+    /// values are treated as a user cap, but never below one full quote; otherwise
+    /// changing `QUOTE_SIZE` upward can make the first order impossible.
+    pub fn effective_max_unpaired_shares(&self) -> f64 {
+        if self.max_unpaired_shares <= 0.0 {
+            0.0
+        } else {
+            self.max_unpaired_shares
+                .max(self.quote_size.round().max(1.0))
+        }
+    }
+
+    /// Effective total inventory stop. `0` still disables it; otherwise the stop
+    /// cannot be below the bot's own configured two-sided capacity.
+    pub fn effective_max_total_inventory(&self) -> f64 {
+        if self.max_total_inventory <= 0.0 {
+            0.0
+        } else {
+            self.max_total_inventory
+                .max((self.max_side_inventory() * 2.0).round())
+        }
+    }
+
+    /// Effective single-order notional cap. In real mode the hard safety ceiling
+    /// remains $60, but a stale low value no longer silently truncates every order
+    /// after `QUOTE_SIZE` is raised.
+    pub fn effective_live_order_notional_cap(&self) -> f64 {
+        if self.live_order_notional_cap <= 0.0 {
+            0.0
+        } else {
+            let desired = self.quote_size.round().max(1.0) * self.max_bid.clamp(0.01, 1.0);
+            self.live_order_notional_cap
+                .max(desired)
+                .min(MAX_LIVE_ORDER_NOTIONAL_CAP_USD)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn sizing_caps_scale_with_quote_size_when_old_values_are_too_small() {
+        let mut cfg = Config::from_env().expect("config");
+        cfg.quote_size = 50.0;
+        cfg.inventory_mult = 2.0;
+        cfg.max_bid = 0.70;
+        cfg.max_unpaired_shares = 20.0;
+        cfg.max_total_inventory = 50.0;
+        cfg.live_order_notional_cap = 20.0;
+
+        assert_eq!(cfg.max_side_inventory(), 100.0);
+        assert_eq!(cfg.effective_max_unpaired_shares(), 50.0);
+        assert_eq!(cfg.effective_max_total_inventory(), 200.0);
+        assert!((cfg.effective_live_order_notional_cap() - 35.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn zero_still_disables_optional_caps() {
+        let mut cfg = Config::from_env().expect("config");
+        cfg.max_unpaired_shares = 0.0;
+        cfg.max_total_inventory = 0.0;
+        cfg.live_order_notional_cap = 0.0;
+
+        assert_eq!(cfg.effective_max_unpaired_shares(), 0.0);
+        assert_eq!(cfg.effective_max_total_inventory(), 0.0);
+        assert_eq!(cfg.effective_live_order_notional_cap(), 0.0);
+    }
 }
 
 fn detect_base_dir() -> AppResult<PathBuf> {

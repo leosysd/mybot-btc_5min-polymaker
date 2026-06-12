@@ -443,6 +443,8 @@ MAX_UNPAIRED_SHARES=19
 
 最大未配平差额，按 `abs((Up已成交+pending) - (Down已成交+pending))` 计算。达到上限后，机器人不再给领先的一边加仓，只允许继续挂落后的一边来缩小差额。`0` 表示关闭该限制。
 
+实际运行时这个值有一个自动下限：只要它是正数，就不会低于 `QUOTE_SIZE`。这样把 `QUOTE_SIZE` 从 10 改到 50 时，不会因为旧的 `MAX_UNPAIRED_SHARES=20` 把第一笔 50 份订单直接挡掉。
+
 ```text
 ENABLE_MARKET_ANCHOR=0
 MARKET_ANCHOR_SHADOW=1
@@ -497,8 +499,8 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 - `WS_STALE_AFTER_MS`：live WS 断流超过阈值，写入停止信号。
 - `MAX_LOSS`：最坏结算情景亏损达到阈值，停止服务。
-- `MAX_TOTAL_INVENTORY`：Up+Down 已成交+pending 总库存达到阈值，停止服务。
-- `LIVE_ORDER_NOTIONAL_CAP`：真实下单单笔名义金额上限；当前 DRY_RUN 也会按它截断模拟挂单。
+- `MAX_TOTAL_INVENTORY`：Up+Down 已成交+pending 总库存达到阈值，停止服务；正数低于 `2 * QUOTE_SIZE * INVENTORY_MULT` 时，会自动按这个双边容量执行。
+- `LIVE_ORDER_NOTIONAL_CAP`：真实下单单笔名义金额上限；当前 DRY_RUN 也会按它截断模拟挂单。低于 `QUOTE_SIZE * MAX_BID` 时会自动抬高，硬上限仍是 `$60`。
 
 ## 做市逻辑
 

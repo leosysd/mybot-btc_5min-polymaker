@@ -380,7 +380,9 @@ pub fn run(
                                 "order-gateway",
                                 format!(
                                     "unpaired cap blocks {} size={:.0} limit={:.0}",
-                                    quote.side, quote.size, cfg.max_unpaired_shares
+                                    quote.side,
+                                    quote.size,
+                                    cfg.effective_max_unpaired_shares()
                                 ),
                             )?;
                             continue;
@@ -586,7 +588,7 @@ fn unpaired_limit_allows_quote(
     side: &str,
     incremental_size: f64,
 ) -> bool {
-    let limit = cfg.max_unpaired_shares;
+    let limit = cfg.effective_max_unpaired_shares();
     if limit <= 0.0 || incremental_size <= 0.0 {
         return true;
     }
@@ -660,8 +662,9 @@ fn accept_resting_order(
     ledger_tx: &LedgerTx,
     mut quote: QuoteIntent,
 ) -> AppResult<bool> {
-    if cfg.live_order_notional_cap > 0.0 && quote.price > 0.0 {
-        let capped_size = (cfg.live_order_notional_cap / quote.price).floor();
+    let live_order_notional_cap = cfg.effective_live_order_notional_cap();
+    if live_order_notional_cap > 0.0 && quote.price > 0.0 {
+        let capped_size = (live_order_notional_cap / quote.price).floor();
         if capped_size < 1.0 {
             heartbeat(cfg, "order-gateway", "skipped live notional cap")?;
             return Ok(false);

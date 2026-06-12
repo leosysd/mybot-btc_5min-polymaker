@@ -439,7 +439,7 @@ fn value_buy_quotes(
 }
 
 fn unpaired_limit_allows(cfg: &Config, inventory: &Inventory, side: &str, size: f64) -> bool {
-    let limit = cfg.max_unpaired_shares;
+    let limit = cfg.effective_max_unpaired_shares();
     if limit <= 0.0 {
         return true;
     }
