@@ -146,6 +146,7 @@ pub fn run(
     // position reconcile. In real mode this is safety-critical: if inventory is
     // even briefly uncertain, do not keep live orders resting.
     let mut reconcile_pause_since: Option<Instant> = None;
+    let mut reconcile_pause_market: Option<String> = None;
     let mut last_pause_heartbeat: Option<Instant> = None;
     let mut pause_cleanup_done = false;
 
@@ -162,6 +163,9 @@ pub fn run(
                     _ => false,
                 };
                 if pause_for_fill {
+                    if let GatewayEvent::Fill(fill) = &event {
+                        reconcile_pause_market = Some(fill.market.clone());
+                    }
                     reconcile_gate.store(true, Ordering::Relaxed);
                     pause_cleanup_done = false;
                 }
@@ -202,6 +206,12 @@ pub fn run(
                 match reconcile_pause_since {
                     None => {
                         reconcile_pause_since = Some(Instant::now());
+                        if reconcile_pause_market.is_none() {
+                            let market = inventory.lock().unwrap().market.clone();
+                            if !market.trim().is_empty() {
+                                reconcile_pause_market = Some(market);
+                            }
+                        }
                         true
                     }
                     Some(t) => {
@@ -221,6 +231,7 @@ pub fn run(
                 }
             } else {
                 reconcile_pause_since = None;
+                reconcile_pause_market = None;
                 last_pause_heartbeat = None;
                 pause_cleanup_done = false;
                 false
@@ -260,12 +271,51 @@ pub fn run(
                             }
                         }
                     }
+                    let freshest_market = newest_quote_market(&latest);
+                    if let Some(market) = freshest_market.as_deref() {
+                        latest.retain(|_, q| q.market == market);
+                    }
                     // Channel drained above (no backlog); if paused, place nothing.
                     if placement_paused {
+                        if let Some(market) = freshest_market.as_deref() {
+                            if reconcile_pause_allows_market_switch(
+                                reconcile_pause_market.as_deref(),
+                                market,
+                            ) {
+                                let old_market = reconcile_pause_market.take().unwrap_or_default();
+                                reconcile_gate.store(false, Ordering::Relaxed);
+                                reconcile_pause_since = None;
+                                last_pause_heartbeat = None;
+                                pause_cleanup_done = false;
+                                heartbeat(
+                                    &cfg,
+                                    "order-gateway",
+                                    format!(
+                                        "reconcile pause released on market switch: {old_market} -> {market}"
+                                    ),
+                                )?;
+                            } else {
+                                heartbeat(
+                                    &cfg,
+                                    "order-gateway",
+                                    "placement paused: awaiting reconcile after unmatched fill",
+                                )?;
+                                continue;
+                            }
+                        } else {
+                            heartbeat(
+                                &cfg,
+                                "order-gateway",
+                                "placement paused: awaiting reconcile after unmatched fill",
+                            )?;
+                            continue;
+                        }
+                    }
+                    if reconcile_gate.load(Ordering::Relaxed) {
                         heartbeat(
                             &cfg,
                             "order-gateway",
-                            "placement paused: awaiting reconcile after unmatched fill",
+                            "placement paused: reconcile gate still set",
                         )?;
                         continue;
                     }
@@ -579,6 +629,24 @@ fn should_keep_resting(cfg: &Config, old: Option<&RestingOrder>, quote: &QuoteIn
     }
     let threshold = cfg.tick_size * cfg.requote_threshold_ticks.max(0.0);
     (old.price - quote.price).abs() < threshold && (old.size - quote.size).abs() < 0.001
+}
+
+fn newest_quote_market(latest: &HashMap<String, QuoteIntent>) -> Option<String> {
+    latest
+        .values()
+        .max_by_key(|quote| quote.ts_ms)
+        .map(|quote| quote.market.clone())
+        .filter(|market| !market.trim().is_empty())
+}
+
+fn reconcile_pause_allows_market_switch(paused_market: Option<&str>, quote_market: &str) -> bool {
+    let quote_market = quote_market.trim();
+    if quote_market.is_empty() {
+        return false;
+    }
+    paused_market
+        .map(str::trim)
+        .is_some_and(|market| !market.is_empty() && market != quote_market)
 }
 
 fn unpaired_limit_allows_quote(
@@ -1766,6 +1834,38 @@ mod tests {
             inventory_down: 0.0,
             reason: "test".to_string(),
         }
+    }
+
+    #[test]
+    fn reconcile_pause_releases_only_after_market_switch() {
+        assert!(!reconcile_pause_allows_market_switch(
+            Some("btc-updown-5m-1000"),
+            "btc-updown-5m-1000"
+        ));
+        assert!(reconcile_pause_allows_market_switch(
+            Some("btc-updown-5m-1000"),
+            "btc-updown-5m-1300"
+        ));
+        assert!(!reconcile_pause_allows_market_switch(
+            None,
+            "btc-updown-5m-1300"
+        ));
+    }
+
+    #[test]
+    fn newest_quote_market_selects_latest_window() {
+        let mut up = quote("Up", 5.0);
+        up.market = "btc-updown-5m-old".to_string();
+        up.ts_ms = 100;
+        let mut down = quote("Down", 5.0);
+        down.market = "btc-updown-5m-new".to_string();
+        down.ts_ms = 200;
+        let latest = HashMap::from([("Up".to_string(), up), ("Down".to_string(), down)]);
+
+        assert_eq!(
+            newest_quote_market(&latest),
+            Some("btc-updown-5m-new".to_string())
+        );
     }
 
     #[test]
