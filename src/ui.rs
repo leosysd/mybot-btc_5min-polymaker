@@ -746,6 +746,14 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("VALUE_MIN_EDGE", "价值买入最低安全垫: fair - bid"),
         ("VALUE_AGGRESSION_TICKS", "价值买入相对买一抬高多少tick"),
         ("VALUE_MIN_FAIR", "价值买入最低模型胜率过滤"),
+        (
+            "STRATEGY_MODE",
+            "selective=趋势强边优先; value_buy=旧版双边",
+        ),
+        ("EDGE_HIGH", "强边/震荡最低安全垫"),
+        ("EDGE_LOW", "弱边最低安全垫"),
+        ("TREND_MIN_GAP", "模型和盘口同向离50%的趋势阈值"),
+        ("RANGE_MAX_GAP", "离50%多少以内按震荡双边处理"),
         ("ENABLE_MARKET_ANCHOR", "1=真实报价使用盘口锚定融合胜率"),
         ("MARKET_ANCHOR_SHADOW", "1=记录影子融合胜率,不改报价"),
         ("MARKET_ANCHOR_WEIGHT", "盘口锚定兼容默认权重"),
@@ -821,7 +829,12 @@ fn print_param_help() {
     println!("  VALUE_MIN_EDGE         最低安全垫: 买价必须 <= 模型fair-该值");
     println!("  VALUE_AGGRESSION_TICKS 相对当前买一抬高多少tick,仍受安全垫限制");
     println!("  VALUE_MIN_FAIR         最低模型胜率过滤,低于则不挂这一边");
-    println!("  ENABLE_MARKET_ANCHOR   1=真实报价使用盘口锚定融合胜率;默认0");
+    println!("  STRATEGY_MODE          selective=趋势强边优先、震荡双边; value_buy=旧版双边");
+    println!("  EDGE_HIGH              selective强边/震荡安全垫,默认1分");
+    println!("  EDGE_LOW               selective弱边安全垫,默认8分,减少低胜率边先成交");
+    println!("  TREND_MIN_GAP          模型和盘口同向离50%超过该值才按趋势强边处理");
+    println!("  RANGE_MAX_GAP          综合胜率离50%不超过该值按震荡局双边报价");
+    println!("  ENABLE_MARKET_ANCHOR   1=真实报价使用盘口锚定融合胜率;默认1");
     println!("  MARKET_ANCHOR_SHADOW   1=只记录FinalUp影子胜率,不改变报价");
     println!("  MARKET_ANCHOR_WEIGHT   兼容默认权重;HIGH/LOW未设置时使用它");
     println!("  MARKET_ANCHOR_WEIGHT_HIGH 模型高胜率边盘口锚定权重");
@@ -1954,12 +1967,12 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "VOL_MAX_PER_SQRT_SEC", "60")?;
     upsert_env_if_missing(path, "WIDTH_FLOOR_USD", "3")?;
     upsert_env_if_missing(path, "BASE_HALF_SPREAD", "0.012")?;
-    upsert_env_if_missing(path, "MIN_LOCK_EDGE", "0.02")?;
+    upsert_env_if_missing(path, "MIN_LOCK_EDGE", "0.06")?;
     upsert_env_if_missing(path, "LATENCY_SEC", "0.4")?;
     upsert_env_if_missing(path, "K_ADVERSE", "1")?;
     upsert_env_if_missing(path, "MIN_HALF_SPREAD", "0.005")?;
     upsert_env_if_missing(path, "MAX_HALF_SPREAD", "0.25")?;
-    upsert_env_if_missing(path, "ENDGAME_PULL_SECS", "12")?;
+    upsert_env_if_missing(path, "ENDGAME_PULL_SECS", "15")?;
     upsert_env_if_missing(path, "INVENTORY_SKEW_TIME_BOOST", "2")?;
     upsert_env_if_missing(path, "TOX_HORIZON_MS", "2500")?;
     upsert_env_if_missing(path, "TOX_DECAY", "0.5")?;
@@ -1988,14 +2001,44 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing_with_comment(
         path,
         "VALUE_MIN_FAIR",
-        "0.05",
+        "0.20",
         "最低模型胜率过滤：低于这个fair的一边不挂单。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
+        "STRATEGY_MODE",
+        "selective",
+        "selective=趋势强边优先、震荡双边；value_buy=旧版双边价值挂单。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "EDGE_HIGH",
+        "0.01",
+        "selective强边/震荡最低安全垫：fair-bid至少1分，提高高胜率边成交率。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "EDGE_LOW",
+        "0.08",
+        "selective弱边最低安全垫：fair-bid至少8分，减少低胜率边先成交。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "TREND_MIN_GAP",
+        "0.12",
+        "模型和盘口同向离50%超过该值时判定趋势局。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "RANGE_MAX_GAP",
+        "0.08",
+        "综合胜率离50%不超过该值时判定震荡局，允许双边快速锁仓。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
         "ENABLE_MARKET_ANCHOR",
-        "0",
-        "1=真实报价使用盘口锚定融合胜率；默认0只记录影子值。",
+        "1",
+        "1=真实报价使用盘口锚定融合胜率，缓解模型慢一步。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
@@ -2012,13 +2055,13 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing_with_comment(
         path,
         "MARKET_ANCHOR_WEIGHT_HIGH",
-        "0.30",
+        "0.35",
         "模型高胜率边盘口融合权重；低一些可保留模型优势。",
     )?;
     upsert_env_if_missing_with_comment(
         path,
         "MARKET_ANCHOR_WEIGHT_LOW",
-        "0.60",
+        "0.85",
         "模型低胜率对边盘口融合权重；高一些可避免低边挂价离谱。",
     )?;
     upsert_env_if_missing_with_comment(

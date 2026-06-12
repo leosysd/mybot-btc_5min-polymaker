@@ -71,6 +71,11 @@ pub struct Config {
     pub value_min_edge: f64,
     pub value_aggression_ticks: f64,
     pub value_min_fair: f64,
+    pub strategy_mode: String,
+    pub edge_high: f64,
+    pub edge_low: f64,
+    pub trend_min_gap: f64,
+    pub range_max_gap: f64,
     pub enable_market_anchor: bool,
     pub market_anchor_shadow: bool,
     pub market_anchor_weight: f64,
@@ -161,12 +166,12 @@ impl Config {
             vol_max_per_sqrt_sec: get_f64(&file_env, "VOL_MAX_PER_SQRT_SEC", 60.0),
             width_floor_usd: get_f64(&file_env, "WIDTH_FLOOR_USD", 3.0),
             base_half_spread: get_f64(&file_env, "BASE_HALF_SPREAD", 0.012),
-            min_lock_edge: get_f64(&file_env, "MIN_LOCK_EDGE", 0.02),
+            min_lock_edge: get_f64(&file_env, "MIN_LOCK_EDGE", 0.06),
             latency_sec: get_f64(&file_env, "LATENCY_SEC", 0.4),
             k_adverse: get_f64(&file_env, "K_ADVERSE", 1.0),
             min_half_spread: get_f64(&file_env, "MIN_HALF_SPREAD", 0.005),
             max_half_spread: get_f64(&file_env, "MAX_HALF_SPREAD", 0.25),
-            endgame_pull_secs: get_f64(&file_env, "ENDGAME_PULL_SECS", 12.0),
+            endgame_pull_secs: get_f64(&file_env, "ENDGAME_PULL_SECS", 15.0),
             inventory_skew_time_boost: get_f64(&file_env, "INVENTORY_SKEW_TIME_BOOST", 2.0),
             tox_horizon_ms: get_u64(&file_env, "TOX_HORIZON_MS", 2500),
             tox_decay: get_f64(&file_env, "TOX_DECAY", 0.5),
@@ -182,20 +187,17 @@ impl Config {
             quote_warmup_secs: get_f64(&file_env, "QUOTE_WARMUP_SECS", 25.0),
             value_min_edge: get_f64(&file_env, "VALUE_MIN_EDGE", 0.03),
             value_aggression_ticks: get_f64(&file_env, "VALUE_AGGRESSION_TICKS", 1.0),
-            value_min_fair: get_f64(&file_env, "VALUE_MIN_FAIR", 0.05),
-            enable_market_anchor: get_bool(&file_env, "ENABLE_MARKET_ANCHOR", false),
+            value_min_fair: get_f64(&file_env, "VALUE_MIN_FAIR", 0.20),
+            strategy_mode: get(&file_env, "STRATEGY_MODE", "selective"),
+            edge_high: get_f64(&file_env, "EDGE_HIGH", 0.01),
+            edge_low: get_f64(&file_env, "EDGE_LOW", 0.08),
+            trend_min_gap: get_f64(&file_env, "TREND_MIN_GAP", 0.12),
+            range_max_gap: get_f64(&file_env, "RANGE_MAX_GAP", 0.08),
+            enable_market_anchor: get_bool(&file_env, "ENABLE_MARKET_ANCHOR", true),
             market_anchor_shadow: get_bool(&file_env, "MARKET_ANCHOR_SHADOW", true),
             market_anchor_weight,
-            market_anchor_weight_high: get_f64(
-                &file_env,
-                "MARKET_ANCHOR_WEIGHT_HIGH",
-                market_anchor_weight,
-            ),
-            market_anchor_weight_low: get_f64(
-                &file_env,
-                "MARKET_ANCHOR_WEIGHT_LOW",
-                market_anchor_weight,
-            ),
+            market_anchor_weight_high: get_f64(&file_env, "MARKET_ANCHOR_WEIGHT_HIGH", 0.35),
+            market_anchor_weight_low: get_f64(&file_env, "MARKET_ANCHOR_WEIGHT_LOW", 0.85),
             market_anchor_low_side_below: get_f64(&file_env, "MARKET_ANCHOR_LOW_SIDE_BELOW", 0.50),
             market_anchor_max_spread: get_f64(&file_env, "MARKET_ANCHOR_MAX_SPREAD", 0.12),
             momentum_shadow: get_bool(&file_env, "MOMENTUM_SHADOW", true),
@@ -302,6 +304,21 @@ impl Config {
         }
         if !(0.0..=1.0).contains(&self.value_min_fair) || !self.value_min_fair.is_finite() {
             return Err("VALUE_MIN_FAIR must be a finite probability in [0, 1]".into());
+        }
+        if !matches!(self.strategy_mode.as_str(), "value_buy" | "selective") {
+            return Err("STRATEGY_MODE must be value_buy or selective".into());
+        }
+        if self.edge_high < 0.0 || self.edge_high >= 1.0 || !self.edge_high.is_finite() {
+            return Err("EDGE_HIGH must be finite and in [0, 1)".into());
+        }
+        if self.edge_low < self.edge_high || self.edge_low >= 1.0 || !self.edge_low.is_finite() {
+            return Err("EDGE_LOW must be finite and >= EDGE_HIGH and < 1".into());
+        }
+        if !(0.0..=0.5).contains(&self.trend_min_gap) || !self.trend_min_gap.is_finite() {
+            return Err("TREND_MIN_GAP must be finite and in [0, 0.5]".into());
+        }
+        if !(0.0..=0.5).contains(&self.range_max_gap) || !self.range_max_gap.is_finite() {
+            return Err("RANGE_MAX_GAP must be finite and in [0, 0.5]".into());
         }
         if !(0.0..=1.0).contains(&self.market_anchor_weight)
             || !self.market_anchor_weight.is_finite()

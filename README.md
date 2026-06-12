@@ -446,11 +446,16 @@ MAX_UNPAIRED_SHARES=19
 实际运行时这个值有一个自动下限：只要它是正数，就不会低于 `QUOTE_SIZE`。这样把 `QUOTE_SIZE` 从 10 改到 50 时，不会因为旧的 `MAX_UNPAIRED_SHARES=20` 把第一笔 50 份订单直接挡掉。
 
 ```text
-ENABLE_MARKET_ANCHOR=0
+STRATEGY_MODE=selective
+EDGE_HIGH=0.01
+EDGE_LOW=0.08
+TREND_MIN_GAP=0.12
+RANGE_MAX_GAP=0.08
+ENABLE_MARKET_ANCHOR=1
 MARKET_ANCHOR_SHADOW=1
 MARKET_ANCHOR_WEIGHT=0.30
-MARKET_ANCHOR_WEIGHT_HIGH=0.30
-MARKET_ANCHOR_WEIGHT_LOW=0.60
+MARKET_ANCHOR_WEIGHT_HIGH=0.35
+MARKET_ANCHOR_WEIGHT_LOW=0.85
 MARKET_ANCHOR_LOW_SIDE_BELOW=0.50
 MARKET_ANCHOR_MAX_SPREAD=0.12
 MOMENTUM_SHADOW=1
@@ -458,14 +463,16 @@ MOMENTUM_WEIGHT=0.08
 MOMENTUM_SCALE_USD_PER_SEC=8
 ```
 
-盘口锚定胜率。默认只记录影子融合胜率，不改变实盘报价：
+`STRATEGY_MODE=selective` 是默认实盘报价模式：趋势局优先高胜率方向，弱边要求更大折扣；震荡局才两边都用较紧安全垫快速锁仓。`EDGE_HIGH=0.01` 表示强边或震荡双边至少留 1 分 edge，提高高胜率边成交率；`EDGE_LOW=0.08` 表示弱边至少留 8 分 edge，避免一直先买低胜率边。`TREND_MIN_GAP=0.12` 表示模型和盘口都离 50% 至少 12 分且同向才按趋势局处理；`RANGE_MAX_GAP=0.08` 表示综合胜率离 50% 不超过 8 分时按震荡局处理。要退回旧逻辑，把 `STRATEGY_MODE=value_buy`。
+
+盘口锚定胜率。默认会参与实盘报价，用来缓解模型慢一步：
 
 ```text
 Up边fair   = 模型Up   * (1 - Up边权重)   + 盘口Up   * Up边权重
 Down边fair = 模型Down * (1 - Down边权重) + 盘口Down * Down边权重
 ```
 
-`MARKET_ANCHOR_WEIGHT_HIGH` 用在模型高胜率边，默认 0.30，保留模型自己的优势；`MARKET_ANCHOR_WEIGHT_LOW` 用在模型低胜率边，默认 0.60，让对边更多参考盘口，避免“盘口 25、模型只挂 5”这种差太远的报价。`MARKET_ANCHOR_LOW_SIDE_BELOW=0.50` 表示模型胜率低于 50% 的一边按 LOW 权重处理。实际权重会随盘口健康度变化；bid/ask 越窄，权重越接近 HIGH/LOW 设定，价差超过 `MARKET_ANCHOR_MAX_SPREAD` 时权重归零。只有把 `ENABLE_MARKET_ANCHOR=1` 后，quote-engine 才会用融合后的单边 fair 参与真实报价。`polymaker model-market` 会显示影子 `FinalUp` 方便先观察。
+`MARKET_ANCHOR_WEIGHT_HIGH` 用在模型高胜率边，默认 0.35，保留模型自己的优势；`MARKET_ANCHOR_WEIGHT_LOW` 用在模型低胜率边，默认 0.85，让对边更多参考盘口，避免“盘口 25、模型只挂 5”这种差太远的报价。`MARKET_ANCHOR_LOW_SIDE_BELOW=0.50` 表示模型胜率低于 50% 的一边按 LOW 权重处理。实际权重会随盘口健康度变化；bid/ask 越窄，权重越接近 HIGH/LOW 设定，价差超过 `MARKET_ANCHOR_MAX_SPREAD` 时权重归零。`polymaker model-market` 会显示影子 `FinalUp` 方便观察模型和盘口差异。
 
 `MOMENTUM_SHADOW=1` 会记录短线动量影子胜率，不改变真实报价。collector 从 Binance BTC 价计算 `mom_1s/mom_3s/mom_10s/accel`；quote-engine 写入 `quotes.jsonl` 的 `momentum_up_shadow`。`MOMENTUM_WEIGHT=0.08` 表示动量最多把 Up 胜率上/下修 8 分；`MOMENTUM_SCALE_USD_PER_SEC=8` 表示 BTC 每秒约 8 美元趋势会被视为强动量。阶段 2 默认只观察它是否能更早反映单边趋势，确认有效后再考虑让真实报价使用它。
 
@@ -508,11 +515,11 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 1. 用 BTC 相对开盘价的偏移估算 `p_up`。
 2. `p_down = 1 - p_up`。
-3. 当前只有一套 value-buy maker 策略：Up/Down 各自独立判断，只在买价低于 fair 至少 `VALUE_MIN_EDGE` 时挂 maker 买单。默认 fair 是 Binance 模型；如果启用 `ENABLE_MARKET_ANCHOR=1`，Up/Down 会分别使用盘口锚定后的单边 fair。
-4. 新模式会参考当前买一价，最多抬高 `VALUE_AGGRESSION_TICKS` 个 tick，但仍然必须满足 post-only，且不能高于 `fair - VALUE_MIN_EDGE`。
+3. 默认 `STRATEGY_MODE=selective`：趋势局强边用 `EDGE_HIGH`，弱边用 `EDGE_LOW`；震荡局两边都用 `EDGE_HIGH`。旧版 `value_buy` 仍可用，会让 Up/Down 各自独立按 `VALUE_MIN_EDGE` 报价。
+4. 报价会参考当前买一价，最多抬高 `VALUE_AGGRESSION_TICKS` 个 tick，但仍然必须满足 post-only，且不能高于对应的 `fair - edge`。
 5. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
 6. 新模式不做中途卖出；`MAX_UNPAIRED_SHARES` 会限制单边差额，超过后只允许挂落后的一边。
-7. `VALUE_MIN_FAIR` 用来过滤极低胜率的一边；默认 0.05，避免买几乎归零的深度劣势方。
+7. `VALUE_MIN_FAIR` 用来过滤极低胜率的一边；默认 0.20，避免买深度劣势方。
 8. 单边库存仍受 `QUOTE_SIZE * INVENTORY_MULT` 限制，总库存仍受 `MAX_TOTAL_INVENTORY` 和 `MAX_LOSS` 限制。
 9. 如果同时持有 Up/Down，网关仍保留成本锁：补成一对时不会允许 `Up成本 + Down成本 > 1 - MIN_LOCK_EDGE`。
 10. 剩余 `ENDGAME_PULL_SECS` 秒进入 Pull，不再发新报价，等已有挂单过期/撤掉。

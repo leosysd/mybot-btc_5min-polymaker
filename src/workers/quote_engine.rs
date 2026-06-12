@@ -396,10 +396,21 @@ fn value_buy_px(
     fair: f64,
     model_bid: f64,
 ) -> Option<f64> {
+    value_buy_px_with_edge(cfg, frame, side_is_up, fair, model_bid, cfg.value_min_edge)
+}
+
+fn value_buy_px_with_edge(
+    cfg: &Config,
+    frame: &MarketFrame,
+    side_is_up: bool,
+    fair: f64,
+    model_bid: f64,
+    edge: f64,
+) -> Option<f64> {
     if fair < cfg.value_min_fair {
         return None;
     }
-    let edge_cap = fair - cfg.value_min_edge;
+    let edge_cap = fair - edge;
     if edge_cap < cfg.min_bid {
         return None;
     }
@@ -426,16 +437,98 @@ fn value_buy_quotes(
     cfg: &Config,
     frame: &MarketFrame,
     phase: Phase,
-    up_fair: f64,
-    down_fair: f64,
+    fair: FairSnapshot,
     model: ModelQuote,
 ) -> (Option<f64>, Option<f64>, &'static str) {
     if phase == Phase::Pull {
         return (None, None, "value_buy_pull");
     }
-    let up_px = value_buy_px(cfg, frame, true, up_fair, model.up_bid);
-    let down_px = value_buy_px(cfg, frame, false, down_fair, model.down_bid);
-    (up_px, down_px, "value_buy")
+    if cfg.strategy_mode != "selective" {
+        let up_px = value_buy_px(cfg, frame, true, fair.quote_up(), model.up_bid);
+        let down_px = value_buy_px(cfg, frame, false, fair.quote_down(), model.down_bid);
+        return (up_px, down_px, "value_buy");
+    }
+
+    let plan = selective_plan(cfg, fair);
+    let up_px = plan.up_edge.and_then(|edge| {
+        value_buy_px_with_edge(cfg, frame, true, fair.quote_up(), model.up_bid, edge)
+    });
+    let down_px = plan.down_edge.and_then(|edge| {
+        value_buy_px_with_edge(cfg, frame, false, fair.quote_down(), model.down_bid, edge)
+    });
+    (up_px, down_px, plan.reason)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SelectivePlan {
+    up_edge: Option<f64>,
+    down_edge: Option<f64>,
+    reason: &'static str,
+}
+
+fn selective_plan(cfg: &Config, fair: FairSnapshot) -> SelectivePlan {
+    let high = cfg.edge_high;
+    let low = cfg.edge_low.max(high);
+    let model_bias = fair.model_up - 0.5;
+    let market_bias = if (0.0001..=0.9999).contains(&fair.market_up) {
+        fair.market_up - 0.5
+    } else {
+        fair.composite_up() - 0.5
+    };
+    let final_bias = fair.composite_up() - 0.5;
+    let trend = cfg.trend_min_gap;
+    let range = cfg.range_max_gap;
+
+    if model_bias * market_bias < 0.0 && model_bias.abs() > range && market_bias.abs() > range {
+        return SelectivePlan {
+            up_edge: None,
+            down_edge: None,
+            reason: "selective_disagree",
+        };
+    }
+
+    if final_bias.abs() <= range && model_bias.abs() < trend && market_bias.abs() < trend {
+        return SelectivePlan {
+            up_edge: Some(high),
+            down_edge: Some(high),
+            reason: "selective_range",
+        };
+    }
+
+    if model_bias >= trend && market_bias >= trend {
+        return SelectivePlan {
+            up_edge: Some(high),
+            down_edge: Some(low),
+            reason: "selective_trend_up",
+        };
+    }
+    if model_bias <= -trend && market_bias <= -trend {
+        return SelectivePlan {
+            up_edge: Some(low),
+            down_edge: Some(high),
+            reason: "selective_trend_down",
+        };
+    }
+
+    if final_bias > range {
+        SelectivePlan {
+            up_edge: Some(high),
+            down_edge: Some(low),
+            reason: "selective_bias_up",
+        }
+    } else if final_bias < -range {
+        SelectivePlan {
+            up_edge: Some(low),
+            down_edge: Some(high),
+            reason: "selective_bias_down",
+        }
+    } else {
+        SelectivePlan {
+            up_edge: Some(low),
+            down_edge: Some(low),
+            reason: "selective_unclear",
+        }
+    }
 }
 
 fn unpaired_limit_allows(cfg: &Config, inventory: &Inventory, side: &str, size: f64) -> bool {
@@ -562,8 +655,7 @@ fn handle_market_frame(
     });
 
     let phase = phase_for(tau, cfg.endgame_pull_secs);
-    let (up_px, down_px, reason) =
-        value_buy_quotes(cfg, frame, phase, fair.quote_up(), fair.quote_down(), model);
+    let (up_px, down_px, reason) = value_buy_quotes(cfg, frame, phase, fair, model);
     if let Some(px) = up_px {
         send_quote(
             cfg,
@@ -685,9 +777,25 @@ mod tests {
 
     fn value_buy_quote_test_cfg() -> Config {
         let mut cfg = flat_quote_test_cfg();
+        cfg.strategy_mode = "value_buy".to_string();
         cfg.value_min_edge = 0.03;
         cfg.value_aggression_ticks = 1.0;
         cfg.value_min_fair = 0.05;
+        cfg
+    }
+
+    fn selective_quote_test_cfg() -> Config {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.strategy_mode = "selective".to_string();
+        cfg.edge_high = 0.01;
+        cfg.edge_low = 0.08;
+        cfg.trend_min_gap = 0.12;
+        cfg.range_max_gap = 0.08;
+        cfg.enable_market_anchor = true;
+        cfg.market_anchor_weight_high = 0.35;
+        cfg.market_anchor_weight_low = 0.85;
+        cfg.market_anchor_low_side_below = 0.50;
+        cfg.market_anchor_max_spread = 0.12;
         cfg
     }
 
@@ -846,6 +954,76 @@ mod tests {
             fair.quote_up() > 0.70,
             "favorite side still stays anchored above the market favorite fair"
         );
+    }
+
+    #[test]
+    fn selective_trend_uses_tighter_edge_only_on_strong_side() {
+        let cfg = selective_quote_test_cfg();
+        let mut frame = flat_frame(112.0);
+        frame.up_bid = 0.64;
+        frame.up_ask = 0.66;
+        frame.down_bid = 0.32;
+        frame.down_ask = 0.34;
+        let model_up = 0.80;
+        let fair = fair_snapshot(&cfg, &frame, model_up);
+        let model = ModelQuote {
+            up_bid: 0.70,
+            down_bid: 0.18,
+        };
+
+        let (up_px, down_px, reason) = value_buy_quotes(&cfg, &frame, Phase::Normal, fair, model);
+
+        assert_eq!(reason, "selective_trend_up");
+        let up_px = up_px.expect("strong Up should quote");
+        assert!(up_px <= fair.quote_up() - cfg.edge_high + 1e-9);
+        if let Some(down_px) = down_px {
+            assert!(
+                down_px <= fair.quote_down() - cfg.edge_low + 1e-9,
+                "weak side must require the larger EDGE_LOW discount"
+            );
+        }
+    }
+
+    #[test]
+    fn selective_range_quotes_both_sides_with_high_edge() {
+        let cfg = selective_quote_test_cfg();
+        let mut frame = flat_frame(100.0);
+        frame.up_bid = 0.49;
+        frame.up_ask = 0.51;
+        frame.down_bid = 0.49;
+        frame.down_ask = 0.51;
+        let fair = fair_snapshot(&cfg, &frame, 0.51);
+        let model = ModelQuote {
+            up_bid: 0.48,
+            down_bid: 0.48,
+        };
+
+        let (up_px, down_px, reason) = value_buy_quotes(&cfg, &frame, Phase::Normal, fair, model);
+
+        assert_eq!(reason, "selective_range");
+        assert!(up_px.is_some());
+        assert!(down_px.is_some());
+    }
+
+    #[test]
+    fn selective_disagreement_skips_quotes() {
+        let cfg = selective_quote_test_cfg();
+        let mut frame = flat_frame(100.0);
+        frame.up_bid = 0.34;
+        frame.up_ask = 0.36;
+        frame.down_bid = 0.64;
+        frame.down_ask = 0.66;
+        let fair = fair_snapshot(&cfg, &frame, 0.65);
+        let model = ModelQuote {
+            up_bid: 0.55,
+            down_bid: 0.33,
+        };
+
+        let (up_px, down_px, reason) = value_buy_quotes(&cfg, &frame, Phase::Normal, fair, model);
+
+        assert_eq!(reason, "selective_disagree");
+        assert!(up_px.is_none());
+        assert!(down_px.is_none());
     }
 
     #[test]
