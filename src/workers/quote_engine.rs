@@ -471,10 +471,27 @@ fn send_quote(
         size,
         fair,
         model_up: fair_snapshot.model_up,
-        market_up: fair_snapshot.market_up,
+        market_up: if fair_snapshot.market_up > 0.0 {
+            fair_snapshot.market_up
+        } else {
+            frame.market_up
+        },
         final_up_shadow: fair_snapshot.final_up_shadow(),
         market_anchor_weight: fair_snapshot.side_anchor_weight(side),
         fair_source: fair_snapshot.fair_source(side).to_string(),
+        calibrated_model_up: frame.calibrated_model_up,
+        momentum_up: frame.momentum_up,
+        flow_up: frame.flow_up,
+        book_up: frame.book_up,
+        final_direction_up_shadow: frame.final_direction_up_shadow,
+        direction_confidence: frame.direction_confidence,
+        mom_1s: frame.mom_1s,
+        mom_3s: frame.mom_3s,
+        mom_10s: frame.mom_10s,
+        flow_imbalance_3s: frame.flow_imbalance_3s,
+        flow_imbalance_10s: frame.flow_imbalance_10s,
+        book_microprice: frame.book_microprice,
+        book_imbalance: frame.book_imbalance,
         inventory_up: inventory.effective_up(),
         inventory_down: inventory.effective_down(),
         reason: reason.to_string(),
@@ -545,6 +562,7 @@ mod tests {
             tau_seconds: 120.0,
             vol_per_sqrt_sec: 1.5,
             source: "test".to_string(),
+            ..Default::default()
         }
     }
 

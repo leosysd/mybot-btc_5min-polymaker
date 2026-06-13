@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::direction::DirectionSnapshot;
 use crate::AppResult;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static JSON_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MarketFrame {
     pub ts_ms: u64,
     pub market: String,
@@ -34,7 +35,63 @@ pub struct MarketFrame {
     /// Adaptive BTC dollar volatility per sqrt-second (sigma_$), from collector.
     #[serde(default)]
     pub vol_per_sqrt_sec: f64,
+    #[serde(default)]
+    pub raw_model_up: f64,
+    #[serde(default)]
+    pub calibrated_model_up: f64,
+    #[serde(default)]
+    pub momentum_up: f64,
+    #[serde(default)]
+    pub flow_up: f64,
+    #[serde(default)]
+    pub book_up: f64,
+    #[serde(default)]
+    pub market_up: f64,
+    #[serde(default)]
+    pub final_direction_up_shadow: f64,
+    #[serde(default)]
+    pub direction_confidence: f64,
+    #[serde(default)]
+    pub mom_1s: f64,
+    #[serde(default)]
+    pub mom_3s: f64,
+    #[serde(default)]
+    pub mom_10s: f64,
+    #[serde(default)]
+    pub mom_20s: f64,
+    #[serde(default)]
+    pub flow_imbalance_1s: f64,
+    #[serde(default)]
+    pub flow_imbalance_3s: f64,
+    #[serde(default)]
+    pub flow_imbalance_10s: f64,
+    #[serde(default)]
+    pub book_microprice: f64,
+    #[serde(default)]
+    pub book_imbalance: f64,
     pub source: String,
+}
+
+impl MarketFrame {
+    pub fn apply_direction(&mut self, direction: DirectionSnapshot) {
+        self.raw_model_up = direction.raw_model_up;
+        self.calibrated_model_up = direction.calibrated_model_up;
+        self.momentum_up = direction.momentum_up;
+        self.flow_up = direction.flow_up;
+        self.book_up = direction.book_up;
+        self.market_up = direction.market_up;
+        self.final_direction_up_shadow = direction.final_direction_up_shadow;
+        self.direction_confidence = direction.direction_confidence;
+        self.mom_1s = direction.mom_1s;
+        self.mom_3s = direction.mom_3s;
+        self.mom_10s = direction.mom_10s;
+        self.mom_20s = direction.mom_20s;
+        self.flow_imbalance_1s = direction.flow_imbalance_1s;
+        self.flow_imbalance_3s = direction.flow_imbalance_3s;
+        self.flow_imbalance_10s = direction.flow_imbalance_10s;
+        self.book_microprice = direction.book_microprice;
+        self.book_imbalance = direction.book_imbalance;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +118,32 @@ pub struct QuoteIntent {
     pub market_anchor_weight: f64,
     #[serde(default)]
     pub fair_source: String,
+    #[serde(default)]
+    pub calibrated_model_up: f64,
+    #[serde(default)]
+    pub momentum_up: f64,
+    #[serde(default)]
+    pub flow_up: f64,
+    #[serde(default)]
+    pub book_up: f64,
+    #[serde(default)]
+    pub final_direction_up_shadow: f64,
+    #[serde(default)]
+    pub direction_confidence: f64,
+    #[serde(default)]
+    pub mom_1s: f64,
+    #[serde(default)]
+    pub mom_3s: f64,
+    #[serde(default)]
+    pub mom_10s: f64,
+    #[serde(default)]
+    pub flow_imbalance_3s: f64,
+    #[serde(default)]
+    pub flow_imbalance_10s: f64,
+    #[serde(default)]
+    pub book_microprice: f64,
+    #[serde(default)]
+    pub book_imbalance: f64,
     pub inventory_up: f64,
     pub inventory_down: f64,
     pub reason: String,

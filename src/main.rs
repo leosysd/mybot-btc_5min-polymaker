@@ -1,4 +1,5 @@
 mod config;
+mod direction;
 mod hedge;
 mod ipc;
 mod pricing;
@@ -40,6 +41,7 @@ fn main() -> AppResult<()> {
         "status" => ui::print_status(&cfg),
         "stats" | "stat" => ui::print_trade_stats(&cfg),
         "model-market" | "market-edge" | "edge" => ui::print_model_market_stats(&cfg),
+        "direction-stats" | "direction" => ui::print_direction_stats(&cfg),
         "dashboard" | "trade" => {
             let seconds = parse_seconds(args.collect())?;
             ui::run_dashboard(&cfg, seconds)

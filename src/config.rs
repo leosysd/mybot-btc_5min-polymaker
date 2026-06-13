@@ -20,6 +20,7 @@ pub struct Config {
     pub polymarket_up_token_id: String,
     pub polymarket_down_token_id: String,
     pub binance_ws_url: String,
+    pub binance_book_ws_url: String,
     pub binance_rest_url: String,
     pub price_to_beat: f64,
     pub tick_size: f64,
@@ -77,6 +78,21 @@ pub struct Config {
     pub market_anchor_weight_low: f64,
     pub market_anchor_low_side_below: f64,
     pub market_anchor_max_spread: f64,
+    pub enable_direction_shadow: bool,
+    pub enable_direction_model: bool,
+    pub direction_temp: f64,
+    pub direction_live_weight: f64,
+    pub enable_binance_flow_signal: bool,
+    pub enable_binance_book_signal: bool,
+    pub enable_polymarket_confirm_signal: bool,
+    pub direction_w_distance: f64,
+    pub direction_w_mom_1s: f64,
+    pub direction_w_mom_3s: f64,
+    pub direction_w_mom_10s: f64,
+    pub direction_w_flow_3s: f64,
+    pub direction_w_flow_10s: f64,
+    pub direction_w_book: f64,
+    pub direction_w_market: f64,
     pub enable_real_orders: String,
     pub polymarket_clob_host: String,
     pub poly_private_key: String,
@@ -129,6 +145,11 @@ impl Config {
                 &file_env,
                 "BINANCE_WS_URL",
                 "wss://stream.binance.com:9443/ws/btcusdt@trade",
+            ),
+            binance_book_ws_url: get(
+                &file_env,
+                "BINANCE_BOOK_WS_URL",
+                "wss://stream.binance.com:9443/ws/btcusdt@bookTicker",
             ),
             binance_rest_url: get(&file_env, "BINANCE_REST_URL", "https://api.binance.com"),
             price_to_beat: get_f64(&file_env, "PRICE_TO_BEAT", 68_000.0),
@@ -194,6 +215,25 @@ impl Config {
             ),
             market_anchor_low_side_below: get_f64(&file_env, "MARKET_ANCHOR_LOW_SIDE_BELOW", 0.50),
             market_anchor_max_spread: get_f64(&file_env, "MARKET_ANCHOR_MAX_SPREAD", 0.12),
+            enable_direction_shadow: get_bool(&file_env, "ENABLE_DIRECTION_SHADOW", true),
+            enable_direction_model: get_bool(&file_env, "ENABLE_DIRECTION_MODEL", false),
+            direction_temp: get_f64(&file_env, "DIRECTION_TEMP", 1.5),
+            direction_live_weight: get_f64(&file_env, "DIRECTION_LIVE_WEIGHT", 0.0),
+            enable_binance_flow_signal: get_bool(&file_env, "ENABLE_BINANCE_FLOW_SIGNAL", true),
+            enable_binance_book_signal: get_bool(&file_env, "ENABLE_BINANCE_BOOK_SIGNAL", true),
+            enable_polymarket_confirm_signal: get_bool(
+                &file_env,
+                "ENABLE_POLYMARKET_CONFIRM_SIGNAL",
+                true,
+            ),
+            direction_w_distance: get_f64(&file_env, "DIRECTION_W_DISTANCE", 1.00),
+            direction_w_mom_1s: get_f64(&file_env, "DIRECTION_W_MOM_1S", 0.15),
+            direction_w_mom_3s: get_f64(&file_env, "DIRECTION_W_MOM_3S", 0.25),
+            direction_w_mom_10s: get_f64(&file_env, "DIRECTION_W_MOM_10S", 0.20),
+            direction_w_flow_3s: get_f64(&file_env, "DIRECTION_W_FLOW_3S", 0.20),
+            direction_w_flow_10s: get_f64(&file_env, "DIRECTION_W_FLOW_10S", 0.15),
+            direction_w_book: get_f64(&file_env, "DIRECTION_W_BOOK", 0.15),
+            direction_w_market: get_f64(&file_env, "DIRECTION_W_MARKET", 0.25),
             enable_real_orders: get(&file_env, "ENABLE_REAL_ORDERS", ""),
             polymarket_clob_host: get(
                 &file_env,
@@ -323,6 +363,31 @@ impl Config {
             || !self.market_anchor_max_spread.is_finite()
         {
             return Err("MARKET_ANCHOR_MAX_SPREAD must be finite and in (0, 1]".into());
+        }
+        if self.direction_temp < 0.1 || !self.direction_temp.is_finite() {
+            return Err("DIRECTION_TEMP must be finite and at least 0.1".into());
+        }
+        if !(0.0..=1.0).contains(&self.direction_live_weight)
+            || !self.direction_live_weight.is_finite()
+        {
+            return Err("DIRECTION_LIVE_WEIGHT must be a finite probability in [0, 1]".into());
+        }
+        if self.enable_direction_model && self.direction_live_weight <= 0.0 {
+            return Err("ENABLE_DIRECTION_MODEL=1 requires DIRECTION_LIVE_WEIGHT > 0".into());
+        }
+        for (name, value) in [
+            ("DIRECTION_W_DISTANCE", self.direction_w_distance),
+            ("DIRECTION_W_MOM_1S", self.direction_w_mom_1s),
+            ("DIRECTION_W_MOM_3S", self.direction_w_mom_3s),
+            ("DIRECTION_W_MOM_10S", self.direction_w_mom_10s),
+            ("DIRECTION_W_FLOW_3S", self.direction_w_flow_3s),
+            ("DIRECTION_W_FLOW_10S", self.direction_w_flow_10s),
+            ("DIRECTION_W_BOOK", self.direction_w_book),
+            ("DIRECTION_W_MARKET", self.direction_w_market),
+        ] {
+            if !value.is_finite() {
+                return Err(format!("{name} must be finite").into());
+            }
         }
         Ok(())
     }

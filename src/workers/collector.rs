@@ -3,6 +3,7 @@
 //! the quote engine. Logs every frame to book.jsonl.
 
 use crate::config::Config;
+use crate::direction::DirectionEstimator;
 use crate::ipc::{heartbeat, now_ms, MarketFrame};
 use crate::pricing::{digital_p_up, uncertainty_width, VolEstimator};
 use crate::AppResult;
@@ -50,6 +51,7 @@ fn run_sim_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResul
         cfg.vol_min_per_sqrt_sec,
         cfg.vol_max_per_sqrt_sec,
     );
+    let mut direction = DirectionEstimator::default();
     // Each window mimics a real 5-min market: price_to_beat is locked at the
     // BTC price when the window opens, then tau counts down to settlement.
     let mut window_start = (now_ms() / 1000) / window * window;
@@ -77,22 +79,40 @@ fn run_sim_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResul
         let micro_noise = 0.012 * (phase * 1.7).sin();
         let up_ask = (fair_up + 0.035 + micro_noise).clamp(0.03, 0.97);
         let down_ask = (1.0 - fair_up + 0.035 - micro_noise).clamp(0.03, 0.97);
-        let frame = MarketFrame {
+        direction.record_trade(now_ms(), btc_price, None, None);
+        let up_bid = (up_ask - 0.07).max(0.01);
+        let down_bid = (down_ask - 0.07).max(0.01);
+        let market_up = market_up_from_quotes(up_bid, up_ask, down_bid, down_ask);
+        let mut frame = MarketFrame {
             ts_ms: now_ms(),
             market: cfg.market_slug.clone(),
             condition_id: String::new(),
             up_token_id: cfg.polymarket_up_token_id.clone(),
             down_token_id: cfg.polymarket_down_token_id.clone(),
-            up_bid: (up_ask - 0.07).max(0.01),
+            up_bid,
             up_ask,
-            down_bid: (down_ask - 0.07).max(0.01),
+            down_bid,
             down_ask,
             btc_price,
             price_to_beat,
             tau_seconds,
             vol_per_sqrt_sec: vol_now,
             source: "simulated_collector".to_string(),
+            ..Default::default()
         };
+        if cfg.enable_direction_shadow {
+            let direction_snapshot = direction.snapshot(
+                cfg,
+                frame.ts_ms,
+                btc_price,
+                price_to_beat,
+                tau_seconds,
+                vol_now,
+                market_up.map(|(up, _)| up),
+                market_up.map(|(_, spread)| spread),
+            );
+            frame.apply_direction(direction_snapshot);
+        }
         match tx.send(frame.clone()) {
             Ok(()) => {
                 log_jsonl(&logger, &cfg.book_path(), &frame)?;
@@ -138,6 +158,12 @@ fn run_live_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResu
         let state = Arc::clone(&state);
         let sink = sink.clone();
         thread::spawn(move || live_btc_loop(cfg, stop, state, sink));
+    }
+    if cfg.enable_direction_shadow && cfg.enable_binance_book_signal {
+        let cfg = cfg.clone();
+        let stop = Arc::clone(stop);
+        let state = Arc::clone(&state);
+        thread::spawn(move || live_btc_book_loop(cfg, stop, state));
     }
 
     while !stopping(stop, cfg) {
@@ -225,12 +251,21 @@ struct LiveMarketState {
     last_btc_ts: u64,
     last_polymarket_ts: u64,
     vol: VolEstimator,
+    direction: DirectionEstimator,
 }
 
 impl LiveMarketState {
     /// Record a fresh BTC price and update the volatility estimate using the
     /// real elapsed time since the previous tick.
-    fn record_btc(&mut self, cfg: &Config, price: f64, can_capture_open: bool, source: &str) {
+    fn record_btc(
+        &mut self,
+        cfg: &Config,
+        price: f64,
+        qty: Option<f64>,
+        buyer_is_maker: Option<bool>,
+        can_capture_open: bool,
+        source: &str,
+    ) {
         let now = now_ms();
         let dt_sec = if self.last_btc_ts == 0 {
             1.0
@@ -254,10 +289,16 @@ impl LiveMarketState {
             }
         }
         self.vol.update(price, dt_sec);
+        self.direction.record_trade(now, price, qty, buyer_is_maker);
         self.btc_price = price;
         self.btc_source = source.to_string();
         self.last_btc_ts = now;
         self.started = true;
+    }
+
+    fn record_btc_book(&mut self, bid: f64, bid_qty: f64, ask: f64, ask_qty: f64) {
+        self.direction
+            .record_book(now_ms(), bid, bid_qty, ask, ask_qty);
     }
 
     fn btc_open_for_window(&self, window_start_s: u64) -> Option<f64> {
@@ -297,6 +338,7 @@ impl LiveMarketState {
                 cfg.vol_min_per_sqrt_sec,
                 cfg.vol_max_per_sqrt_sec,
             ),
+            direction: DirectionEstimator::default(),
         }
     }
 
@@ -315,7 +357,9 @@ impl LiveMarketState {
         }
         let window_end_ms = market.window_end_s.saturating_mul(1000);
         let tau_seconds = (window_end_ms.saturating_sub(now) as f64 / 1000.0).max(0.0);
-        Some(MarketFrame {
+        let market_up =
+            market_up_from_quotes(self.up_bid, self.up_ask, self.down_bid, self.down_ask);
+        let mut frame = MarketFrame {
             ts_ms: now,
             market: market.slug.clone(),
             condition_id: market.condition_id.clone(),
@@ -334,7 +378,22 @@ impl LiveMarketState {
             } else {
                 format!("live_polymarket_{}", self.btc_source)
             },
-        })
+            ..Default::default()
+        };
+        if cfg.enable_direction_shadow {
+            let direction_snapshot = self.direction.snapshot(
+                cfg,
+                now,
+                self.btc_price,
+                market.price_to_beat,
+                tau_seconds,
+                self.vol.current(),
+                market_up.map(|(up, _)| up),
+                market_up.map(|(_, spread)| spread),
+            );
+            frame.apply_direction(direction_snapshot);
+        }
+        Some(frame)
     }
 
     fn set_market(&mut self, next: LiveMarketIdentity) -> bool {
@@ -681,7 +740,7 @@ fn live_btc_loop(
     if let Some(price) = fetch_binance_rest_price(&cfg) {
         {
             let mut state = state.lock().unwrap();
-            state.record_btc(&cfg, price, false, "binance_rest_seed");
+            state.record_btc(&cfg, price, None, None, false, "binance_rest_seed");
         }
         let _ = push_live_frame(&cfg, &state, &sink, "btc rest seed");
         let _ = heartbeat(&cfg, "collector", format!("btc rest seed {price:.2}"));
@@ -711,7 +770,7 @@ fn live_btc_loop(
         if let Some(price) = fetch_binance_rest_price(&cfg) {
             {
                 let mut state = state.lock().unwrap();
-                state.record_btc(&cfg, price, false, "binance_rest_fallback");
+                state.record_btc(&cfg, price, None, None, false, "binance_rest_fallback");
             }
             let _ = push_live_frame(&cfg, &state, &sink, "btc rest fallback");
             let _ = heartbeat(&cfg, "collector", format!("btc rest fallback {price:.2}"));
@@ -720,6 +779,63 @@ fn live_btc_loop(
         }
         sleep_ms(250);
     }
+}
+
+fn live_btc_book_loop(cfg: Config, stop: StopFlag, state: Arc<Mutex<LiveMarketState>>) {
+    while !stopping(&stop, &cfg) {
+        if let Err(err) = live_btc_book_once(&cfg, &stop, &state) {
+            let _ = heartbeat(&cfg, "collector", format!("btc book ws reconnect: {err}"));
+            sleep_ms(1_000);
+        }
+    }
+}
+
+fn live_btc_book_once(
+    cfg: &Config,
+    stop: &StopFlag,
+    state: &Arc<Mutex<LiveMarketState>>,
+) -> AppResult<()> {
+    let (mut socket, _) = connect(cfg.binance_book_ws_url.as_str())?;
+    let read_timeout = Duration::from_millis(500);
+    let dead_timeout = Duration::from_millis((cfg.stale_after_ms * 5).clamp(2_500, 6_000));
+    tune_ws_socket(&mut socket, read_timeout)?;
+    heartbeat(
+        cfg,
+        "collector",
+        format!("btc book ws subscribed {}", cfg.binance_book_ws_url),
+    )?;
+    let mut last_event = Instant::now();
+    while !stopping(stop, cfg) {
+        let msg = match socket.read() {
+            Ok(msg) => msg,
+            Err(err) if is_ws_timeout(&err) => {
+                if last_event.elapsed() >= dead_timeout {
+                    return Err(format!("btc book ws quiet for {:?}", last_event.elapsed()).into());
+                }
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
+        match msg {
+            Message::Text(raw) => {
+                if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                    if let Some((bid, bid_qty, ask, ask_qty)) = parse_book_ticker(&value) {
+                        last_event = Instant::now();
+                        state
+                            .lock()
+                            .unwrap()
+                            .record_btc_book(bid, bid_qty, ask, ask_qty);
+                    }
+                }
+            }
+            Message::Ping(payload) => {
+                socket.send(Message::Pong(payload))?;
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn live_btc_once(
@@ -762,10 +878,12 @@ fn live_btc_once(
             Message::Text(raw) => {
                 if let Ok(value) = serde_json::from_str::<Value>(&raw) {
                     if let Some(price) = parse_btc_price(&value) {
+                        let qty = parse_btc_quantity(&value);
+                        let buyer_is_maker = parse_buyer_is_maker(&value);
                         last_event = Instant::now();
                         {
                             let mut state = state.lock().unwrap();
-                            state.record_btc(cfg, price, true, "binance_ws");
+                            state.record_btc(cfg, price, qty, buyer_is_maker, true, "binance_ws");
                         }
                         if let Err(err) = push_live_frame(cfg, state, sink, "live btc event") {
                             let _ =
@@ -896,6 +1014,33 @@ fn valid_probability_price(px: f64) -> bool {
     px.is_finite() && px > 0.0 && px <= 1.0
 }
 
+fn market_up_from_quotes(
+    up_bid: f64,
+    up_ask: f64,
+    down_bid: f64,
+    down_ask: f64,
+) -> Option<(f64, f64)> {
+    let up = valid_probability_price(up_bid)
+        .then_some(up_bid)
+        .zip(valid_probability_price(up_ask).then_some(up_ask))
+        .filter(|(bid, ask)| ask >= bid)
+        .map(|(bid, ask)| ((bid + ask) / 2.0, ask - bid));
+    let down = valid_probability_price(down_bid)
+        .then_some(down_bid)
+        .zip(valid_probability_price(down_ask).then_some(down_ask))
+        .filter(|(bid, ask)| ask >= bid)
+        .map(|(bid, ask)| (1.0 - ((bid + ask) / 2.0), ask - bid));
+    match (up, down) {
+        (Some((up_mid, up_spread)), Some((down_mid, down_spread))) => Some((
+            ((up_mid + down_mid) / 2.0).clamp(0.0, 1.0),
+            up_spread.max(down_spread),
+        )),
+        (Some((up_mid, up_spread)), None) => Some((up_mid.clamp(0.0, 1.0), up_spread)),
+        (None, Some((down_mid, down_spread))) => Some((down_mid.clamp(0.0, 1.0), down_spread)),
+        (None, None) => None,
+    }
+}
+
 fn best_bid_from_levels(levels: Option<&Value>) -> Option<f64> {
     levels?
         .as_array()?
@@ -924,6 +1069,30 @@ fn parse_btc_price(value: &Value) -> Option<f64> {
     parse_f64_value(value.get("p"))
         .or_else(|| parse_f64_value(value.get("price")))
         .or_else(|| parse_f64_value(value.get("c")))
+}
+
+fn parse_btc_quantity(value: &Value) -> Option<f64> {
+    parse_f64_value(value.get("q"))
+        .or_else(|| parse_f64_value(value.get("quantity")))
+        .or_else(|| parse_f64_value(value.get("v")))
+}
+
+fn parse_buyer_is_maker(value: &Value) -> Option<bool> {
+    value
+        .get("m")
+        .and_then(Value::as_bool)
+        .or_else(|| value.get("buyer_is_maker").and_then(Value::as_bool))
+}
+
+fn parse_book_ticker(value: &Value) -> Option<(f64, f64, f64, f64)> {
+    let bid = parse_f64_value(value.get("b")).or_else(|| parse_f64_value(value.get("bid")))?;
+    let bid_qty =
+        parse_f64_value(value.get("B")).or_else(|| parse_f64_value(value.get("bidQty")))?;
+    let ask = parse_f64_value(value.get("a")).or_else(|| parse_f64_value(value.get("ask")))?;
+    let ask_qty =
+        parse_f64_value(value.get("A")).or_else(|| parse_f64_value(value.get("askQty")))?;
+    (bid > 0.0 && ask > bid && bid_qty > 0.0 && ask_qty > 0.0)
+        .then_some((bid, bid_qty, ask, ask_qty))
 }
 
 /// Shared with the gateway's user-WS parsing; kept here next to the other JSON

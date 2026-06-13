@@ -1696,6 +1696,204 @@ pub fn print_model_market_stats(cfg: &Config) -> AppResult<()> {
     Ok(())
 }
 
+#[derive(Clone, Default)]
+struct DirectionBucket {
+    n: u64,
+    prob_sum: f64,
+    outcome_sum: f64,
+    brier_sum: f64,
+}
+
+impl DirectionBucket {
+    fn add(&mut self, prob: f64, up_won: bool) {
+        let outcome = if up_won { 1.0 } else { 0.0 };
+        self.n += 1;
+        self.prob_sum += prob;
+        self.outcome_sum += outcome;
+        self.brier_sum += (prob - outcome) * (prob - outcome);
+    }
+
+    fn avg_prob(&self) -> f64 {
+        self.prob_sum / self.n.max(1) as f64
+    }
+
+    fn hit_rate(&self) -> f64 {
+        self.outcome_sum / self.n.max(1) as f64
+    }
+
+    fn brier(&self) -> f64 {
+        self.brier_sum / self.n.max(1) as f64
+    }
+}
+
+#[derive(Clone)]
+struct DirectionEval {
+    label: &'static str,
+    total: DirectionBucket,
+    buckets: Vec<DirectionBucket>,
+}
+
+impl DirectionEval {
+    fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            total: DirectionBucket::default(),
+            buckets: vec![DirectionBucket::default(); 20],
+        }
+    }
+
+    fn add(&mut self, prob: f64, up_won: bool) {
+        let prob = prob.clamp(0.0001, 0.9999);
+        self.total.add(prob, up_won);
+        let idx = ((prob * 20.0).floor() as usize).min(19);
+        self.buckets[idx].add(prob, up_won);
+    }
+}
+
+pub fn print_direction_stats(cfg: &Config) -> AppResult<()> {
+    print_banner("方向信号校准统计");
+    let mut last_by_market: HashMap<String, MarketFrame> = HashMap::new();
+    let now = now_ms();
+    for_each_jsonl::<MarketFrame, _>(&cfg.book_path(), |fr| {
+        if fr.btc_price > 0.0
+            && fr.price_to_beat > 0.0
+            && is_settlement_frame(&fr, cfg.market_window_secs, now)
+        {
+            last_by_market.insert(fr.market.clone(), fr);
+        }
+    })?;
+
+    let outcomes = last_by_market
+        .into_iter()
+        .filter_map(|(market, fr)| {
+            if fr.btc_price > fr.price_to_beat {
+                Some((market, true))
+            } else if fr.btc_price < fr.price_to_beat {
+                Some((market, false))
+            } else {
+                None
+            }
+        })
+        .collect::<HashMap<_, _>>();
+
+    if outcomes.is_empty() {
+        println!(
+            "{}暂无可用结算样本 ({})。{}",
+            C_DIM,
+            cfg.book_path().display(),
+            C_RESET
+        );
+        return Ok(());
+    }
+
+    let mut raw_eval = DirectionEval::new("raw_model_up");
+    let mut calibrated_eval = DirectionEval::new("calibrated_model_up");
+    let mut shadow_eval = DirectionEval::new("final_direction_up_shadow");
+    let mut shadow_rows = 0u64;
+    let mut raw_rows = 0u64;
+
+    for_each_jsonl::<MarketFrame, _>(&cfg.book_path(), |fr| {
+        let Some(up_won) = outcomes.get(&fr.market).copied() else {
+            return;
+        };
+        let raw = if fr.raw_model_up > 0.0 {
+            fr.raw_model_up
+        } else if fr.btc_price > 0.0 && fr.price_to_beat > 0.0 {
+            let vol = if fr.vol_per_sqrt_sec > 0.0 {
+                fr.vol_per_sqrt_sec
+            } else {
+                cfg.vol_seed_per_sqrt_sec
+            };
+            let width = uncertainty_width(vol, fr.tau_seconds, cfg.width_floor_usd);
+            digital_p_up(fr.btc_price, fr.price_to_beat, width)
+        } else {
+            return;
+        };
+        raw_eval.add(raw, up_won);
+        raw_rows += 1;
+
+        if fr.calibrated_model_up > 0.0 {
+            calibrated_eval.add(fr.calibrated_model_up, up_won);
+        }
+        if fr.final_direction_up_shadow > 0.0 {
+            shadow_eval.add(fr.final_direction_up_shadow, up_won);
+            shadow_rows += 1;
+        }
+    })?;
+
+    println!(
+        "markets={} raw_samples={} shadow_samples={}",
+        outcomes.len(),
+        raw_rows,
+        shadow_rows
+    );
+    print_direction_eval_summary(&raw_eval);
+    if calibrated_eval.total.n > 0 {
+        print_direction_eval_summary(&calibrated_eval);
+    }
+    if shadow_eval.total.n > 0 {
+        print_direction_eval_summary(&shadow_eval);
+    } else {
+        println!(
+            "{}暂无 final_direction_up_shadow。部署方向 v1 后再跑本命令可比较 shadow。{}",
+            C_DIM, C_RESET
+        );
+    }
+
+    if shadow_eval.total.n > 0 {
+        println!();
+        print_direction_bucket_table(&shadow_eval);
+    } else {
+        println!();
+        print_direction_bucket_table(&raw_eval);
+    }
+    Ok(())
+}
+
+fn print_direction_eval_summary(eval: &DirectionEval) {
+    println!(
+        "{}{}{} samples={} avg_prob={:.3} actual_up={:.3} brier={:.5}",
+        C_BOLD,
+        eval.label,
+        C_RESET,
+        eval.total.n,
+        eval.total.avg_prob(),
+        eval.total.hit_rate(),
+        eval.total.brier()
+    );
+}
+
+fn print_direction_bucket_table(eval: &DirectionEval) {
+    println!("{}{} 概率分桶{}", C_BOLD, eval.label, C_RESET);
+    println!(
+        "{}",
+        table_row(&[
+            ("bucket".to_string(), 11, Align::Left),
+            ("samples".to_string(), 8, Align::Right),
+            ("avg_p".to_string(), 8, Align::Right),
+            ("hit".to_string(), 8, Align::Right),
+            ("brier".to_string(), 9, Align::Right),
+        ])
+    );
+    for (idx, bucket) in eval.buckets.iter().enumerate() {
+        if bucket.n == 0 {
+            continue;
+        }
+        let lo = idx as f64 / 20.0;
+        let hi = (idx + 1) as f64 / 20.0;
+        println!(
+            "{}",
+            table_row(&[
+                (format!("{lo:.2}-{hi:.2}"), 11, Align::Left),
+                (bucket.n.to_string(), 8, Align::Right),
+                (format!("{:.3}", bucket.avg_prob()), 8, Align::Right),
+                (format!("{:.3}", bucket.hit_rate()), 8, Align::Right),
+                (format!("{:.5}", bucket.brier()), 9, Align::Right),
+            ])
+        );
+    }
+}
+
 fn print_model_market_summary(label: &str, samples: &[ModelMarketSample]) {
     let (model, market, final_up, model_diff, final_diff, final_abs_diff) =
         model_market_means(samples);
@@ -1862,6 +2060,7 @@ mod tests {
             tau_seconds,
             vol_per_sqrt_sec: 0.0,
             source: String::new(),
+            ..Default::default()
         }
     }
 
