@@ -141,6 +141,22 @@ pub fn run(
                 // The gateway already credited the shared inventory; we enrich the
                 // fill from it for the fills.jsonl log and persist inventory.json.
                 let inv = inventory.lock().unwrap();
+                if inv.market != fill.market {
+                    let inventory_market = inv.market.clone();
+                    write_json(&cfg.inventory_path(), &*inv)?;
+                    drop(inv);
+                    reconcile_gate.store(true, Ordering::Relaxed);
+                    force_reconcile = true;
+                    heartbeat(
+                        &cfg,
+                        "risk-ledger",
+                        format!(
+                            "fill market mismatch {} vs {} -> pausing placement + forcing reconcile",
+                            fill.market, inventory_market
+                        ),
+                    )?;
+                    continue;
+                }
                 let enriched = FillEvent {
                     quote_id: fill.quote_id,
                     ts_ms: now_ms(),

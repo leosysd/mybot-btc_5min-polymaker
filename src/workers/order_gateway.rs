@@ -1415,25 +1415,43 @@ fn emit_user_fill(
     };
     // Authoritative in-process update: credit the fill into the shared inventory
     // immediately under the lock. This never gets lost like the old socket path.
+    let mut credited = false;
+    let mut current_market = String::new();
     {
         let mut inv = inventory.lock().unwrap();
-        // NEVER reset to the fill's market here. A late fill from a PREVIOUS
-        // window must not wipe the current window's inventory (that would reset
-        // the cap and re-open over-accumulation). Adopt a market only if we have
-        // none yet; otherwise credit only fills for the current market. Genuinely
-        // missed fills are recovered by the periodic on-chain reconcile.
-        if inv.market.is_empty() {
+        // A late fill from a previous window must not wipe a live non-flat
+        // inventory. Only adopt the fill's market when we have no exposure.
+        if inv.market.is_empty() || (inv.market != fill.market && inventory_is_flat(&inv)) {
             reset_inventory_for_market(&mut inv, &fill.market);
         }
         if inv.market == fill.market {
             inv.add_fill(&fill.market, &fill.side, fill.price, fill.size);
+            credited = true;
+        } else {
+            current_market = inv.market.clone();
         }
     }
     // Tell the gateway loop to shrink/drop the resting order (it recomputes
     // pending), and the ledger for jsonl + kill switch + inventory.json.
     let _ = gw_tx.send(GatewayEvent::Fill(fill.clone()));
-    let _ = ledger_tx.send(LedgerEvent::Filled(fill));
-    heartbeat(cfg, "order-gateway", "user ws fill")?;
+    if credited {
+        let _ = ledger_tx.send(LedgerEvent::Filled(fill));
+        heartbeat(cfg, "order-gateway", "user ws fill")?;
+    } else {
+        eprintln!(
+            "[FILL_MARKET_MISMATCH] order {order_id} fill_market={} inventory_market={} size={fill_size} price={fill_price} - forcing reconcile",
+            fill.market, current_market
+        );
+        let _ = heartbeat(
+            cfg,
+            "order-gateway",
+            format!(
+                "fill market mismatch {} vs {} -> forcing reconcile",
+                fill.market, current_market
+            ),
+        );
+        let _ = ledger_tx.send(LedgerEvent::UnmatchedFill);
+    }
     Ok(())
 }
 
@@ -1481,6 +1499,16 @@ fn match_and_reduce_order(
         }
     }
     FillMatch::Matched(meta)
+}
+
+fn inventory_is_flat(inv: &Inventory) -> bool {
+    const TOL: f64 = 1e-9;
+    inv.up_shares.abs() <= TOL
+        && inv.down_shares.abs() <= TOL
+        && inv.up_cost.abs() <= TOL
+        && inv.down_cost.abs() <= TOL
+        && inv.pending_up.abs() <= TOL
+        && inv.pending_down.abs() <= TOL
 }
 
 fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -1692,6 +1720,116 @@ mod tests {
             ledger_rx.try_recv().is_err(),
             "unknown maker_orders must not emit unmatched reconcile events"
         );
+    }
+
+    #[test]
+    fn user_fill_market_mismatch_forces_reconcile_not_cross_market_credit() {
+        let cfg = test_cfg();
+        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
+            market: "btc-updown-5m-old".to_string(),
+            down_shares: 40.0,
+            down_cost: 12.0,
+            ..Default::default()
+        }));
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
+        order_map.lock().unwrap().insert(
+            "new-order".to_string(),
+            QuoteMeta {
+                quote_id: "q-new".to_string(),
+                market: "btc-updown-5m-new".to_string(),
+                condition_id: "condition".to_string(),
+                side: "Up".to_string(),
+                price: 0.55,
+                size: 5.0,
+                credited: false,
+                done: false,
+            },
+        );
+        let (gw_tx, gw_rx) = std::sync::mpsc::channel();
+        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
+        let mut seen = HashSet::new();
+        let event = serde_json::json!({
+            "id": "trade-mismatch",
+            "event_type": "trade",
+            "maker_orders": [
+                {"order_id": "new-order", "matched_amount": "5", "price": "0.55"}
+            ]
+        });
+
+        handle_user_trade(
+            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+        )
+        .unwrap();
+
+        {
+            let inv = inventory.lock().unwrap();
+            assert_eq!(inv.market, "btc-updown-5m-old");
+            assert_eq!(inv.up_shares, 0.0);
+            assert_eq!(inv.down_shares, 40.0);
+        }
+        assert!(matches!(
+            gw_rx.try_recv().expect("resting order still shrinks"),
+            GatewayEvent::Fill(fill)
+                if fill.market == "btc-updown-5m-new" && fill.side == "Up"
+        ));
+        assert!(matches!(
+            ledger_rx.try_recv().expect("mismatch must force reconcile"),
+            LedgerEvent::UnmatchedFill
+        ));
+        assert!(
+            ledger_rx.try_recv().is_err(),
+            "mismatch must not be logged as an enriched fill"
+        );
+    }
+
+    #[test]
+    fn user_fill_can_adopt_new_market_when_inventory_is_flat() {
+        let cfg = test_cfg();
+        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
+            market: "btc-updown-5m-old".to_string(),
+            ..Default::default()
+        }));
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
+        order_map.lock().unwrap().insert(
+            "new-order".to_string(),
+            QuoteMeta {
+                quote_id: "q-new".to_string(),
+                market: "btc-updown-5m-new".to_string(),
+                condition_id: "condition".to_string(),
+                side: "Up".to_string(),
+                price: 0.55,
+                size: 5.0,
+                credited: false,
+                done: false,
+            },
+        );
+        let (gw_tx, _gw_rx) = std::sync::mpsc::channel();
+        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
+        let mut seen = HashSet::new();
+        let event = serde_json::json!({
+            "id": "trade-flat-adopt",
+            "event_type": "trade",
+            "maker_orders": [
+                {"order_id": "new-order", "matched_amount": "5", "price": "0.55"}
+            ]
+        });
+
+        handle_user_trade(
+            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+        )
+        .unwrap();
+
+        {
+            let inv = inventory.lock().unwrap();
+            assert_eq!(inv.market, "btc-updown-5m-new");
+            assert_eq!(inv.up_shares, 5.0);
+            assert_eq!(inv.down_shares, 0.0);
+        }
+        assert!(matches!(
+            ledger_rx.try_recv().expect("flat inventory can credit"),
+            LedgerEvent::Filled(fill)
+                if fill.market == "btc-updown-5m-new" && fill.side == "Up"
+        ));
     }
 
     #[test]
