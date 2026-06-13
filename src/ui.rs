@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::Command;
 use std::str::FromStr;
@@ -881,15 +881,22 @@ fn maybe_restart_background(cfg: &Config) -> AppResult<()> {
 }
 
 fn tail_jsonl<T: DeserializeOwned>(path: &Path, n: usize) -> AppResult<Vec<T>> {
-    let Ok(raw) = fs::read_to_string(path) else {
+    let Ok(file) = fs::File::open(path) else {
         return Ok(Vec::new());
     };
+    let reader = BufReader::new(file);
     let mut lines = VecDeque::with_capacity(n);
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
         if lines.len() == n {
             lines.pop_front();
         }
-        lines.push_back(line.to_string());
+        lines.push_back(line);
     }
     let mut out = Vec::new();
     for line in lines {
@@ -900,17 +907,28 @@ fn tail_jsonl<T: DeserializeOwned>(path: &Path, n: usize) -> AppResult<Vec<T>> {
     Ok(out)
 }
 
-fn read_all_jsonl<T: DeserializeOwned>(path: &Path) -> AppResult<Vec<T>> {
-    let Ok(raw) = fs::read_to_string(path) else {
-        return Ok(Vec::new());
+fn for_each_jsonl<T, F>(path: &Path, mut on_row: F) -> AppResult<()>
+where
+    T: DeserializeOwned,
+    F: FnMut(T),
+{
+    let Ok(file) = fs::File::open(path) else {
+        return Ok(());
     };
-    let mut out = Vec::new();
-    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
         if let Ok(row) = serde_json::from_str::<T>(line) {
-            out.push(row);
+            on_row(row);
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -1187,20 +1205,11 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// 交易统计表：按盘口聚合成交，展示双边/单边、情景 PnL、锁定毛利与汇总。
 pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     print_banner("POLYMAKER 交易统计");
-    let fills = read_all_jsonl::<FillEvent>(&cfg.fills_path())?;
-    if fills.is_empty() {
-        println!(
-            "{}暂无成交记录 ({})。先跑模拟或实盘产生 fills.jsonl。{}",
-            C_DIM,
-            cfg.fills_path().display(),
-            C_RESET
-        );
-        return Ok(());
-    }
-
     let mut order: Vec<String> = Vec::new();
     let mut agg: HashMap<String, MarketStat> = HashMap::new();
-    for f in &fills {
+    let mut fill_rows = 0u64;
+    for_each_jsonl::<FillEvent, _>(&cfg.fills_path(), |f| {
+        fill_rows += 1;
         let stat = agg.entry(f.market.clone()).or_insert_with(|| {
             order.push(f.market.clone());
             MarketStat::new()
@@ -1217,6 +1226,15 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
             _ => {}
         }
         stat.fills += 1;
+    })?;
+    if fill_rows == 0 {
+        println!(
+            "{}暂无成交记录 ({})。先跑模拟或实盘产生 fills.jsonl。{}",
+            C_DIM,
+            cfg.fills_path().display(),
+            C_RESET
+        );
+        return Ok(());
     }
 
     let official_trade_stats = fetch_official_trade_stats(cfg, &order);
@@ -1229,18 +1247,18 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         std::collections::HashMap::new();
     let mut close_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let stats_now_ms = now_ms();
-    for fr in read_all_jsonl::<MarketFrame>(&cfg.book_path())? {
+    for_each_jsonl::<MarketFrame, _>(&cfg.book_path(), |fr| {
         if fr.btc_price <= 0.0 || fr.price_to_beat <= 0.0 {
-            continue;
+            return;
         }
         if !is_settlement_frame(&fr, cfg.market_window_secs, stats_now_ms) {
-            continue;
+            return;
         }
         if close_ts.get(&fr.market).map_or(true, |&t| fr.ts_ms >= t) {
             close_ts.insert(fr.market.clone(), fr.ts_ms);
             local_won_up.insert(fr.market.clone(), fr.btc_price > fr.price_to_beat);
         }
-    }
+    })?;
 
     println!(
         "{}",
@@ -1527,11 +1545,12 @@ struct ModelMarketSample {
 
 pub fn print_model_market_stats(cfg: &Config) -> AppResult<()> {
     print_banner("模型/盘口胜率对比");
-    let frames = read_all_jsonl::<MarketFrame>(&cfg.book_path())?;
-    let samples = frames
-        .iter()
-        .filter_map(|fr| model_market_sample(cfg, fr))
-        .collect::<Vec<_>>();
+    let mut samples = Vec::new();
+    for_each_jsonl::<MarketFrame, _>(&cfg.book_path(), |fr| {
+        if let Some(sample) = model_market_sample(cfg, &fr) {
+            samples.push(sample);
+        }
+    })?;
     if samples.is_empty() {
         println!(
             "{}暂无可用行情样本 ({})。先运行 live collector 生成 book.jsonl。{}",
