@@ -2086,6 +2086,15 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "DRY_RUN", "1")?;
     upsert_env_if_missing(path, "ENABLE_REAL_ORDERS", "")?;
     upsert_env_if_missing(path, "BOT_RUN_DIR", "run")?;
+    upsert_env_if_missing(path, "ENV_SWITCH_ENABLED", "0")?;
+    upsert_env_if_missing(
+        path,
+        "ENV_SWITCH_SCHEDULE",
+        "08:00-20:00=.env.day;20:00-08:00=.env.night",
+    )?;
+    upsert_env_if_missing(path, "ENV_SWITCH_CHECK_SECS", "30")?;
+    upsert_env_if_missing(path, "ENV_SWITCH_TZ_OFFSET_MINUTES", "480")?;
+    upsert_env_if_missing(path, "ENV_SWITCH_RESTART_MODE", "stop")?;
     upsert_env_if_missing(path, "MARKET_SLUG", "btc-updown-5m")?;
     upsert_env_if_missing(path, "DATA_MODE", "sim")?;
     upsert_env_if_missing(path, "AUTO_DISCOVER_MARKET", "1")?;

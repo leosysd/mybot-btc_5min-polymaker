@@ -8,6 +8,11 @@ pub const LIVE_MIN_ORDER_SIZE: f64 = 5.0;
 pub struct Config {
     pub base_dir: PathBuf,
     pub run_dir: PathBuf,
+    pub env_switch_enabled: bool,
+    pub env_switch_schedule: String,
+    pub env_switch_check_secs: u64,
+    pub env_switch_tz_offset_minutes: i64,
+    pub env_switch_restart_mode: String,
     pub market_slug: String,
     pub data_mode: String,
     pub auto_discover_market: bool,
@@ -118,6 +123,11 @@ impl Config {
         let cfg = Self {
             base_dir,
             run_dir,
+            env_switch_enabled: get_bool(&file_env, "ENV_SWITCH_ENABLED", false),
+            env_switch_schedule: get(&file_env, "ENV_SWITCH_SCHEDULE", ""),
+            env_switch_check_secs: get_u64(&file_env, "ENV_SWITCH_CHECK_SECS", 30),
+            env_switch_tz_offset_minutes: get_i64(&file_env, "ENV_SWITCH_TZ_OFFSET_MINUTES", 480),
+            env_switch_restart_mode: get(&file_env, "ENV_SWITCH_RESTART_MODE", "stop"),
             market_slug: get(&file_env, "MARKET_SLUG", "btc-updown-5m"),
             data_mode: get(&file_env, "DATA_MODE", "sim"),
             auto_discover_market: get_bool(&file_env, "AUTO_DISCOVER_MARKET", true),
@@ -294,6 +304,18 @@ impl Config {
         }
         if self.live_order_notional_cap < 0.0 || !self.live_order_notional_cap.is_finite() {
             return Err("LIVE_ORDER_NOTIONAL_CAP must be finite and non-negative".into());
+        }
+        if self.env_switch_enabled && self.env_switch_schedule.trim().is_empty() {
+            return Err("ENV_SWITCH_ENABLED=1 requires ENV_SWITCH_SCHEDULE".into());
+        }
+        if self.env_switch_check_secs < 5 {
+            return Err("ENV_SWITCH_CHECK_SECS must be at least 5".into());
+        }
+        if !(-720..=840).contains(&self.env_switch_tz_offset_minutes) {
+            return Err("ENV_SWITCH_TZ_OFFSET_MINUTES must be between -720 and 840".into());
+        }
+        if !matches!(self.env_switch_restart_mode.as_str(), "none" | "stop") {
+            return Err("ENV_SWITCH_RESTART_MODE must be none or stop".into());
         }
         // ── strategy brain v3 sanity ───────────────────────────────────
         if !(self.vol_seed_per_sqrt_sec.is_finite() && self.vol_seed_per_sqrt_sec > 0.0) {
@@ -581,6 +603,12 @@ fn get_f64(file_env: &HashMap<String, String>, key: &str, default: f64) -> f64 {
 }
 
 fn get_u64(file_env: &HashMap<String, String>, key: &str, default: u64) -> u64 {
+    get(file_env, key, &default.to_string())
+        .parse()
+        .unwrap_or(default)
+}
+
+fn get_i64(file_env: &HashMap<String, String>, key: &str, default: i64) -> i64 {
     get(file_env, key, &default.to_string())
         .parse()
         .unwrap_or(default)

@@ -302,6 +302,7 @@ pm2 save
 ```bash
 pm2 status
 pm2 logs polymaker-supervisor
+pm2 logs polymaker-env-switcher
 ```
 
 停止：
@@ -310,6 +311,35 @@ pm2 logs polymaker-supervisor
 pm2 stop ecosystem.config.js
 polymaker stop
 ```
+
+## 按时间自动切换 `.env`
+
+如果你想按北京时间自动切换两套参数，先准备两个完整配置文件，例如：
+
+```bash
+cp .env .env.day
+cp .env .env.night
+```
+
+然后在当前 `.env` 里打开切换器：
+
+```text
+ENV_SWITCH_ENABLED=1
+ENV_SWITCH_SCHEDULE=08:00-20:00=.env.day;20:00-08:00=.env.night
+ENV_SWITCH_CHECK_SECS=30
+ENV_SWITCH_TZ_OFFSET_MINUTES=480
+ENV_SWITCH_RESTART_MODE=stop
+```
+
+`ENV_SWITCH_SCHEDULE` 的格式是 `HH:MM-HH:MM=文件名`，多段用 `;` 分隔，支持跨午夜。切换器会把命中的文件复制成正式 `.env`，然后写入 STOP 文件；PM2 会重启 `polymaker-supervisor`，新进程读取新的 `.env`。
+
+手动测试当前时间会切到哪一套：
+
+```bash
+polymaker env-switcher --once
+```
+
+建议两套文件都保留相同的账号、私钥、`BOT_RUN_DIR`、`ENV_SWITCH_*` 字段，只改做市参数，例如 `QUOTE_SIZE`、`LIVE_ORDER_NOTIONAL_CAP`、`MAX_UNPAIRED_SHARES`、`MAX_TOTAL_INVENTORY`、`MIN_BID`、`MAX_BID`、`VALUE_MIN_EDGE`。
 
 ## 配置说明
 

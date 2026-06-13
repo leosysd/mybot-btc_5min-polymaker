@@ -32,5 +32,8 @@ const app = (name, args) => ({
 });
 
 module.exports = {
-  apps: [app("polymaker-supervisor", "supervisor")],
+  apps: [
+    app("polymaker-supervisor", "supervisor"),
+    app("polymaker-env-switcher", "env-switcher"),
+  ],
 };

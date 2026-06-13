@@ -1,5 +1,6 @@
 mod config;
 mod direction;
+mod env_switcher;
 mod hedge;
 mod ipc;
 mod pricing;
@@ -42,6 +43,10 @@ fn main() -> AppResult<()> {
         "stats" | "stat" => ui::print_trade_stats(&cfg),
         "model-market" | "market-edge" | "edge" => ui::print_model_market_stats(&cfg),
         "direction-stats" | "direction" => ui::print_direction_stats(&cfg),
+        "env-switcher" | "switch-env" => {
+            let once = parse_once(args.collect())?;
+            env_switcher::run(cfg, once)
+        }
         "dashboard" | "trade" => {
             let seconds = parse_seconds(args.collect())?;
             ui::run_dashboard(&cfg, seconds)
@@ -59,6 +64,17 @@ fn main() -> AppResult<()> {
             std::process::exit(2);
         }
     }
+}
+
+fn parse_once(args: Vec<String>) -> AppResult<bool> {
+    let mut once = false;
+    for arg in args {
+        match arg.as_str() {
+            "--once" => once = true,
+            other => return Err(format!("未知 env-switcher 参数: {other}").into()),
+        }
+    }
+    Ok(once)
 }
 
 fn install_tls_crypto_provider() {
@@ -100,6 +116,7 @@ fn print_usage() {
   polymaker stop                      通知所有进程停止\n\
   polymaker cancel-all                撤销账户全部 Polymarket open orders\n\
   polymaker restart                   重启后台服务\n\
+  polymaker env-switcher [--once]     按时间自动切换 .env 文件并触发重启\n\
   polymaker init                      初始化 .env 配置\n\
   polymaker clean                     删除 run 运行目录\n"
     );
