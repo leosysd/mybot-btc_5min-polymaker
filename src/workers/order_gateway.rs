@@ -268,20 +268,31 @@ pub fn run(
                         // Counts OUTSTANDING orders, so churn/lag cannot exceed the cap.
                         let side_cap_room = cfg.max_side_inventory() - held - pending;
                         let room = side_cap_room.floor();
-                        // Skip unless there's room for a FULL quote. Posting the
-                        // leftover (e.g. 2 shares when room=2) is below the exchange
-                        // minimum order size and gets rejected ("Size lower than
-                        // minimum: 5"), spamming the log and risking rate limits.
-                        if room < quote.size {
+                        // If only partial cap room remains, place the leftover
+                        // as long as it satisfies the exchange minimum size.
+                        let min_order_size = cfg.min_order_size();
+                        if room + 1e-9 < min_order_size {
                             heartbeat(
                             &cfg,
                             "order-gateway",
                             format!(
-                                "side cap reached {} held={:.0} pending={:.0} room={:.0} (need {:.0})",
-                                quote.side, held, pending, room, quote.size
+                                "side cap reached {} held={:.0} pending={:.0} room={:.0} (min {:.0})",
+                                quote.side, held, pending, room, min_order_size
                             ),
                         )?;
                             continue;
+                        }
+                        if room + 1e-9 < quote.size {
+                            let old_size = quote.size;
+                            quote.size = room.floor().max(min_order_size);
+                            heartbeat(
+                                &cfg,
+                                "order-gateway",
+                                format!(
+                                    "side cap shrinks {} size {:.0}->{:.0} room={:.0}",
+                                    quote.side, old_size, quote.size, room
+                                ),
+                            )?;
                         }
 
                         let incremental_size = if resting.contains_key(&quote.side) {
@@ -581,7 +592,7 @@ fn accept_resting_order(
 ) -> AppResult<bool> {
     if cfg.live_order_notional_cap > 0.0 && quote.price > 0.0 {
         let capped_size = (cfg.live_order_notional_cap / quote.price).floor();
-        if capped_size < 1.0 {
+        if capped_size + 1e-9 < cfg.min_order_size() {
             heartbeat(cfg, "order-gateway", "skipped live notional cap")?;
             return Ok(false);
         }

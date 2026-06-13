@@ -442,17 +442,18 @@ fn send_quote(
     reason: &str,
     fair_snapshot: FairSnapshot,
 ) -> AppResult<()> {
-    let size = cfg.quote_size.round().max(1.0);
-    if !unpaired_limit_allows(cfg, inventory, side, size) {
-        return Ok(());
-    }
+    let desired_size = cfg.quote_size.round().max(1.0);
     let side_inventory = if side == "Up" {
         inventory.effective_up()
     } else {
         inventory.effective_down()
     };
     let left = (cfg.max_side_inventory() - side_inventory).floor();
-    if left + 1e-9 < cfg.quote_size {
+    if left + 1e-9 < cfg.min_order_size() {
+        return Ok(());
+    }
+    let size = desired_size.min(left).floor().max(cfg.min_order_size());
+    if !unpaired_limit_allows(cfg, inventory, side, size) {
         return Ok(());
     }
     let quote = QuoteIntent {
@@ -545,6 +546,88 @@ mod tests {
             vol_per_sqrt_sec: 1.5,
             source: "test".to_string(),
         }
+    }
+
+    fn flat_fair_snapshot() -> FairSnapshot {
+        let side = SideFair {
+            shadow: 0.50,
+            quote: 0.50,
+            anchor_weight: 0.0,
+            anchor_active: false,
+        };
+        FairSnapshot {
+            model_up: 0.50,
+            market_up: 0.50,
+            up: side,
+            down: side,
+        }
+    }
+
+    #[test]
+    fn send_quote_uses_remaining_live_room_when_above_exchange_minimum() {
+        let mut cfg = flat_quote_test_cfg();
+        cfg.dry_run = false;
+        cfg.enable_real_orders = "I_UNDERSTAND_REAL_MONEY".to_string();
+        cfg.quote_size = 20.0;
+        cfg.inventory_mult = 4.0;
+        cfg.max_unpaired_shares = 0.0;
+
+        let frame = flat_frame(100.0);
+        let inventory = Inventory {
+            market: frame.market.clone(),
+            up_shares: 66.0,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        send_quote(
+            &cfg,
+            &tx,
+            &frame,
+            "Up",
+            0.40,
+            0.50,
+            &inventory,
+            "test",
+            flat_fair_snapshot(),
+        )
+        .expect("quote");
+
+        let quote = rx.try_recv().expect("remaining-room quote");
+        assert_eq!(quote.size, 14.0);
+    }
+
+    #[test]
+    fn send_quote_skips_remaining_live_room_below_exchange_minimum() {
+        let mut cfg = flat_quote_test_cfg();
+        cfg.dry_run = false;
+        cfg.enable_real_orders = "I_UNDERSTAND_REAL_MONEY".to_string();
+        cfg.quote_size = 20.0;
+        cfg.inventory_mult = 4.0;
+        cfg.max_unpaired_shares = 0.0;
+
+        let frame = flat_frame(100.0);
+        let inventory = Inventory {
+            market: frame.market.clone(),
+            up_shares: 76.0,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        send_quote(
+            &cfg,
+            &tx,
+            &frame,
+            "Up",
+            0.40,
+            0.50,
+            &inventory,
+            "test",
+            flat_fair_snapshot(),
+        )
+        .expect("quote");
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

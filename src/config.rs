@@ -2,6 +2,8 @@ use crate::AppResult;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+pub const LIVE_MIN_ORDER_SIZE: f64 = 5.0;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub base_dir: PathBuf,
@@ -351,6 +353,14 @@ impl Config {
 
     pub fn real_orders_enabled(&self) -> bool {
         !self.dry_run && self.enable_real_orders == "I_UNDERSTAND_REAL_MONEY"
+    }
+
+    pub fn min_order_size(&self) -> f64 {
+        if self.real_orders_enabled() {
+            LIVE_MIN_ORDER_SIZE
+        } else {
+            1.0
+        }
     }
 
     pub fn ensure_real_order_config(&self) -> AppResult<()> {
