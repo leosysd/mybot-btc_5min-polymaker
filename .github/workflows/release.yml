@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Use stable Rust
         run: |
@@ -35,7 +35,7 @@ jobs:
           sha256sum dist/polymaker-linux-x86_64.tar.gz > dist/polymaker-linux-x86_64.tar.gz.sha256
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: polymaker-linux-x86_64
           path: |
