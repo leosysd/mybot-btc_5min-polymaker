@@ -333,6 +333,8 @@ ENV_SWITCH_RESTART_MODE=stop
 
 `ENV_SWITCH_SCHEDULE` 的格式是 `HH:MM-HH:MM=文件名`，多段用 `;` 分隔，支持跨午夜。切换器会把命中的文件复制成正式 `.env`，然后写入 STOP 文件；PM2 会重启 `polymaker-supervisor`，新进程读取新的 `.env`。
 
+一键安装/更新会读取当前 `.env` 里的 `ENV_SWITCH_SCHEDULE`，并自动补齐其中已经存在的配置文件的缺失字段和注释，例如 `.env.active`、`.env.quiet`。
+
 手动测试当前时间会切到哪一套：
 
 ```bash

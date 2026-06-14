@@ -41,6 +41,7 @@ need_cmd() {
 need_root
 need_cmd curl
 need_cmd tar
+need_cmd sed
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -221,7 +222,63 @@ ensure_env_defaults() {
   fi
 }
 
+trim_spaces() {
+  printf "%s" "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+ensure_scheduled_env_defaults() {
+  local active_env="$INSTALL_DIR/.env"
+  if [ ! -f "$active_env" ]; then
+    return
+  fi
+
+  local schedule_line
+  schedule_line="$(grep -E "^[[:space:]]*ENV_SWITCH_SCHEDULE=" "$active_env" | tail -n 1 || true)"
+  if [ -z "$schedule_line" ]; then
+    return
+  fi
+
+  local schedule
+  schedule="${schedule_line#*=}"
+  schedule="${schedule%%#*}"
+  if [ -z "$(trim_spaces "$schedule")" ]; then
+    return
+  fi
+
+  local old_ifs="$IFS"
+  IFS=';,'
+  set -- $schedule
+  IFS="$old_ifs"
+
+  local original_env_file="$ENV_FILE"
+  local original_backup_done="$ENV_BACKUP_DONE"
+  local original_backup_path="$ENV_BACKUP_PATH"
+  local part target
+  for part in "$@"; do
+    case "$part" in
+      *=*) target="$(trim_spaces "${part#*=}")" ;;
+      *) continue ;;
+    esac
+    [ -n "$target" ] || continue
+    case "$target" in
+      /*) ENV_FILE="$target" ;;
+      *) ENV_FILE="$INSTALL_DIR/$target" ;;
+    esac
+    [ "$ENV_FILE" != "$active_env" ] || continue
+    if [ -f "$ENV_FILE" ]; then
+      ENV_BACKUP_DONE=0
+      ENV_BACKUP_PATH=""
+      ensure_env_defaults
+    fi
+  done
+
+  ENV_FILE="$original_env_file"
+  ENV_BACKUP_DONE="$original_backup_done"
+  ENV_BACKUP_PATH="$original_backup_path"
+}
+
 ensure_env_defaults
+ensure_scheduled_env_defaults
 
 cat <<EOF
 
