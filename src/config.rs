@@ -1,6 +1,7 @@
 use crate::AppResult;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const LIVE_MIN_ORDER_SIZE: f64 = 5.0;
 
@@ -8,6 +9,9 @@ pub const LIVE_MIN_ORDER_SIZE: f64 = 5.0;
 pub struct Config {
     pub base_dir: PathBuf,
     pub run_dir: PathBuf,
+    pub log_dir: PathBuf,
+    pub log_rotate_max_mb: u64,
+    pub log_rotate_keep: u64,
     pub env_switch_enabled: bool,
     pub env_switch_schedule: String,
     pub env_switch_check_secs: u64,
@@ -122,10 +126,19 @@ impl Config {
         } else {
             base_dir.join(run_dir_raw)
         };
+        let log_dir_raw = PathBuf::from(get(&file_env, "BOT_LOG_DIR", "log"));
+        let log_dir = if log_dir_raw.is_absolute() {
+            log_dir_raw
+        } else {
+            base_dir.join(log_dir_raw)
+        };
         let market_anchor_weight = get_f64(&file_env, "MARKET_ANCHOR_WEIGHT", 0.30);
         let cfg = Self {
             base_dir,
             run_dir,
+            log_dir,
+            log_rotate_max_mb: get_u64(&file_env, "LOG_ROTATE_MAX_MB", 256),
+            log_rotate_keep: get_u64(&file_env, "LOG_ROTATE_KEEP", 50),
             env_switch_enabled: get_bool(&file_env, "ENV_SWITCH_ENABLED", false),
             env_switch_schedule: get(&file_env, "ENV_SWITCH_SCHEDULE", ""),
             env_switch_check_secs: get_u64(&file_env, "ENV_SWITCH_CHECK_SECS", 30),
@@ -310,6 +323,9 @@ impl Config {
         }
         if self.live_order_notional_cap < 0.0 || !self.live_order_notional_cap.is_finite() {
             return Err("LIVE_ORDER_NOTIONAL_CAP must be finite and non-negative".into());
+        }
+        if self.log_rotate_keep > 100 {
+            return Err("LOG_ROTATE_KEEP must be <= 100".into());
         }
         if self.env_switch_enabled && self.env_switch_schedule.trim().is_empty() {
             return Err("ENV_SWITCH_ENABLED=1 requires ENV_SWITCH_SCHEDULE".into());
@@ -497,6 +513,7 @@ impl Config {
 
     pub fn ensure_dirs(&self) -> AppResult<()> {
         std::fs::create_dir_all(&self.run_dir)?;
+        std::fs::create_dir_all(&self.log_dir)?;
         std::fs::create_dir_all(self.heartbeat_dir())?;
         std::fs::create_dir_all(self.socket_dir())?;
         Ok(())
@@ -527,15 +544,62 @@ impl Config {
     }
 
     pub fn book_path(&self) -> PathBuf {
-        self.run_dir.join("book.jsonl")
+        self.dated_log_dir().join("book.jsonl")
     }
 
     pub fn quotes_path(&self) -> PathBuf {
-        self.run_dir.join("quotes.jsonl")
+        self.dated_log_dir().join("quotes.jsonl")
     }
 
     pub fn fills_path(&self) -> PathBuf {
+        self.dated_log_dir().join("fills.jsonl")
+    }
+
+    pub fn legacy_book_path(&self) -> PathBuf {
+        self.run_dir.join("book.jsonl")
+    }
+
+    pub fn legacy_quotes_path(&self) -> PathBuf {
+        self.run_dir.join("quotes.jsonl")
+    }
+
+    pub fn legacy_fills_path(&self) -> PathBuf {
         self.run_dir.join("fills.jsonl")
+    }
+
+    pub fn book_read_paths(&self) -> Vec<PathBuf> {
+        self.jsonl_read_paths(self.legacy_book_path(), self.book_path())
+    }
+
+    pub fn quotes_read_paths(&self) -> Vec<PathBuf> {
+        self.jsonl_read_paths(self.legacy_quotes_path(), self.quotes_path())
+    }
+
+    pub fn fills_read_paths(&self) -> Vec<PathBuf> {
+        self.jsonl_read_paths(self.legacy_fills_path(), self.fills_path())
+    }
+
+    fn jsonl_read_paths(&self, legacy: PathBuf, current: PathBuf) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        append_jsonl_read_paths(&mut paths, &legacy, self.log_rotate_keep);
+
+        if let Some(name) = current.file_name() {
+            let root_log_path = self.log_dir.join(name);
+            append_jsonl_read_paths(&mut paths, &root_log_path, self.log_rotate_keep);
+
+            for dated_dir in dated_log_dirs(&self.log_dir) {
+                append_jsonl_read_paths(&mut paths, &dated_dir.join(name), self.log_rotate_keep);
+            }
+        }
+        if !paths.contains(&current) {
+            append_jsonl_read_paths(&mut paths, &current, self.log_rotate_keep);
+        }
+        paths
+    }
+
+    fn dated_log_dir(&self) -> PathBuf {
+        self.log_dir
+            .join(current_date_dir(self.env_switch_tz_offset_minutes))
     }
 
     pub fn inventory_path(&self) -> PathBuf {
@@ -603,6 +667,77 @@ fn load_dotenv_like(path: &std::path::Path) -> AppResult<HashMap<String, String>
     Ok(values)
 }
 
+fn append_jsonl_read_paths(paths: &mut Vec<PathBuf>, path: &Path, keep: u64) {
+    for idx in (1..=keep).rev() {
+        let rotated = PathBuf::from(format!("{}.{}", path.display(), idx));
+        if rotated.exists() && !paths.contains(&rotated) {
+            paths.push(rotated);
+        }
+    }
+    if path.exists() && !paths.iter().any(|p| p == path) {
+        paths.push(path.to_path_buf());
+    }
+}
+
+fn dated_log_dirs(log_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return Vec::new();
+    };
+    let mut dirs = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(is_date_dir_name)
+        })
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs
+}
+
+fn is_date_dir_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(idx, b)| idx == 4 || idx == 7 || b.is_ascii_digit())
+}
+
+fn current_date_dir(tz_offset_minutes: i64) -> String {
+    let unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    date_dir_from_unix(unix, tz_offset_minutes)
+}
+
+fn date_dir_from_unix(unix_seconds: i64, tz_offset_minutes: i64) -> String {
+    let shifted = unix_seconds.saturating_add(tz_offset_minutes.saturating_mul(60));
+    let days = shifted.div_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+// Howard Hinnant's civil_from_days algorithm. Input is days since 1970-01-01.
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096).div_euclid(365);
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2).div_euclid(153);
+    let d = doy - (153 * mp + 2).div_euclid(5) + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if m <= 2 { 1 } else { 0 };
+    (year as i32, m as u32, d as u32)
+}
+
 fn get(file_env: &HashMap<String, String>, key: &str, default: &str) -> String {
     std::env::var(key)
         .ok()
@@ -636,5 +771,25 @@ fn get_bool(file_env: &HashMap<String, String>, key: &str, default: bool) -> boo
         "1" | "true" | "yes" | "on" => true,
         "0" | "false" | "no" | "off" => false,
         _ => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_dir_uses_configured_timezone_offset() {
+        assert_eq!(date_dir_from_unix(0, 0), "1970-01-01");
+        assert_eq!(date_dir_from_unix(0, 480), "1970-01-01");
+        assert_eq!(date_dir_from_unix(57_599, 480), "1970-01-01");
+        assert_eq!(date_dir_from_unix(57_600, 480), "1970-01-02");
+    }
+
+    #[test]
+    fn date_dir_name_requires_yyyy_mm_dd() {
+        assert!(is_date_dir_name("2026-06-14"));
+        assert!(!is_date_dir_name("20260614"));
+        assert!(!is_date_dir_name("2026-6-14"));
     }
 }

@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -298,7 +298,7 @@ fn print_status_cards(cfg: &Config) -> AppResult<()> {
 }
 
 fn print_latest_market(cfg: &Config) -> AppResult<()> {
-    let rows = tail_jsonl::<MarketFrame>(&cfg.book_path(), 5)?;
+    let rows = tail_jsonl_paths::<MarketFrame>(&cfg.book_read_paths(), 5)?;
     println!("{}最近行情{}", C_BOLD, C_RESET);
     println!(
         "{}",
@@ -331,7 +331,7 @@ fn print_latest_market(cfg: &Config) -> AppResult<()> {
 }
 
 fn print_latest_quotes(cfg: &Config) -> AppResult<()> {
-    let rows = tail_jsonl::<QuoteIntent>(&cfg.quotes_path(), 8)?;
+    let rows = tail_jsonl_paths::<QuoteIntent>(&cfg.quotes_read_paths(), 8)?;
     println!("{}最近报价{}", C_BOLD, C_RESET);
     println!(
         "{}",
@@ -364,7 +364,7 @@ fn print_latest_quotes(cfg: &Config) -> AppResult<()> {
 }
 
 fn print_latest_fills(cfg: &Config) -> AppResult<()> {
-    let rows = tail_jsonl::<FillEvent>(&cfg.fills_path(), 8)?;
+    let rows = tail_jsonl_paths::<FillEvent>(&cfg.fills_read_paths(), 8)?;
     println!("{}最近成交{}", C_BOLD, C_RESET);
     println!(
         "{}",
@@ -886,23 +886,25 @@ fn maybe_restart_background(cfg: &Config) -> AppResult<()> {
     Ok(())
 }
 
-fn tail_jsonl<T: DeserializeOwned>(path: &Path, n: usize) -> AppResult<Vec<T>> {
-    let Ok(file) = fs::File::open(path) else {
-        return Ok(Vec::new());
-    };
-    let reader = BufReader::new(file);
+fn tail_jsonl_paths<T: DeserializeOwned>(paths: &[PathBuf], n: usize) -> AppResult<Vec<T>> {
     let mut lines = VecDeque::with_capacity(n);
-    for line in reader.lines() {
-        let Ok(line) = line else {
+    for path in paths {
+        let Ok(file) = fs::File::open(path) else {
             continue;
         };
-        if line.trim().is_empty() {
-            continue;
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let Ok(line) = line else {
+                continue;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            if lines.len() == n {
+                lines.pop_front();
+            }
+            lines.push_back(line);
         }
-        if lines.len() == n {
-            lines.pop_front();
-        }
-        lines.push_back(line);
     }
     let mut out = Vec::new();
     for line in lines {
@@ -933,6 +935,17 @@ where
         if let Ok(row) = serde_json::from_str::<T>(line) {
             on_row(row);
         }
+    }
+    Ok(())
+}
+
+fn for_each_jsonl_paths<T, F>(paths: &[PathBuf], mut on_row: F) -> AppResult<()>
+where
+    T: DeserializeOwned,
+    F: FnMut(T),
+{
+    for path in paths {
+        for_each_jsonl::<T, _>(path, |row| on_row(row))?;
     }
     Ok(())
 }
@@ -1214,7 +1227,7 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
     let mut order: Vec<String> = Vec::new();
     let mut agg: HashMap<String, MarketStat> = HashMap::new();
     let mut fill_rows = 0u64;
-    for_each_jsonl::<FillEvent, _>(&cfg.fills_path(), |f| {
+    for_each_jsonl_paths::<FillEvent, _>(&cfg.fills_read_paths(), |f| {
         fill_rows += 1;
         let stat = agg.entry(f.market.clone()).or_insert_with(|| {
             order.push(f.market.clone());
@@ -1253,7 +1266,7 @@ pub fn print_trade_stats(cfg: &Config) -> AppResult<()> {
         std::collections::HashMap::new();
     let mut close_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let stats_now_ms = now_ms();
-    for_each_jsonl::<MarketFrame, _>(&cfg.book_path(), |fr| {
+    for_each_jsonl_paths::<MarketFrame, _>(&cfg.book_read_paths(), |fr| {
         if fr.btc_price <= 0.0 || fr.price_to_beat <= 0.0 {
             return;
         }
@@ -1552,7 +1565,7 @@ struct ModelMarketSample {
 pub fn print_model_market_stats(cfg: &Config) -> AppResult<()> {
     print_banner("模型/盘口胜率对比");
     let mut samples = Vec::new();
-    for_each_jsonl::<MarketFrame, _>(&cfg.book_path(), |fr| {
+    for_each_jsonl_paths::<MarketFrame, _>(&cfg.book_read_paths(), |fr| {
         if let Some(sample) = model_market_sample(cfg, &fr) {
             samples.push(sample);
         }
@@ -1760,7 +1773,7 @@ pub fn print_direction_stats(cfg: &Config) -> AppResult<()> {
     print_banner("方向信号校准统计");
     let mut last_by_market: HashMap<String, MarketFrame> = HashMap::new();
     let now = now_ms();
-    for_each_jsonl::<MarketFrame, _>(&cfg.book_path(), |fr| {
+    for_each_jsonl_paths::<MarketFrame, _>(&cfg.book_read_paths(), |fr| {
         if fr.btc_price > 0.0
             && fr.price_to_beat > 0.0
             && is_settlement_frame(&fr, cfg.market_window_secs, now)
@@ -1798,7 +1811,7 @@ pub fn print_direction_stats(cfg: &Config) -> AppResult<()> {
     let mut shadow_rows = 0u64;
     let mut raw_rows = 0u64;
 
-    for_each_jsonl::<MarketFrame, _>(&cfg.book_path(), |fr| {
+    for_each_jsonl_paths::<MarketFrame, _>(&cfg.book_read_paths(), |fr| {
         let Some(up_won) = outcomes.get(&fr.market).copied() else {
             return;
         };
@@ -2092,6 +2105,24 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "DRY_RUN", "1")?;
     upsert_env_if_missing(path, "ENABLE_REAL_ORDERS", "")?;
     upsert_env_if_missing(path, "BOT_RUN_DIR", "run")?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "BOT_LOG_DIR",
+        "log",
+        "行情/报价/成交日志目录；相对路径基于安装目录，会按日期分目录。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "LOG_ROTATE_MAX_MB",
+        "256",
+        "book/quotes/fills 单个 jsonl 超过多少 MB 自动轮转；0=关闭。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "LOG_ROTATE_KEEP",
+        "50",
+        "每个 jsonl 每天最多保留多少个旧轮转文件。",
+    )?;
     upsert_env_if_missing(path, "ENV_SWITCH_ENABLED", "0")?;
     upsert_env_if_missing(
         path,
