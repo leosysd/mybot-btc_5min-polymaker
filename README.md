@@ -150,7 +150,7 @@ polymaker dashboard --seconds 10
 polymaker model-market
 ```
 
-`model-market` 会读取 `run/book.jsonl`，用 bot 的 BTC 模型概率对比 Polymarket 盘口隐含概率。新日志会用 best bid/ask mid；旧日志没有 bid 字段时，会明确标记为 ask 推算近似。
+`model-market` 会读取 `log/YYYY-MM-DD/book.jsonl`，并兼容旧的 `run/book.jsonl`，用 bot 的 BTC 模型概率对比 Polymarket 盘口隐含概率。新日志会用 best bid/ask mid；旧日志没有 bid 字段时，会明确标记为 ask 推算近似。
 
 ## 快速试跑
 
@@ -170,9 +170,10 @@ polymaker supervisor --seconds 15
 
 ```bash
 ls run
-tail -n 5 run/book.jsonl
-tail -n 5 run/quotes.jsonl
-tail -n 5 run/fills.jsonl
+ls log
+tail -n 5 log/$(date +%F)/book.jsonl
+tail -n 5 log/$(date +%F)/quotes.jsonl
+tail -n 5 log/$(date +%F)/fills.jsonl
 cat run/inventory.json
 ```
 
@@ -183,7 +184,7 @@ cat run/inventory.json
 - `fills.jsonl`：order-gateway 模拟成交
 - `inventory.json`：risk-ledger 当前库存
 
-`book.jsonl`、`quotes.jsonl`、`fills.jsonl` 会按 `LOG_ROTATE_MAX_MB` 自动轮转，旧文件命名为 `book.jsonl.1`、`book.jsonl.2` 等，每个日志最多保留 `LOG_ROTATE_KEEP` 份旧文件。`LOG_ROTATE_MAX_MB=0` 表示关闭程序内轮转。
+`book.jsonl`、`quotes.jsonl`、`fills.jsonl` 写入 `BOT_LOG_DIR/YYYY-MM-DD/`，日期按 `ENV_SWITCH_TZ_OFFSET_MINUTES` 计算。单日文件会按 `LOG_ROTATE_MAX_MB` 自动轮转，旧文件命名为 `book.jsonl.1`、`book.jsonl.2` 等，每天每个日志最多保留 `LOG_ROTATE_KEEP` 份旧文件。`LOG_ROTATE_MAX_MB=0` 表示关闭程序内轮转。
 
 ## DRY_RUN 模拟怎么跑
 
@@ -343,7 +344,7 @@ ENV_SWITCH_RESTART_MODE=stop
 polymaker env-switcher --once
 ```
 
-建议两套文件都保留相同的账号、私钥、`BOT_RUN_DIR`、`LOG_ROTATE_*`、`ENV_SWITCH_*` 字段，只改做市参数，例如 `QUOTE_SIZE`、`LIVE_ORDER_NOTIONAL_CAP`、`MAX_UNPAIRED_SHARES`、`MAX_TOTAL_INVENTORY`、`MIN_BID`、`MAX_BID`、`VALUE_MIN_EDGE`。
+建议两套文件都保留相同的账号、私钥、`BOT_RUN_DIR`、`BOT_LOG_DIR`、`LOG_ROTATE_*`、`ENV_SWITCH_*` 字段，只改做市参数，例如 `QUOTE_SIZE`、`LIVE_ORDER_NOTIONAL_CAP`、`MAX_UNPAIRED_SHARES`、`MAX_TOTAL_INVENTORY`、`MIN_BID`、`MAX_BID`、`VALUE_MIN_EDGE`。
 
 ## 配置说明
 

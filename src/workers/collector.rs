@@ -138,7 +138,6 @@ fn run_live_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResu
     let state = Arc::new(Mutex::new(LiveMarketState::new(cfg)));
     let sink = LiveFrameSink {
         tx: tx.clone(),
-        book_path: cfg.book_path().to_path_buf(),
         logger: spawn_jsonl_writer(
             cfg.log_rotate_max_mb.saturating_mul(1024 * 1024),
             cfg.log_rotate_keep,
@@ -204,7 +203,6 @@ fn run_live_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResu
 #[derive(Clone)]
 struct LiveFrameSink {
     tx: MarketTx,
-    book_path: std::path::PathBuf,
     logger: AsyncJsonlWriter,
 }
 
@@ -226,7 +224,7 @@ fn push_live_frame(
         // Quote engine gone; nothing more to do.
         return Ok(false);
     }
-    log_jsonl(&sink.logger, &sink.book_path, &frame)?;
+    log_jsonl(&sink.logger, &cfg.book_path(), &frame)?;
     heartbeat(cfg, "collector", status)?;
     Ok(true)
 }
