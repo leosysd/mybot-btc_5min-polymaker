@@ -194,10 +194,14 @@ ensure_env_defaults() {
     append_env_line REJECT_BACKOFF_MS "# 同一边被拒后冷却毫秒数，避免空转刷 400 被限流。0=关。" "REJECT_BACKOFF_MS=500"
   fi
 
-  if section_has_missing ENABLE_MARKET_ANCHOR MARKET_ANCHOR_SHADOW MARKET_ANCHOR_WEIGHT \
+  if section_has_missing ENABLE_DIRECTION_EDGE DIRECTION_ALIGNED_EDGE DIRECTION_COUNTER_EDGE \
+    ENABLE_MARKET_ANCHOR MARKET_ANCHOR_SHADOW MARKET_ANCHOR_WEIGHT \
     MARKET_ANCHOR_WEIGHT_HIGH MARKET_ANCHOR_WEIGHT_LOW MARKET_ANCHOR_LOW_SIDE_BELOW \
     MARKET_ANCHOR_MAX_SPREAD; then
     append_section_header "# ── 盘口锚定胜率（install.sh 自动补齐）──────────────────────"
+    append_env_line ENABLE_DIRECTION_EDGE "# 1=按方向强弱调整 edge；不禁止任何一边，只改变成交难度。" "ENABLE_DIRECTION_EDGE=0"
+    append_env_line DIRECTION_ALIGNED_EDGE "# 顺方向最低安全垫；小于 VALUE_MIN_EDGE 时顺方向更容易成交。" "DIRECTION_ALIGNED_EDGE=0.012"
+    append_env_line DIRECTION_COUNTER_EDGE "# 反方向最低安全垫；大于 VALUE_MIN_EDGE 时反方向必须更便宜。" "DIRECTION_COUNTER_EDGE=0.04"
     append_env_line ENABLE_MARKET_ANCHOR "# 1=真实报价使用盘口胜率修正模型。" "ENABLE_MARKET_ANCHOR=0"
     append_env_line MARKET_ANCHOR_SHADOW "# 1=记录影子融合胜率，不改变报价。" "MARKET_ANCHOR_SHADOW=1"
     append_env_line MARKET_ANCHOR_WEIGHT "# 兼容默认权重；HIGH/LOW 未设置时使用。" "MARKET_ANCHOR_WEIGHT=0.30"
