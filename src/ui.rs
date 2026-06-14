@@ -2092,6 +2092,18 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     upsert_env_if_missing(path, "DRY_RUN", "1")?;
     upsert_env_if_missing(path, "ENABLE_REAL_ORDERS", "")?;
     upsert_env_if_missing(path, "BOT_RUN_DIR", "run")?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "LOG_ROTATE_MAX_MB",
+        "256",
+        "book/quotes/fills 单个 jsonl 超过多少 MB 自动轮转；0=关闭。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "LOG_ROTATE_KEEP",
+        "6",
+        "每个 jsonl 最多保留多少个旧轮转文件。",
+    )?;
     upsert_env_if_missing(path, "ENV_SWITCH_ENABLED", "0")?;
     upsert_env_if_missing(
         path,

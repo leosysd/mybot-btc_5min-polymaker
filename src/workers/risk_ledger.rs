@@ -34,7 +34,10 @@ pub fn run(
         let inv = inventory.lock().unwrap();
         write_json(&cfg.inventory_path(), &*inv)?;
     }
-    let logger = spawn_jsonl_writer();
+    let logger = spawn_jsonl_writer(
+        cfg.log_rotate_max_mb.saturating_mul(1024 * 1024),
+        cfg.log_rotate_keep,
+    );
 
     // Position reconciliation: periodically read the wallet's true on-chain share
     // holdings and correct the shared inventory if a fill was ever missed over

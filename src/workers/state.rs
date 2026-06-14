@@ -262,13 +262,15 @@ struct JsonlJob {
     line: String,
 }
 
-pub fn spawn_jsonl_writer() -> AsyncJsonlWriter {
+pub fn spawn_jsonl_writer(max_bytes: u64, keep: u64) -> AsyncJsonlWriter {
     let (tx, rx) = mpsc::channel::<JsonlJob>();
     thread::spawn(move || {
         while let Ok(job) = rx.recv() {
             if let Some(parent) = job.path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
+            let line_bytes = job.line.len() as u64 + 1;
+            rotate_jsonl_if_needed(&job.path, max_bytes, keep, line_bytes);
             if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&job.path) {
                 let _ = file.write_all(job.line.as_bytes());
                 let _ = file.write_all(b"\n");
@@ -276,6 +278,32 @@ pub fn spawn_jsonl_writer() -> AsyncJsonlWriter {
         }
     });
     AsyncJsonlWriter { tx }
+}
+
+fn rotate_jsonl_if_needed(path: &Path, max_bytes: u64, keep: u64, incoming_bytes: u64) {
+    if max_bytes == 0 || keep == 0 {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len().saturating_add(incoming_bytes) <= max_bytes {
+        return;
+    }
+
+    let _ = std::fs::remove_file(rotated_path(path, keep));
+    for idx in (1..keep).rev() {
+        let from = rotated_path(path, idx);
+        let to = rotated_path(path, idx + 1);
+        if from.exists() {
+            let _ = std::fs::rename(from, to);
+        }
+    }
+    let _ = std::fs::rename(path, rotated_path(path, 1));
+}
+
+fn rotated_path(path: &Path, idx: u64) -> PathBuf {
+    PathBuf::from(format!("{}.{}", path.display(), idx))
 }
 
 pub fn log_jsonl<T: Serialize>(writer: &AsyncJsonlWriter, path: &Path, value: &T) -> AppResult<()> {
@@ -315,4 +343,49 @@ pub fn is_ws_timeout(err: &WsError) -> bool {
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
             )
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jsonl_rotation_moves_large_current_file_as_first_archive() {
+        let dir = std::env::temp_dir().join(format!("polymaker-rotate-test-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("book.jsonl");
+        std::fs::write(&path, "1234567890\n").unwrap();
+
+        rotate_jsonl_if_needed(&path, 12, 3, 4);
+
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(rotated_path(&path, 1)).unwrap(),
+            "1234567890\n"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn jsonl_rotation_shifts_and_respects_keep_count() {
+        let dir = std::env::temp_dir().join(format!("polymaker-rotate-test-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("quotes.jsonl");
+        std::fs::write(&path, "current\n").unwrap();
+        std::fs::write(rotated_path(&path, 1), "old1\n").unwrap();
+        std::fs::write(rotated_path(&path, 2), "old2\n").unwrap();
+
+        rotate_jsonl_if_needed(&path, 4, 2, 4);
+
+        assert_eq!(
+            std::fs::read_to_string(rotated_path(&path, 1)).unwrap(),
+            "current\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rotated_path(&path, 2)).unwrap(),
+            "old1\n"
+        );
+        assert!(!rotated_path(&path, 3).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

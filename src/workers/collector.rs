@@ -40,7 +40,10 @@ pub fn run(cfg: Config, stop: StopFlag, tx: MarketTx) -> AppResult<()> {
 }
 
 fn run_sim_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResult<()> {
-    let logger = spawn_jsonl_writer();
+    let logger = spawn_jsonl_writer(
+        cfg.log_rotate_max_mb.saturating_mul(1024 * 1024),
+        cfg.log_rotate_keep,
+    );
     let mut step = 0u64;
     let center = cfg.price_to_beat;
     let window = cfg.market_window_secs.max(1);
@@ -136,7 +139,10 @@ fn run_live_market_data(cfg: &Config, stop: &StopFlag, tx: &MarketTx) -> AppResu
     let sink = LiveFrameSink {
         tx: tx.clone(),
         book_path: cfg.book_path().to_path_buf(),
-        logger: spawn_jsonl_writer(),
+        logger: spawn_jsonl_writer(
+            cfg.log_rotate_max_mb.saturating_mul(1024 * 1024),
+            cfg.log_rotate_keep,
+        ),
     };
 
     {

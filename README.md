@@ -183,6 +183,8 @@ cat run/inventory.json
 - `fills.jsonl`：order-gateway 模拟成交
 - `inventory.json`：risk-ledger 当前库存
 
+`book.jsonl`、`quotes.jsonl`、`fills.jsonl` 会按 `LOG_ROTATE_MAX_MB` 自动轮转，旧文件命名为 `book.jsonl.1`、`book.jsonl.2` 等，每个日志最多保留 `LOG_ROTATE_KEEP` 份旧文件。`LOG_ROTATE_MAX_MB=0` 表示关闭程序内轮转。
+
 ## DRY_RUN 模拟怎么跑
 
 当前模拟不是在真实 Polymarket 下单，而是在本地构造一套“像 5 分钟 BTC 二元市场”的小环境：
@@ -341,7 +343,7 @@ ENV_SWITCH_RESTART_MODE=stop
 polymaker env-switcher --once
 ```
 
-建议两套文件都保留相同的账号、私钥、`BOT_RUN_DIR`、`ENV_SWITCH_*` 字段，只改做市参数，例如 `QUOTE_SIZE`、`LIVE_ORDER_NOTIONAL_CAP`、`MAX_UNPAIRED_SHARES`、`MAX_TOTAL_INVENTORY`、`MIN_BID`、`MAX_BID`、`VALUE_MIN_EDGE`。
+建议两套文件都保留相同的账号、私钥、`BOT_RUN_DIR`、`LOG_ROTATE_*`、`ENV_SWITCH_*` 字段，只改做市参数，例如 `QUOTE_SIZE`、`LIVE_ORDER_NOTIONAL_CAP`、`MAX_UNPAIRED_SHARES`、`MAX_TOTAL_INVENTORY`、`MIN_BID`、`MAX_BID`、`VALUE_MIN_EDGE`。
 
 ## 配置说明
 

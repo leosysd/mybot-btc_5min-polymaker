@@ -8,6 +8,8 @@ pub const LIVE_MIN_ORDER_SIZE: f64 = 5.0;
 pub struct Config {
     pub base_dir: PathBuf,
     pub run_dir: PathBuf,
+    pub log_rotate_max_mb: u64,
+    pub log_rotate_keep: u64,
     pub env_switch_enabled: bool,
     pub env_switch_schedule: String,
     pub env_switch_check_secs: u64,
@@ -126,6 +128,8 @@ impl Config {
         let cfg = Self {
             base_dir,
             run_dir,
+            log_rotate_max_mb: get_u64(&file_env, "LOG_ROTATE_MAX_MB", 256),
+            log_rotate_keep: get_u64(&file_env, "LOG_ROTATE_KEEP", 6),
             env_switch_enabled: get_bool(&file_env, "ENV_SWITCH_ENABLED", false),
             env_switch_schedule: get(&file_env, "ENV_SWITCH_SCHEDULE", ""),
             env_switch_check_secs: get_u64(&file_env, "ENV_SWITCH_CHECK_SECS", 30),
@@ -310,6 +314,9 @@ impl Config {
         }
         if self.live_order_notional_cap < 0.0 || !self.live_order_notional_cap.is_finite() {
             return Err("LIVE_ORDER_NOTIONAL_CAP must be finite and non-negative".into());
+        }
+        if self.log_rotate_keep > 100 {
+            return Err("LOG_ROTATE_KEEP must be <= 100".into());
         }
         if self.env_switch_enabled && self.env_switch_schedule.trim().is_empty() {
             return Err("ENV_SWITCH_ENABLED=1 requires ENV_SWITCH_SCHEDULE".into());
