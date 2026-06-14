@@ -733,6 +733,8 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("VALUE_MIN_EDGE", "价值买入最低安全垫: fair - bid"),
         ("VALUE_AGGRESSION_TICKS", "价值买入相对买一抬高多少tick"),
         ("VALUE_MIN_FAIR", "价值买入最低模型胜率过滤"),
+        ("ENABLE_DIRECTION_MODEL", "1=方向v2混合模型实盘启用"),
+        ("DIRECTION_LIVE_WEIGHT", "方向v2 shadow混合权重"),
         ("ENABLE_DIRECTION_EDGE", "1=方向强弱调整edge"),
         ("DIRECTION_ALIGNED_EDGE", "顺方向最低安全垫"),
         ("DIRECTION_COUNTER_EDGE", "反方向最低安全垫"),
@@ -808,6 +810,8 @@ fn print_param_help() {
     println!("  VALUE_MIN_EDGE         最低安全垫: 买价必须 <= 模型fair-该值");
     println!("  VALUE_AGGRESSION_TICKS 相对当前买一抬高多少tick,仍受安全垫限制");
     println!("  VALUE_MIN_FAIR         最低模型胜率过滤,低于则不挂这一边");
+    println!("  ENABLE_DIRECTION_MODEL 1=启用方向v2混合模型,默认只记录shadow");
+    println!("  DIRECTION_LIVE_WEIGHT  v2混合权重:(1-w)*raw+w*shadow");
     println!("  ENABLE_DIRECTION_EDGE  1=按方向强弱调整edge,不禁止任何一边");
     println!("  DIRECTION_ALIGNED_EDGE 顺方向最低安全垫,越小越容易成交");
     println!("  DIRECTION_COUNTER_EDGE 反方向最低安全垫,越大越要求便宜");
@@ -2231,6 +2235,18 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
         "VALUE_MIN_FAIR",
         "0.05",
         "最低模型胜率过滤：低于这个fair的一边不挂单。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "ENABLE_DIRECTION_MODEL",
+        "0",
+        "1=启用方向v2小权重实盘模型；默认只记录shadow。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "DIRECTION_LIVE_WEIGHT",
+        "0.25",
+        "v2混合权重：model_up_live=(1-w)*raw+w*final_direction_up_shadow。",
     )?;
     upsert_env_if_missing_with_comment(
         path,

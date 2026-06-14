@@ -477,6 +477,20 @@ MAX_UNPAIRED_SHARES=19
 最大未配平差额，按 `abs((Up已成交+pending) - (Down已成交+pending))` 计算。达到上限后，机器人不再给领先的一边加仓，只允许继续挂落后的一边来缩小差额。`0` 表示关闭该限制。
 
 ```text
+ENABLE_DIRECTION_MODEL=0
+DIRECTION_LIVE_WEIGHT=0.25
+```
+
+方向 v2 实盘混合开关。默认关闭；开启后 quote-engine 用 shadow 方向概率小权重修正原始模型：
+
+```text
+model_up_live = (1 - DIRECTION_LIVE_WEIGHT) * raw_model_up
+              + DIRECTION_LIVE_WEIGHT * final_direction_up_shadow
+```
+
+建议只有 `polymaker direction-stats` 显示 shadow 的 Brier score、分桶校准和高置信错误都优于 raw 后再开启。初始权重建议保持 `0.25`，不要直接全量替换。
+
+```text
 ENABLE_MARKET_ANCHOR=0
 MARKET_ANCHOR_SHADOW=1
 MARKET_ANCHOR_WEIGHT=0.30
@@ -532,18 +546,19 @@ LIVE_ORDER_NOTIONAL_CAP=5
 
 当前报价逻辑是：
 
-1. 用 BTC 相对开盘价的偏移估算 `p_up`。
-2. `p_down = 1 - p_up`。
-3. 当前只有一套 value-buy maker 策略：Up/Down 各自独立判断，只在买价低于 fair 至少 `VALUE_MIN_EDGE` 时挂 maker 买单。默认 fair 是 Binance 模型；如果启用 `ENABLE_MARKET_ANCHOR=1`，Up/Down 会分别使用盘口锚定后的单边 fair。
-4. 新模式会参考当前买一价，最多抬高 `VALUE_AGGRESSION_TICKS` 个 tick，但仍然必须满足 post-only，且不能高于 `fair - VALUE_MIN_EDGE`。
-5. 如果启用 `ENABLE_DIRECTION_EDGE=1`，方向强的一边使用 `DIRECTION_ALIGNED_EDGE`，反方向使用 `DIRECTION_COUNTER_EDGE`，中性区间继续用 `VALUE_MIN_EDGE`。这不会禁止任何一边，只是顺方向更容易成交、反方向必须更便宜。
-6. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
-7. 新模式不做中途卖出；`MAX_UNPAIRED_SHARES` 会限制单边差额，超过后只允许挂落后的一边。
-8. `VALUE_MIN_FAIR` 用来过滤极低胜率的一边；默认 0.05，避免买几乎归零的深度劣势方。
-9. 单边库存仍受 `QUOTE_SIZE * INVENTORY_MULT` 限制，总库存仍受 `MAX_TOTAL_INVENTORY` 和 `MAX_LOSS` 限制。
-10. 如果同时持有 Up/Down，网关仍保留成本锁：补成一对时不会允许 `Up成本 + Down成本 > 1 - MIN_LOCK_EDGE`。
-11. 剩余 `ENDGAME_PULL_SECS` 秒进入 Pull，不再发新报价，等已有挂单过期/撤掉。
-12. 报价不能吃单，必须低于当前 ask 至少 `POST_ONLY_MARGIN_TICKS` 个 tick。
+1. 用 BTC 相对开盘价的偏移估算 `raw_model_up`。
+2. 如果启用 `ENABLE_DIRECTION_MODEL=1`，用 `DIRECTION_LIVE_WEIGHT` 把 `raw_model_up` 和 `final_direction_up_shadow` 混合为 `model_up_live`；否则直接使用 raw。
+3. `p_down = 1 - model_up_live`。
+4. 当前只有一套 value-buy maker 策略：Up/Down 各自独立判断，只在买价低于 fair 至少 `VALUE_MIN_EDGE` 时挂 maker 买单。默认 fair 是 Binance 模型；如果启用 `ENABLE_MARKET_ANCHOR=1`，Up/Down 会分别使用盘口锚定后的单边 fair。
+5. 新模式会参考当前买一价，最多抬高 `VALUE_AGGRESSION_TICKS` 个 tick，但仍然必须满足 post-only，且不能高于 `fair - VALUE_MIN_EDGE`。
+6. 如果启用 `ENABLE_DIRECTION_EDGE=1`，方向强的一边使用 `DIRECTION_ALIGNED_EDGE`，反方向使用 `DIRECTION_COUNTER_EDGE`，中性区间继续用 `VALUE_MIN_EDGE`。这不会禁止任何一边，只是顺方向更容易成交、反方向必须更便宜；它和方向 v2 混合模型是两个独立开关。
+7. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
+8. 新模式不做中途卖出；`MAX_UNPAIRED_SHARES` 会限制单边差额，超过后只允许挂落后的一边。
+9. `VALUE_MIN_FAIR` 用来过滤极低胜率的一边；默认 0.05，避免买几乎归零的深度劣势方。
+10. 单边库存仍受 `QUOTE_SIZE * INVENTORY_MULT` 限制，总库存仍受 `MAX_TOTAL_INVENTORY` 和 `MAX_LOSS` 限制。
+11. 如果同时持有 Up/Down，网关仍保留成本锁：补成一对时不会允许 `Up成本 + Down成本 > 1 - MIN_LOCK_EDGE`。
+12. 剩余 `ENDGAME_PULL_SECS` 秒进入 Pull，不再发新报价，等已有挂单过期/撤掉。
+13. 报价不能吃单，必须低于当前 ask 至少 `POST_ONLY_MARGIN_TICKS` 个 tick。
 
 ## 当前限制
 

@@ -147,6 +147,7 @@ impl SideFair {
 
 #[derive(Debug, Clone, Copy)]
 struct FairSnapshot {
+    raw_model_up: f64,
     model_up: f64,
     market_up: f64,
     up: SideFair,
@@ -187,6 +188,18 @@ impl FairSnapshot {
     }
 }
 
+fn direction_model_up(cfg: &Config, raw_model_up: f64, frame: &MarketFrame) -> f64 {
+    if !cfg.enable_direction_model {
+        return raw_model_up;
+    }
+    let direction_up = frame.final_direction_up_shadow;
+    if !direction_up.is_finite() || direction_up <= 0.0 || direction_up >= 1.0 {
+        return raw_model_up;
+    }
+    let w = cfg.direction_live_weight.clamp(0.0, 1.0);
+    ((1.0 - w) * raw_model_up + w * direction_up).clamp(0.0001, 0.9999)
+}
+
 fn side_anchor_weight(cfg: &Config, side_model_fair: f64, spread: f64) -> f64 {
     let max_weight = if side_model_fair < cfg.market_anchor_low_side_below {
         cfg.market_anchor_weight_low
@@ -196,7 +209,12 @@ fn side_anchor_weight(cfg: &Config, side_model_fair: f64, spread: f64) -> f64 {
     market_anchor_weight(max_weight, spread, cfg.market_anchor_max_spread)
 }
 
-fn fair_snapshot(cfg: &Config, frame: &MarketFrame, model_up: f64) -> FairSnapshot {
+fn fair_snapshot(
+    cfg: &Config,
+    frame: &MarketFrame,
+    raw_model_up: f64,
+    model_up: f64,
+) -> FairSnapshot {
     let anchor_enabled = cfg.enable_market_anchor || cfg.market_anchor_shadow;
     let model_down = 1.0 - model_up;
     let (market_up, spread) = if anchor_enabled {
@@ -228,6 +246,7 @@ fn fair_snapshot(cfg: &Config, frame: &MarketFrame, model_up: f64) -> FairSnapsh
     let up_anchor_active = cfg.enable_market_anchor && up_anchor_weight > 0.0;
     let down_anchor_active = cfg.enable_market_anchor && down_anchor_weight > 0.0;
     FairSnapshot {
+        raw_model_up,
         model_up,
         market_up,
         up: SideFair {
@@ -389,8 +408,9 @@ fn handle_market_frame(
         cfg.vol_seed_per_sqrt_sec
     };
     let width = uncertainty_width(vol, tau, cfg.width_floor_usd);
-    let p_model_up = digital_p_up(frame.btc_price, frame.price_to_beat, width);
-    let fair = fair_snapshot(cfg, frame, p_model_up);
+    let p_raw_model_up = digital_p_up(frame.btc_price, frame.price_to_beat, width);
+    let p_model_up = direction_model_up(cfg, p_raw_model_up, frame);
+    let fair = fair_snapshot(cfg, frame, p_raw_model_up, p_model_up);
     let p_up = fair.composite_up();
 
     // ── 2. Toxicity feedback: settle matured fills, get any extra widening.
@@ -510,6 +530,7 @@ fn send_quote(
         price,
         size,
         fair,
+        raw_model_up: fair_snapshot.raw_model_up,
         model_up: fair_snapshot.model_up,
         market_up: if fair_snapshot.market_up > 0.0 {
             fair_snapshot.market_up
@@ -614,6 +635,7 @@ mod tests {
             anchor_active: false,
         };
         FairSnapshot {
+            raw_model_up: 0.50,
             model_up: 0.50,
             market_up: 0.50,
             up: side,
@@ -779,6 +801,45 @@ mod tests {
     }
 
     #[test]
+    fn direction_model_disabled_uses_raw_model_up() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.enable_direction_model = false;
+        cfg.direction_live_weight = 0.25;
+        let mut frame = flat_frame(100.0);
+        frame.final_direction_up_shadow = 0.90;
+
+        let p = direction_model_up(&cfg, 0.50, &frame);
+
+        assert_eq!(p, 0.50);
+    }
+
+    #[test]
+    fn direction_model_mixes_raw_with_shadow_when_enabled() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.enable_direction_model = true;
+        cfg.direction_live_weight = 0.25;
+        let mut frame = flat_frame(100.0);
+        frame.final_direction_up_shadow = 0.90;
+
+        let p = direction_model_up(&cfg, 0.50, &frame);
+
+        assert!((p - 0.60).abs() < 1e-12);
+    }
+
+    #[test]
+    fn direction_model_falls_back_to_raw_when_shadow_invalid() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.enable_direction_model = true;
+        cfg.direction_live_weight = 0.25;
+        let mut frame = flat_frame(100.0);
+        frame.final_direction_up_shadow = 0.0;
+
+        let p = direction_model_up(&cfg, 0.50, &frame);
+
+        assert_eq!(p, 0.50);
+    }
+
+    #[test]
     fn market_anchor_can_weight_low_probability_side_more() {
         let mut cfg = value_buy_quote_test_cfg();
         cfg.enable_market_anchor = true;
@@ -793,7 +854,7 @@ mod tests {
         frame.down_bid = 0.25;
         frame.down_ask = 0.27;
 
-        let fair = fair_snapshot(&cfg, &frame, 0.80);
+        let fair = fair_snapshot(&cfg, &frame, 0.80, 0.80);
 
         assert!(
             fair.side_anchor_weight("Down") > fair.side_anchor_weight("Up"),
