@@ -361,6 +361,60 @@ fn value_buy_quotes(
     (up_px, down_px, "value_buy")
 }
 
+fn avg_cost(cost: f64, shares: f64) -> Option<f64> {
+    (shares > 0.0 && cost.is_finite()).then_some(cost / shares)
+}
+
+fn balance_first_px(
+    cfg: &Config,
+    frame: &MarketFrame,
+    side_is_up: bool,
+    inventory: &Inventory,
+    model_bid: f64,
+) -> Option<f64> {
+    let up_eff = inventory.effective_up();
+    let down_eff = inventory.effective_down();
+    let side_is_lagging = if side_is_up {
+        up_eff + cfg.min_order_size() <= down_eff
+    } else {
+        down_eff + cfg.min_order_size() <= up_eff
+    };
+    if !side_is_lagging {
+        return None;
+    }
+
+    let opposite_avg = if side_is_up {
+        avg_cost(inventory.down_cost, inventory.down_shares)
+    } else {
+        avg_cost(inventory.up_cost, inventory.up_shares)
+    }?;
+    let pair_lock_cap = 1.0 - opposite_avg - cfg.min_lock_edge;
+    if pair_lock_cap < cfg.min_bid {
+        return None;
+    }
+
+    let book_improved = top_bid(frame, side_is_up)
+        .map(|bid| bid + cfg.value_aggression_ticks * cfg.tick_size)
+        .unwrap_or(model_bid);
+    let raw_bid = model_bid
+        .max(book_improved)
+        .min(pair_lock_cap)
+        .min(cfg.max_bid);
+    let ask = if side_is_up {
+        frame.up_ask
+    } else {
+        frame.down_ask
+    };
+    post_only_bid(
+        raw_bid,
+        ask,
+        cfg.tick_size,
+        cfg.min_bid,
+        cfg.max_bid,
+        cfg.post_only_margin_ticks,
+    )
+}
+
 fn unpaired_limit_allows(cfg: &Config, inventory: &Inventory, side: &str, size: f64) -> bool {
     let limit = cfg.max_unpaired_shares;
     if limit <= 0.0 {
@@ -459,8 +513,24 @@ fn handle_market_frame(
     });
 
     let phase = phase_for(tau, cfg.endgame_pull_secs);
-    let (up_px, down_px, reason) =
+    let (mut up_px, mut down_px, reason) =
         value_buy_quotes(cfg, frame, phase, fair.quote_up(), fair.quote_down(), model);
+    let mut up_reason = reason;
+    let mut down_reason = reason;
+    if phase != Phase::Pull {
+        if let Some(px) = balance_first_px(cfg, frame, true, inventory, model.up_bid) {
+            if up_px.map(|current| px > current).unwrap_or(true) {
+                up_px = Some(px);
+                up_reason = "balance_first";
+            }
+        }
+        if let Some(px) = balance_first_px(cfg, frame, false, inventory, model.down_bid) {
+            if down_px.map(|current| px > current).unwrap_or(true) {
+                down_px = Some(px);
+                down_reason = "balance_first";
+            }
+        }
+    }
     if let Some(px) = up_px {
         send_quote(
             cfg,
@@ -470,7 +540,7 @@ fn handle_market_frame(
             px,
             fair.quote_up(),
             inventory,
-            reason,
+            up_reason,
             fair,
         )?;
     }
@@ -483,7 +553,7 @@ fn handle_market_frame(
             px,
             fair.quote_down(),
             inventory,
-            reason,
+            down_reason,
             fair,
         )?;
     }
@@ -885,10 +955,13 @@ mod tests {
 
         handle_market_frame(&cfg, &tx, &flat_frame(110.0), &inventory, &mut tox).expect("quote");
 
-        assert!(
-            rx.try_recv().is_err(),
+        let quote = rx.try_recv().expect("opposite-side balance quote");
+        assert_eq!(quote.side, "Down");
+        assert_ne!(
+            quote.side, "Up",
             "same-side add would push unpaired exposure above MAX_UNPAIRED_SHARES"
         );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -910,6 +983,38 @@ mod tests {
         assert_eq!(quote.side, "Down");
         assert_eq!(quote.reason, "value_buy");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn balance_first_quotes_lagging_side_by_pair_lock_price() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.value_min_fair = 0.30;
+        cfg.min_lock_edge = 0.02;
+        cfg.quote_size = 20.0;
+        cfg.inventory_mult = 2.0;
+        cfg.max_unpaired_shares = 20.0;
+
+        let mut frame = flat_frame(50.0);
+        frame.up_bid = 0.42;
+        frame.up_ask = 0.90;
+        frame.down_bid = 0.90;
+        frame.down_ask = 0.95;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            down_shares: 40.0,
+            down_cost: 17.6,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &frame, &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("balance quote");
+        assert_eq!(quote.side, "Up");
+        assert_eq!(quote.reason, "balance_first");
+        assert_eq!(quote.price, 0.43);
+        assert!(quote.price <= 1.0 - 0.44 - cfg.min_lock_edge + 1e-9);
     }
 
     #[test]
