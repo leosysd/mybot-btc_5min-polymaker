@@ -198,11 +198,14 @@ ensure_env_defaults() {
     append_env_line REJECT_BACKOFF_MS "# 同一边被拒后冷却毫秒数，避免空转刷 400 被限流。0=关。" "REJECT_BACKOFF_MS=500"
   fi
 
-  if section_has_missing ENABLE_DIRECTION_EDGE DIRECTION_ALIGNED_EDGE DIRECTION_COUNTER_EDGE \
+  if section_has_missing ENABLE_DIRECTION_MODEL DIRECTION_LIVE_WEIGHT \
+    ENABLE_DIRECTION_EDGE DIRECTION_ALIGNED_EDGE DIRECTION_COUNTER_EDGE \
     ENABLE_MARKET_ANCHOR MARKET_ANCHOR_SHADOW MARKET_ANCHOR_WEIGHT \
     MARKET_ANCHOR_WEIGHT_HIGH MARKET_ANCHOR_WEIGHT_LOW MARKET_ANCHOR_LOW_SIDE_BELOW \
     MARKET_ANCHOR_MAX_SPREAD; then
     append_section_header "# ── 盘口锚定胜率（install.sh 自动补齐）──────────────────────"
+    append_env_line ENABLE_DIRECTION_MODEL "# 1=启用方向 v2 小权重实盘模型；默认只记录 shadow。" "ENABLE_DIRECTION_MODEL=0"
+    append_env_line DIRECTION_LIVE_WEIGHT "# v2 混合权重：model_up_live=(1-w)*raw+w*final_direction_up_shadow。" "DIRECTION_LIVE_WEIGHT=0.25"
     append_env_line ENABLE_DIRECTION_EDGE "# 1=按方向强弱调整 edge；不禁止任何一边，只改变成交难度。" "ENABLE_DIRECTION_EDGE=0"
     append_env_line DIRECTION_ALIGNED_EDGE "# 顺方向最低安全垫；小于 VALUE_MIN_EDGE 时顺方向更容易成交。" "DIRECTION_ALIGNED_EDGE=0.012"
     append_env_line DIRECTION_COUNTER_EDGE "# 反方向最低安全垫；大于 VALUE_MIN_EDGE 时反方向必须更便宜。" "DIRECTION_COUNTER_EDGE=0.04"

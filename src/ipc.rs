@@ -109,6 +109,8 @@ pub struct QuoteIntent {
     pub size: f64,
     pub fair: f64,
     #[serde(default)]
+    pub raw_model_up: f64,
+    #[serde(default)]
     pub model_up: f64,
     #[serde(default)]
     pub market_up: f64,
