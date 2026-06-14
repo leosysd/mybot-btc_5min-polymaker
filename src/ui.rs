@@ -2203,6 +2203,24 @@ fn ensure_cli_defaults(path: &Path) -> AppResult<()> {
     )?;
     upsert_env_if_missing_with_comment(
         path,
+        "ENABLE_DIRECTION_EDGE",
+        "0",
+        "1=按方向强弱调整edge；不禁止任何一边，只改变成交难度。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "DIRECTION_ALIGNED_EDGE",
+        "0.012",
+        "顺方向最低安全垫；小于VALUE_MIN_EDGE时顺方向更容易成交。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
+        "DIRECTION_COUNTER_EDGE",
+        "0.04",
+        "反方向最低安全垫；大于VALUE_MIN_EDGE时反方向必须更便宜。",
+    )?;
+    upsert_env_if_missing_with_comment(
+        path,
         "ENABLE_MARKET_ANCHOR",
         "0",
         "1=真实报价使用盘口锚定融合胜率；默认0只记录影子值。",
