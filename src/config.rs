@@ -98,6 +98,9 @@ pub struct Config {
     pub direction_w_flow_10s: f64,
     pub direction_w_book: f64,
     pub direction_w_market: f64,
+    pub enable_direction_edge: bool,
+    pub direction_aligned_edge: f64,
+    pub direction_counter_edge: f64,
     pub enable_real_orders: String,
     pub polymarket_clob_host: String,
     pub poly_private_key: String,
@@ -244,6 +247,9 @@ impl Config {
             direction_w_flow_10s: get_f64(&file_env, "DIRECTION_W_FLOW_10S", 0.15),
             direction_w_book: get_f64(&file_env, "DIRECTION_W_BOOK", 0.15),
             direction_w_market: get_f64(&file_env, "DIRECTION_W_MARKET", 0.25),
+            enable_direction_edge: get_bool(&file_env, "ENABLE_DIRECTION_EDGE", false),
+            direction_aligned_edge: get_f64(&file_env, "DIRECTION_ALIGNED_EDGE", 0.012),
+            direction_counter_edge: get_f64(&file_env, "DIRECTION_COUNTER_EDGE", 0.04),
             enable_real_orders: get(&file_env, "ENABLE_REAL_ORDERS", ""),
             polymarket_clob_host: get(
                 &file_env,
@@ -396,6 +402,14 @@ impl Config {
         }
         if self.enable_direction_model && self.direction_live_weight <= 0.0 {
             return Err("ENABLE_DIRECTION_MODEL=1 requires DIRECTION_LIVE_WEIGHT > 0".into());
+        }
+        for (name, value) in [
+            ("DIRECTION_ALIGNED_EDGE", self.direction_aligned_edge),
+            ("DIRECTION_COUNTER_EDGE", self.direction_counter_edge),
+        ] {
+            if value < 0.0 || value >= 1.0 || !value.is_finite() {
+                return Err(format!("{name} must be finite and in [0, 1)").into());
+            }
         }
         for (name, value) in [
             ("DIRECTION_W_DISTANCE", self.direction_w_distance),

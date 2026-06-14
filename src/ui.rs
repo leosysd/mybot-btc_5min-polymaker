@@ -733,6 +733,9 @@ fn edit_market_maker_params(cfg: &Config) -> AppResult<()> {
         ("VALUE_MIN_EDGE", "价值买入最低安全垫: fair - bid"),
         ("VALUE_AGGRESSION_TICKS", "价值买入相对买一抬高多少tick"),
         ("VALUE_MIN_FAIR", "价值买入最低模型胜率过滤"),
+        ("ENABLE_DIRECTION_EDGE", "1=方向强弱调整edge"),
+        ("DIRECTION_ALIGNED_EDGE", "顺方向最低安全垫"),
+        ("DIRECTION_COUNTER_EDGE", "反方向最低安全垫"),
         ("ENABLE_MARKET_ANCHOR", "1=真实报价使用盘口锚定融合胜率"),
         ("MARKET_ANCHOR_SHADOW", "1=记录影子融合胜率,不改报价"),
         ("MARKET_ANCHOR_WEIGHT", "盘口锚定兼容默认权重"),
@@ -805,6 +808,9 @@ fn print_param_help() {
     println!("  VALUE_MIN_EDGE         最低安全垫: 买价必须 <= 模型fair-该值");
     println!("  VALUE_AGGRESSION_TICKS 相对当前买一抬高多少tick,仍受安全垫限制");
     println!("  VALUE_MIN_FAIR         最低模型胜率过滤,低于则不挂这一边");
+    println!("  ENABLE_DIRECTION_EDGE  1=按方向强弱调整edge,不禁止任何一边");
+    println!("  DIRECTION_ALIGNED_EDGE 顺方向最低安全垫,越小越容易成交");
+    println!("  DIRECTION_COUNTER_EDGE 反方向最低安全垫,越大越要求便宜");
     println!("  ENABLE_MARKET_ANCHOR   1=真实报价使用盘口锚定融合胜率;默认0");
     println!("  MARKET_ANCHOR_SHADOW   1=只记录FinalUp影子胜率,不改变报价");
     println!("  MARKET_ANCHOR_WEIGHT   兼容默认权重;HIGH/LOW未设置时使用它");

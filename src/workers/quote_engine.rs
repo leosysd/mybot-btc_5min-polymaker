@@ -259,11 +259,12 @@ fn value_buy_px(
     side_is_up: bool,
     fair: f64,
     model_bid: f64,
+    min_edge: f64,
 ) -> Option<f64> {
     if fair < cfg.value_min_fair {
         return None;
     }
-    let edge_cap = fair - cfg.value_min_edge;
+    let edge_cap = fair - min_edge;
     if edge_cap < cfg.min_bid {
         return None;
     }
@@ -286,6 +287,31 @@ fn value_buy_px(
     )
 }
 
+fn direction_aware_edge(cfg: &Config, frame: &MarketFrame, side_is_up: bool) -> f64 {
+    if !cfg.enable_direction_edge {
+        return cfg.value_min_edge;
+    }
+    let p = frame.final_direction_up_shadow;
+    if !p.is_finite() || p <= 0.0 || p >= 1.0 {
+        return cfg.value_min_edge;
+    }
+    if p >= 0.60 {
+        if side_is_up {
+            cfg.direction_aligned_edge
+        } else {
+            cfg.direction_counter_edge
+        }
+    } else if p <= 0.40 {
+        if side_is_up {
+            cfg.direction_counter_edge
+        } else {
+            cfg.direction_aligned_edge
+        }
+    } else {
+        cfg.value_min_edge
+    }
+}
+
 fn value_buy_quotes(
     cfg: &Config,
     frame: &MarketFrame,
@@ -297,8 +323,22 @@ fn value_buy_quotes(
     if phase == Phase::Pull {
         return (None, None, "value_buy_pull");
     }
-    let up_px = value_buy_px(cfg, frame, true, up_fair, model.up_bid);
-    let down_px = value_buy_px(cfg, frame, false, down_fair, model.down_bid);
+    let up_px = value_buy_px(
+        cfg,
+        frame,
+        true,
+        up_fair,
+        model.up_bid,
+        direction_aware_edge(cfg, frame, true),
+    );
+    let down_px = value_buy_px(
+        cfg,
+        frame,
+        false,
+        down_fair,
+        model.down_bid,
+        direction_aware_edge(cfg, frame, false),
+    );
     (up_px, down_px, "value_buy")
 }
 
@@ -688,6 +728,54 @@ mod tests {
         assert!(q1.price <= q1.fair - cfg.value_min_edge + 1e-9);
         assert!(q2.price <= q2.fair - cfg.value_min_edge + 1e-9);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn direction_edge_makes_aligned_side_easier_than_counter_side() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.enable_direction_edge = true;
+        cfg.direction_aligned_edge = 0.01;
+        cfg.direction_counter_edge = 0.08;
+
+        let mut frame = flat_frame(100.0);
+        frame.final_direction_up_shadow = 0.70;
+        frame.up_bid = 0.48;
+        frame.up_ask = 0.90;
+        frame.down_bid = 0.48;
+        frame.down_ask = 0.90;
+        let model = ModelQuote {
+            up_bid: 0.49,
+            down_bid: 0.49,
+        };
+
+        let (up_px, down_px, reason) =
+            value_buy_quotes(&cfg, &frame, Phase::Normal, 0.50, 0.50, model);
+
+        assert_eq!(reason, "value_buy");
+        assert_eq!(up_px, Some(0.49), "aligned Up can use smaller edge");
+        assert_eq!(down_px, Some(0.42), "counter Down must quote cheaper");
+        assert!(up_px > down_px);
+    }
+
+    #[test]
+    fn direction_edge_disabled_keeps_plain_value_min_edge() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.enable_direction_edge = false;
+        cfg.direction_aligned_edge = 0.01;
+        cfg.direction_counter_edge = 0.08;
+
+        let mut frame = flat_frame(100.0);
+        frame.final_direction_up_shadow = 0.70;
+        frame.up_bid = 0.48;
+        frame.up_ask = 0.90;
+        let model = ModelQuote {
+            up_bid: 0.49,
+            down_bid: 0.49,
+        };
+
+        let (up_px, _, _) = value_buy_quotes(&cfg, &frame, Phase::Normal, 0.50, 0.50, model);
+
+        assert_eq!(up_px, Some(0.46), "plain VALUE_MIN_EDGE still applies");
     }
 
     #[test]
