@@ -434,15 +434,23 @@ fn asymmetric_balance_room(cfg: &Config, inventory: &Inventory, side: &str) -> f
         return f64::INFINITY;
     }
     let ratio = cfg.balance_secondary_ratio;
-    let (same, other) = match side {
-        "Up" => (inventory.effective_up(), inventory.effective_down()),
-        "Down" => (inventory.effective_down(), inventory.effective_up()),
+    let (same_filled, same_pending, other_filled) = match side {
+        "Up" => (
+            inventory.up_shares,
+            inventory.pending_up,
+            inventory.down_shares,
+        ),
+        "Down" => (
+            inventory.down_shares,
+            inventory.pending_down,
+            inventory.up_shares,
+        ),
         _ => return f64::INFINITY,
     };
-    if same >= other {
+    if same_filled >= other_filled {
         return f64::INFINITY;
     }
-    (other * ratio - same).max(0.0)
+    (other_filled * ratio - same_filled - same_pending).max(0.0)
 }
 
 /// Compute the time-aware quotes for one market frame and emit them.
@@ -1032,6 +1040,58 @@ mod tests {
         let quote = rx.try_recv().expect("secondary balance quote");
         assert_eq!(quote.side, "Down");
         assert_eq!(quote.size, 16.0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn asymmetric_balance_ignores_main_side_pending_when_sizing_secondary() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.value_min_fair = 0.30;
+        cfg.quote_size = 20.0;
+        cfg.inventory_mult = 3.0;
+        cfg.max_unpaired_shares = 40.0;
+        cfg.enable_asymmetric_balance = true;
+        cfg.balance_secondary_ratio = 0.8;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 7.0,
+            pending_up: 20.0,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(90.0), &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("secondary quote sized from filled main only");
+        assert_eq!(quote.side, "Down");
+        assert_eq!(quote.size, 5.0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn asymmetric_balance_counts_secondary_pending_against_ratio() {
+        let mut cfg = value_buy_quote_test_cfg();
+        cfg.value_min_fair = 0.30;
+        cfg.quote_size = 20.0;
+        cfg.inventory_mult = 3.0;
+        cfg.max_unpaired_shares = 40.0;
+        cfg.enable_asymmetric_balance = true;
+        cfg.balance_secondary_ratio = 0.8;
+        let inventory = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 20.0,
+            pending_down: 11.0,
+            ..Default::default()
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tox = ToxicityMonitor::new(2_500, 0.5, 1.5, 0.08);
+
+        handle_market_frame(&cfg, &tx, &flat_frame(90.0), &inventory, &mut tox).expect("quote");
+
+        let quote = rx.try_recv().expect("remaining secondary balance quote");
+        assert_eq!(quote.side, "Down");
+        assert_eq!(quote.size, 5.0);
         assert!(rx.try_recv().is_err());
     }
 

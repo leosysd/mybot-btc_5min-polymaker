@@ -587,17 +587,23 @@ fn asymmetric_balance_room_after_replace(
     if !cfg.enable_asymmetric_balance || cfg.balance_secondary_ratio >= 1.0 {
         return f64::INFINITY;
     }
-    let current_up = held_shares(inv, market, "Up") + pending_shares(inv, market, "Up");
-    let current_down = held_shares(inv, market, "Down") + pending_shares(inv, market, "Down");
-    let (same, other) = match side {
-        "Up" => ((current_up - replacing_size).max(0.0), current_down),
-        "Down" => ((current_down - replacing_size).max(0.0), current_up),
+    let (same_filled, same_pending_after_replace, other_filled) = match side {
+        "Up" => (
+            held_shares(inv, market, "Up"),
+            (pending_shares(inv, market, "Up") - replacing_size).max(0.0),
+            held_shares(inv, market, "Down"),
+        ),
+        "Down" => (
+            held_shares(inv, market, "Down"),
+            (pending_shares(inv, market, "Down") - replacing_size).max(0.0),
+            held_shares(inv, market, "Up"),
+        ),
         _ => return f64::INFINITY,
     };
-    if same >= other {
+    if same_filled >= other_filled {
         return f64::INFINITY;
     }
-    (other * cfg.balance_secondary_ratio - same).max(0.0)
+    (other_filled * cfg.balance_secondary_ratio - same_filled - same_pending_after_replace).max(0.0)
 }
 
 fn load_active_orders(cfg: &Config) -> AppResult<HashMap<String, RestingOrder>> {
@@ -2172,6 +2178,50 @@ mod tests {
             asymmetric_balance_room_after_replace(&cfg, &inv, "btc-updown-5m-test", "Up", 0.0)
                 .is_infinite(),
             "the current main side is not limited by the 80% secondary cap"
+        );
+    }
+
+    #[test]
+    fn asymmetric_balance_after_replace_ignores_main_side_pending() {
+        let mut cfg = test_cfg();
+        cfg.enable_asymmetric_balance = true;
+        cfg.balance_secondary_ratio = 0.8;
+        let inv = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 7.0,
+            pending_up: 20.0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            asymmetric_balance_room_after_replace(&cfg, &inv, "btc-updown-5m-test", "Down", 0.0),
+            5.6000000000000005,
+            "pending Up must not make Down room larger than 80% of filled Up"
+        );
+    }
+
+    #[test]
+    fn asymmetric_balance_after_replace_counts_secondary_pending() {
+        let mut cfg = test_cfg();
+        cfg.enable_asymmetric_balance = true;
+        cfg.balance_secondary_ratio = 0.8;
+        let inv = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 20.0,
+            down_shares: 5.0,
+            pending_down: 11.0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            asymmetric_balance_room_after_replace(&cfg, &inv, "btc-updown-5m-test", "Down", 0.0),
+            0.0,
+            "filled Down 5 plus pending Down 11 already reaches 80% of Up 20"
+        );
+        assert_eq!(
+            asymmetric_balance_room_after_replace(&cfg, &inv, "btc-updown-5m-test", "Down", 11.0),
+            11.0,
+            "replacing the existing pending Down quote frees that pending room"
         );
     }
 }
