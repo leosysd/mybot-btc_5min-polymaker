@@ -1358,17 +1358,12 @@ fn handle_user_trade(
         });
 
     if let Some(makers) = value.get("maker_orders").and_then(Value::as_array) {
+        let mut matched_any_local = false;
+        let mut unknown_hint: Option<(String, f64, f64)> = None;
         for maker in makers {
             let Some(order_id) = first_str(maker, &["order_id", "id"]) else {
                 continue;
             };
-            if !order_map_contains(order_map, order_id) {
-                continue;
-            }
-            let key = format!("{trade_id}:{order_id}");
-            if !seen_trades.insert(key) {
-                continue;
-            }
             let size = parse_f64_value(maker.get("matched_amount"))
                 .or_else(|| parse_f64_value(maker.get("size")))
                 .or_else(|| parse_f64_value(value.get("size")))
@@ -1376,9 +1371,42 @@ fn handle_user_trade(
             let price = parse_f64_value(maker.get("price"))
                 .or_else(|| parse_f64_value(value.get("price")))
                 .unwrap_or(0.0);
+            if !order_map_contains(order_map, order_id) {
+                // Could be a counterparty's maker (skip), or OUR fill we lost
+                // track of. We can't credit it precisely without the order, but
+                // we must NOT silently drop it. Remember the first untracked
+                // maker; if we end up matching NONE of our own orders below, we
+                // force a reconcile for it (see after the loop).
+                if unknown_hint.is_none() {
+                    unknown_hint = Some((order_id.to_string(), price, size));
+                }
+                continue;
+            }
+            let key = format!("{trade_id}:{order_id}");
+            if !seen_trades.insert(key) {
+                continue;
+            }
+            matched_any_local = true;
             emit_user_fill(
                 cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size,
             )?;
+        }
+        // This trade is in OUR user feed, so one of its orders is ours. If we
+        // matched NONE of the makers to a tracked order, our maker fill is
+        // untracked. Silently dropping it (a refactor replaced this with a bare
+        // `continue`) under-counts `held`, so the side cap re-opens and the bot
+        // over-buys past the cap (observed: real 60 vs cap 40). Force ONE
+        // on-chain reconcile, which raises held to the true position AND pauses
+        // placement until it catches up — closing the cap breach.
+        if !matched_any_local {
+            if let Some((order_id, price, size)) = unknown_hint {
+                let key = format!("{trade_id}:unmatched");
+                if seen_trades.insert(key) {
+                    emit_user_fill(
+                        cfg, inventory, order_map, gw_tx, ledger_tx, &order_id, price, size,
+                    )?;
+                }
+            }
         }
         return Ok(());
     }
@@ -1876,6 +1904,60 @@ mod tests {
         assert!(
             ledger_rx.try_recv().is_err(),
             "unknown maker_orders must not emit unmatched reconcile events"
+        );
+    }
+
+    #[test]
+    fn user_trade_all_unknown_makers_forces_reconcile_once() {
+        // Regression guard: a trade in OUR feed whose makers match NONE of our
+        // tracked orders means our maker fill is untracked. It must NOT be
+        // silently dropped (that under-counts held -> the side cap re-opens ->
+        // over-buy past the cap). It must force exactly one on-chain reconcile.
+        let cfg = test_cfg();
+        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        }));
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
+        let (gw_tx, _gw_rx) = std::sync::mpsc::channel();
+        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
+        let mut seen = HashSet::new();
+        let event = serde_json::json!({
+            "id": "trade-allunknown",
+            "event_type": "trade",
+            "maker_orders": [
+                {"order_id": "untracked-a", "matched_amount": "20", "price": "0.58"},
+                {"order_id": "untracked-b", "matched_amount": "4", "price": "0.65"}
+            ]
+        });
+
+        handle_user_trade(
+            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+        )
+        .unwrap();
+
+        // Exactly one reconcile forced, and nothing locally synthesized.
+        assert!(matches!(
+            ledger_rx
+                .try_recv()
+                .expect("untracked own fill must force reconcile"),
+            LedgerEvent::UnmatchedFill
+        ));
+        assert!(
+            ledger_rx.try_recv().is_err(),
+            "must force the reconcile only once per trade"
+        );
+        assert_eq!(inventory.lock().unwrap().up_shares, 0.0);
+        assert_eq!(inventory.lock().unwrap().down_shares, 0.0);
+
+        // A replay of the same trade must not force a second reconcile.
+        handle_user_trade(
+            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+        )
+        .unwrap();
+        assert!(
+            ledger_rx.try_recv().is_err(),
+            "replay of the same trade must be deduped"
         );
     }
 
