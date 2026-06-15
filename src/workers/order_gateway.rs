@@ -686,14 +686,13 @@ fn accept_resting_order(
             )?;
             return Ok(false);
         };
-        heartbeat(
-            cfg,
-            "order-gateway",
-            format!(
-                "real order {} {} build={}ms sign={}ms post={}ms 总={}ms",
-                ack.order_id, ack.status, ack.build_ms, ack.sign_ms, ack.post_ms, ack.total_ms
-            ),
-        )?;
+        // Record the order in order_map IMMEDIATELY after the POST returns and
+        // BEFORE the heartbeat (a disk write). In a hot market the fill can come
+        // back within milliseconds; the old order: POST -> heartbeat(disk) ->
+        // insert left a multi-ms window where the fill arrived for an order not
+        // yet recorded -> "unknown" -> under-count -> cap over-accumulates
+        // (confirmed by DIAG2: own fills with the order not in the map). Inserting
+        // first shrinks that race window to a single in-memory map insert.
         if let Some(order_map) = order_map {
             order_map.lock().unwrap().insert(
                 ack.order_id.clone(),
@@ -709,6 +708,14 @@ fn accept_resting_order(
                 },
             );
         }
+        heartbeat(
+            cfg,
+            "order-gateway",
+            format!(
+                "real order {} {} build={}ms sign={}ms post={}ms 总={}ms",
+                ack.order_id, ack.status, ack.build_ms, ack.sign_ms, ack.post_ms, ack.total_ms
+            ),
+        )?;
         Some(ack.order_id)
     } else {
         None
@@ -1364,41 +1371,6 @@ fn handle_user_trade(
             known_condition_ids(order_map).into_iter().collect();
         let event_condition =
             first_str(value, &["market", "condition_id"]).map(ToString::to_string);
-        // TEMP DIAGNOSTIC (remove after capture): per-trade, count OUR makers and
-        // how many are tracked in order_map. Decides the under-count cause:
-        //  - ours_not_in_map > 0 in busy windows => placement race (handler fix).
-        //  - ours far below chain fills for the window => WS delivery gap (need a
-        //    placement-quantity cap instead). Logs counts only, no ids/wallets.
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static DIAG2: AtomicU64 = AtomicU64::new(0);
-            if DIAG2.fetch_add(1, Ordering::Relaxed) < 600 {
-                let mut ours = 0u32;
-                let mut ours_in_map = 0u32;
-                for m in makers {
-                    if maker_order_belongs_to_us(cfg, m) {
-                        ours += 1;
-                        let oid = first_str(m, &["order_id", "id"]).unwrap_or("");
-                        if order_map_contains(order_map, oid) {
-                            ours_in_map += 1;
-                        }
-                    }
-                }
-                eprintln!(
-                    "[DIAG2] evt_market={:?} makers={} ours={} ours_in_map={} ours_not_in_map={} cur_conds={} evt_cond_in_cur={}",
-                    event_condition,
-                    makers.len(),
-                    ours,
-                    ours_in_map,
-                    ours - ours_in_map,
-                    current_conditions.len(),
-                    event_condition
-                        .as_deref()
-                        .map(|c| current_conditions.contains(c))
-                        .unwrap_or(false),
-                );
-            }
-        }
         let mut handled_any = false;
         let mut unmatched_hint: Option<(String, f64, f64)> = None;
         for maker in makers {
