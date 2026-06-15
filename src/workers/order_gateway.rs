@@ -242,6 +242,12 @@ pub fn run(
                         {
                             let mut inv = inventory.lock().unwrap();
                             reset_inventory_for_market(&mut inv, &quote.market);
+                            // Record the window's condition id so the user-WS thread
+                            // can attribute own fills to the current window in real
+                            // time (no order_map dependency, no reconcile pause).
+                            if !quote.condition_id.trim().is_empty() {
+                                inv.condition_id = quote.condition_id.clone();
+                            }
                             recompute_pending_from_resting(&mut inv, &resting);
                         }
                         // Drop order_map entries from other windows (incl. spent
@@ -1365,10 +1371,10 @@ fn handle_user_trade(
         });
 
     if let Some(makers) = value.get("maker_orders").and_then(Value::as_array) {
-        // Condition ids of the orders we currently hold = the live window. Used
-        // to window-guard a real-time credit of our own untracked fill.
-        let current_conditions: HashSet<String> =
-            known_condition_ids(order_map).into_iter().collect();
+        // The CURRENT window's condition id, recorded by the gateway on reset.
+        // Used to window-guard a real-time credit of our own untracked fill —
+        // robust across window boundaries (unlike order_map, which empties).
+        let inv_condition = { inventory.lock().unwrap().condition_id.clone() };
         let event_condition =
             first_str(value, &["market", "condition_id"]).map(ToString::to_string);
         let mut handled_any = false;
@@ -1422,13 +1428,16 @@ fn handle_user_trade(
             let side = first_str(maker, &["outcome"])
                 .map(ToString::to_string)
                 .filter(|s| s == "Up" || s == "Down");
-            // Only credit when we can place the fill in the CURRENT window:
-            // its condition id is one we hold orders in (or we hold none yet —
-            // the first-order race). Otherwise fall back to a reconcile.
+            // Credit in real time only when the fill is for the CURRENT window:
+            // its condition id equals the inventory's (or we have none yet).
+            // This now uses the inventory's recorded condition id, so it works
+            // even when order_map is momentarily empty at a window boundary —
+            // which is exactly when the placement race happens. Mismatch falls
+            // back to a reconcile.
             let same_window = side.is_some()
                 && match &event_condition {
-                    Some(c) => current_conditions.is_empty() || current_conditions.contains(c),
-                    None => current_conditions.is_empty(),
+                    Some(c) => inv_condition.is_empty() || *c == inv_condition,
+                    None => inv_condition.is_empty(),
                 };
             match (side, same_window) {
                 (Some(side), true) => {

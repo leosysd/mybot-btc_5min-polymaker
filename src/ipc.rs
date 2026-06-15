@@ -190,6 +190,13 @@ pub struct FillEvent {
 pub struct Inventory {
     pub ts_ms: u64,
     pub market: String,
+    /// Condition id (0x…) of the current window. Set by the gateway when it
+    /// resets for a new window. Lets the user-WS thread attribute an own fill to
+    /// the current window from the trade event's `market` field WITHOUT relying
+    /// on order_map (which empties at window boundaries) — so we can credit the
+    /// fill in real time instead of pausing placement to reconcile.
+    #[serde(default)]
+    pub condition_id: String,
     pub up_shares: f64,
     pub down_shares: f64,
     pub up_cost: f64,
@@ -205,6 +212,7 @@ impl Default for Inventory {
         Self {
             ts_ms: now_ms(),
             market: String::new(),
+            condition_id: String::new(),
             up_shares: 0.0,
             down_shares: 0.0,
             up_cost: 0.0,
