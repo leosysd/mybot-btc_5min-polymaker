@@ -348,10 +348,27 @@ pub fn is_ws_timeout(err: &WsError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Per-test unique temp dir. now_ms() is NOT unique enough: parallel tests
+    // can hit the same millisecond, share a directory, and one test's
+    // remove_dir_all then deletes the other's directory mid-run (NotFound on
+    // write/read). Process id + an atomic counter guarantees no collision.
+    static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_test_dir(tag: &str) -> PathBuf {
+        let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "polymaker-rotate-test-{}-{}-{}",
+            std::process::id(),
+            tag,
+            seq
+        ))
+    }
 
     #[test]
     fn jsonl_rotation_moves_large_current_file_as_first_archive() {
-        let dir = std::env::temp_dir().join(format!("polymaker-rotate-test-{}", now_ms()));
+        let dir = unique_test_dir("first-archive");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("book.jsonl");
         std::fs::write(&path, "1234567890\n").unwrap();
@@ -368,7 +385,7 @@ mod tests {
 
     #[test]
     fn jsonl_rotation_shifts_and_respects_keep_count() {
-        let dir = std::env::temp_dir().join(format!("polymaker-rotate-test-{}", now_ms()));
+        let dir = unique_test_dir("keep-count");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("quotes.jsonl");
         std::fs::write(&path, "current\n").unwrap();
