@@ -1063,7 +1063,9 @@ mod tests {
 
         handle_market_frame(&cfg, &tx, &flat_frame(90.0), &inventory, &mut tox).expect("quote");
 
-        let quote = rx.try_recv().expect("secondary quote sized from filled main only");
+        let quote = rx
+            .try_recv()
+            .expect("secondary quote sized from filled main only");
         assert_eq!(quote.side, "Down");
         assert_eq!(quote.size, 5.0);
         assert!(rx.try_recv().is_err());

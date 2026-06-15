@@ -992,14 +992,25 @@ fn send_cancel(
             .into());
         }
         if ack.canceled {
-            // Genuinely cancelled by us: it did not fill. Drop tracking.
+            // Genuinely cancelled by us: it did not fill. KEEP the order_map entry
+            // as an echo guard (mark done) instead of removing it. Removing it
+            // orphaned any fill that lands AFTER the cancel (common under fast
+            // requote churn): such a late trade event would be classified
+            // "unknown" -> UnmatchedFill -> placement pause (the stutter). Marking
+            // done lets match_and_reduce_order recognise the late event as
+            // already-accounted (benign); a genuinely missed partial is still
+            // recovered by the periodic on-chain reconcile. The entry is pruned
+            // per window on market change. order_map is only used for fill
+            // matching, so this does NOT affect pending/cap accounting.
             heartbeat(
                 cfg,
                 "order-gateway",
                 format!("real cancel {exchange_order_id}"),
             )?;
             if let Some(order_map) = order_map {
-                order_map.lock().unwrap().remove(exchange_order_id);
+                if let Some(meta) = order_map.lock().unwrap().get_mut(exchange_order_id) {
+                    meta.done = true;
+                }
             }
         } else {
             // Gone but we did NOT cancel it => it filled, vanished, or the API no
@@ -1409,8 +1420,18 @@ fn handle_user_order(
     let Some(order_id) = first_str(value, &["id", "order_id"]) else {
         return Ok(());
     };
-    let Some(meta) = order_map.lock().unwrap().remove(order_id) else {
-        return Ok(());
+    // KEEP the order_map entry as an echo guard (mark done) instead of removing
+    // it, so a trade event that arrives AFTER this cancel is recognised as
+    // already-accounted rather than "unknown" (which pauses placement). Pruned
+    // per window on market change; order_map drives only fill matching, not the
+    // cap, so this does not change pending/cap accounting.
+    let meta = {
+        let mut map = order_map.lock().unwrap();
+        let Some(entry) = map.get_mut(order_id) else {
+            return Ok(());
+        };
+        entry.done = true;
+        entry.clone()
     };
     // Report the ACTUAL matched size for the cancel log. The old
     // `.max(meta.size)` inflated every partial cancel up to the full order
@@ -1751,6 +1772,42 @@ mod tests {
         assert!(matches!(
             match_and_reduce_order(&order_map, "never-seen", 5.0),
             FillMatch::Unknown
+        ));
+    }
+
+    #[test]
+    fn cancel_keeps_echo_guard_so_late_fill_is_benign_not_unknown() {
+        // 治本: a confirmed cancel must KEEP the order_map entry (marked done) as
+        // an echo guard instead of removing it. A fill that lands AFTER the cancel
+        // (fast requote churn) must then be recognised as already-accounted, NOT
+        // "unknown" — the unknown path is what spammed UnmatchedFill -> placement
+        // pause (the stutter). This simulates the keep-and-mark-done that the
+        // cancel paths now perform.
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
+        order_map.lock().unwrap().insert(
+            "ex-c".to_string(),
+            QuoteMeta {
+                quote_id: "q1".to_string(),
+                market: "m".to_string(),
+                condition_id: String::new(),
+                side: "Up".to_string(),
+                price: 0.5,
+                size: 5.0,
+                credited: false,
+                done: false,
+            },
+        );
+        // Cancel marks the entry done and keeps it (what send_cancel /
+        // handle_user_order now do).
+        if let Some(meta) = order_map.lock().unwrap().get_mut("ex-c") {
+            meta.done = true;
+        }
+        assert!(order_map.lock().unwrap().contains_key("ex-c"));
+        // A late fill for the cancelled order is benign (already accounted), NOT
+        // Unknown — so no UnmatchedFill, no placement pause.
+        assert!(matches!(
+            match_and_reduce_order(&order_map, "ex-c", 5.0),
+            FillMatch::AlreadyCredited
         ));
     }
 
