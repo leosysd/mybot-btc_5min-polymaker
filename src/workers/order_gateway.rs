@@ -1358,8 +1358,14 @@ fn handle_user_trade(
         });
 
     if let Some(makers) = value.get("maker_orders").and_then(Value::as_array) {
-        let mut matched_any_local = false;
-        let mut unknown_hint: Option<(String, f64, f64)> = None;
+        // Condition ids of the orders we currently hold = the live window. Used
+        // to window-guard a real-time credit of our own untracked fill.
+        let current_conditions: HashSet<String> =
+            known_condition_ids(order_map).into_iter().collect();
+        let event_condition =
+            first_str(value, &["market", "condition_id"]).map(ToString::to_string);
+        let mut handled_any = false;
+        let mut unmatched_hint: Option<(String, f64, f64)> = None;
         for maker in makers {
             let Some(order_id) = first_str(maker, &["order_id", "id"]) else {
                 continue;
@@ -1371,35 +1377,68 @@ fn handle_user_trade(
             let price = parse_f64_value(maker.get("price"))
                 .or_else(|| parse_f64_value(value.get("price")))
                 .unwrap_or(0.0);
-            if !order_map_contains(order_map, order_id) {
-                // Could be a counterparty's maker (skip), or OUR fill we lost
-                // track of. We can't credit it precisely without the order, but
-                // we must NOT silently drop it. Remember the first untracked
-                // maker; if we end up matching NONE of our own orders below, we
-                // force a reconcile for it (see after the loop).
-                if unknown_hint.is_none() {
-                    unknown_hint = Some((order_id.to_string(), price, size));
+
+            // Known order: credit via the order-map path (unchanged).
+            if order_map_contains(order_map, order_id) {
+                let key = format!("{trade_id}:{order_id}");
+                if !seen_trades.insert(key) {
+                    continue;
                 }
+                handled_any = true;
+                emit_user_fill(
+                    cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size,
+                )?;
+                continue;
+            }
+
+            // Unknown order id. Remember the first one as an ownership-independent
+            // fallback: if we end up accounting NOTHING from this trade, we still
+            // force a reconcile after the loop (so an own fill is never silently
+            // dropped, even if the owner field doesn't identify us).
+            if unmatched_hint.is_none() {
+                unmatched_hint = Some((order_id.to_string(), price, size));
+            }
+            // Other traders' makers are skipped. For OUR OWN fill that we lost
+            // track of — the placement race where the fill beats the order-map
+            // insert (POST returns, order is live and fills before we record its
+            // id) — credit it in REAL TIME from this event. This is the only
+            // source fast enough: the on-chain reconcile lags (Data API
+            // indexing), so relying on it lets `held` under-count and the side
+            // cap over-accumulate (observed real Up=74 vs cap 40).
+            if !maker_order_belongs_to_us(cfg, maker) {
                 continue;
             }
             let key = format!("{trade_id}:{order_id}");
             if !seen_trades.insert(key) {
                 continue;
             }
-            matched_any_local = true;
-            emit_user_fill(
-                cfg, inventory, order_map, gw_tx, ledger_tx, order_id, price, size,
-            )?;
+            let side = first_str(maker, &["outcome"])
+                .map(ToString::to_string)
+                .filter(|s| s == "Up" || s == "Down");
+            // Only credit when we can place the fill in the CURRENT window:
+            // its condition id is one we hold orders in (or we hold none yet —
+            // the first-order race). Otherwise fall back to a reconcile.
+            let same_window = side.is_some()
+                && match &event_condition {
+                    Some(c) => current_conditions.is_empty() || current_conditions.contains(c),
+                    None => current_conditions.is_empty(),
+                };
+            match (side, same_window) {
+                (Some(side), true) => {
+                    credit_owned_fill_direct(cfg, inventory, gw_tx, ledger_tx, &side, price, size)?;
+                    handled_any = true;
+                }
+                _ => {
+                    if unmatched_hint.is_none() {
+                        unmatched_hint = Some((order_id.to_string(), price, size));
+                    }
+                }
+            }
         }
-        // This trade is in OUR user feed, so one of its orders is ours. If we
-        // matched NONE of the makers to a tracked order, our maker fill is
-        // untracked. Silently dropping it (a refactor replaced this with a bare
-        // `continue`) under-counts `held`, so the side cap re-opens and the bot
-        // over-buys past the cap (observed: real 60 vs cap 40). Force ONE
-        // on-chain reconcile, which raises held to the true position AND pauses
-        // placement until it catches up — closing the cap breach.
-        if !matched_any_local {
-            if let Some((order_id, price, size)) = unknown_hint {
+        // Couldn't credit our own fill directly (no side / wrong window): force a
+        // reconcile so held still catches up rather than silently under-counting.
+        if !handled_any {
+            if let Some((order_id, price, size)) = unmatched_hint {
                 let key = format!("{trade_id}:unmatched");
                 if seen_trades.insert(key) {
                     emit_user_fill(
@@ -1430,6 +1469,75 @@ fn handle_user_trade(
 
 fn order_map_contains(order_map: &SharedOrderMap, order_id: &str) -> bool {
     order_map.lock().unwrap().contains_key(order_id)
+}
+
+/// True if a maker entry in a user-WS trade is OUR order. The user channel is
+/// authenticated with our api key, so our maker rows carry our `owner` (api key)
+/// or `maker_address` (funder). Lets us credit an own fill whose order id we
+/// have not recorded yet (placement race) without misattributing a counterparty's.
+fn maker_order_belongs_to_us(cfg: &Config, maker: &Value) -> bool {
+    let api_key = cfg.poly_api_key.trim();
+    if !api_key.is_empty()
+        && first_str(maker, &["owner", "api_key", "apiKey"])
+            .is_some_and(|o| o.eq_ignore_ascii_case(api_key))
+    {
+        return true;
+    }
+    let funder = cfg.poly_funder_address.trim();
+    !funder.is_empty()
+        && first_str(maker, &["maker_address", "makerAddress"])
+            .is_some_and(|a| a.eq_ignore_ascii_case(funder))
+}
+
+/// Credit an own fill straight into the shared inventory from the user-WS event,
+/// without an order-map match. Used when the fill beat the order-map insert
+/// (placement race). `held` becomes accurate immediately, so the side cap holds
+/// even though the chain reconcile lags. Credits only to the CURRENT market;
+/// resting/pending is reduced on that side via the gateway loop. Dedup is the
+/// caller's seen_trades(trade_id:order_id).
+fn credit_owned_fill_direct(
+    cfg: &Config,
+    inventory: &SharedInventory,
+    gw_tx: &GatewayTx,
+    ledger_tx: &LedgerTx,
+    side: &str,
+    price: f64,
+    size: f64,
+) -> AppResult<()> {
+    if size <= 0.001 {
+        return Ok(());
+    }
+    let market = {
+        let mut inv = inventory.lock().unwrap();
+        if inv.market.is_empty() {
+            return Ok(());
+        }
+        let m = inv.market.clone();
+        inv.add_fill(&m, side, price, size);
+        m
+    };
+    let fill = FillEvent {
+        quote_id: String::new(),
+        ts_ms: now_ms(),
+        market: market.clone(),
+        side: side.to_string(),
+        price,
+        size,
+        inventory_up: 0.0,
+        inventory_down: 0.0,
+        pnl_if_up: 0.0,
+        pnl_if_down: 0.0,
+        source: "polymarket_user_ws_owner".to_string(),
+    };
+    // Reduce the resting order on this side (recomputes pending); log + persist.
+    let _ = gw_tx.send(GatewayEvent::Fill(fill.clone()));
+    let _ = ledger_tx.send(LedgerEvent::Filled(fill));
+    heartbeat(
+        cfg,
+        "order-gateway",
+        format!("own untracked fill credited real-time {side} {size:.2}@{price:.3}"),
+    )?;
+    Ok(())
 }
 
 fn handle_user_order(
@@ -1958,6 +2066,72 @@ mod tests {
         assert!(
             ledger_rx.try_recv().is_err(),
             "replay of the same trade must be deduped"
+        );
+    }
+
+    #[test]
+    fn owned_untracked_fill_is_credited_realtime_not_dropped() {
+        // The real fix for over-accumulation: an OWN maker fill whose order id we
+        // never recorded (placement race) is credited straight into held from the
+        // event (owner + outcome), not silently dropped and not left to the
+        // (laggy) chain reconcile. held stays accurate -> the side cap holds.
+        let mut cfg = test_cfg();
+        cfg.poly_api_key = "our-key".to_string();
+        let inventory: SharedInventory = Arc::new(Mutex::new(Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            ..Default::default()
+        }));
+        // Empty order_map = the placement-race / first-order case (current
+        // window conditions unknown -> allowed).
+        let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
+        let (gw_tx, gw_rx) = std::sync::mpsc::channel();
+        let (ledger_tx, ledger_rx) = std::sync::mpsc::channel();
+        let mut seen = HashSet::new();
+        let event = serde_json::json!({
+            "id": "trade-race",
+            "event_type": "trade",
+            "market": "cond-1",
+            "maker_orders": [
+                {"order_id": "untracked-1", "owner": "our-key",
+                 "outcome": "Up", "matched_amount": "20", "price": "0.66"}
+            ]
+        });
+
+        handle_user_trade(
+            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+        )
+        .unwrap();
+
+        {
+            let inv = inventory.lock().unwrap();
+            assert_eq!(inv.up_shares, 20.0, "own fill credited in real time");
+            assert!(
+                (inv.up_cost - 20.0 * 0.66).abs() < 1e-9,
+                "cost at the real fill price"
+            );
+        }
+        assert!(matches!(
+            ledger_rx.try_recv().expect("ledger fill"),
+            LedgerEvent::Filled(f) if (f.size - 20.0).abs() < 1e-9
+        ));
+        assert!(matches!(
+            gw_rx.try_recv().expect("gateway fill to shrink resting"),
+            GatewayEvent::Fill(_)
+        ));
+        assert!(
+            ledger_rx.try_recv().is_err(),
+            "credited directly: must NOT also force a reconcile"
+        );
+
+        // Replay of the same trade must not double-credit.
+        handle_user_trade(
+            &cfg, &inventory, &order_map, &gw_tx, &ledger_tx, &mut seen, &event,
+        )
+        .unwrap();
+        assert_eq!(
+            inventory.lock().unwrap().up_shares,
+            20.0,
+            "replay must be deduped, no double credit"
         );
     }
 
