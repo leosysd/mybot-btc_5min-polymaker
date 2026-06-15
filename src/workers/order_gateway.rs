@@ -257,6 +257,11 @@ pub fn run(
                         // thread is the sole writer of pending/fills (synchronously),
                         // held+pending is always current here — this is what stops the
                         // over-accumulation runaway.
+                        let replacing_size = resting
+                            .get(&quote.side)
+                            .filter(|order| order.market == quote.market)
+                            .map(|order| order.size)
+                            .unwrap_or(0.0);
                         let (held, pending, opp_avg) = {
                             let inv = inventory.lock().unwrap();
                             (
@@ -266,7 +271,8 @@ pub fn run(
                             )
                         };
                         // Counts OUTSTANDING orders, so churn/lag cannot exceed the cap.
-                        let side_cap_room = cfg.max_side_inventory() - held - pending;
+                        let side_cap_room =
+                            cfg.max_side_inventory() - held - (pending - replacing_size).max(0.0);
                         let room = side_cap_room.floor();
                         // If only partial cap room remains, place the leftover
                         // as long as it satisfies the exchange minimum size.
@@ -295,19 +301,50 @@ pub fn run(
                             )?;
                         }
 
-                        let incremental_size = if resting.contains_key(&quote.side) {
-                            0.0
-                        } else {
-                            quote.size
-                        };
-                        let unpaired_allowed = {
+                        let asym_room = {
                             let inv = inventory.lock().unwrap();
-                            unpaired_limit_allows_quote(
+                            asymmetric_balance_room_after_replace(
                                 &cfg,
                                 &inv,
                                 &quote.market,
                                 &quote.side,
-                                incremental_size,
+                                replacing_size,
+                            )
+                            .floor()
+                        };
+                        if asym_room + 1e-9 < min_order_size {
+                            heartbeat(
+                                &cfg,
+                                "order-gateway",
+                                format!(
+                                    "asymmetric balance blocks {} size={:.0} ratio={:.2}",
+                                    quote.side, quote.size, cfg.balance_secondary_ratio
+                                ),
+                            )?;
+                            continue;
+                        }
+                        if asym_room + 1e-9 < quote.size {
+                            let old_size = quote.size;
+                            quote.size = asym_room.floor().max(min_order_size);
+                            heartbeat(
+                                &cfg,
+                                "order-gateway",
+                                format!(
+                                    "asymmetric balance shrinks {} size {:.0}->{:.0} ratio={:.2}",
+                                    quote.side, old_size, quote.size, cfg.balance_secondary_ratio
+                                ),
+                            )?;
+                        }
+
+                        let unpaired_allowed = {
+                            let inv = inventory.lock().unwrap();
+                            unpaired_limit_allows_quote_after_replace(
+                                &cfg,
+                                &inv,
+                                &quote.market,
+                                &quote.side,
+                                quote.size,
+                                replacing_size,
                             )
                         };
                         if !unpaired_allowed {
@@ -510,26 +547,57 @@ fn should_keep_resting(cfg: &Config, old: Option<&RestingOrder>, quote: &QuoteIn
     (old.price - quote.price).abs() < threshold && (old.size - quote.size).abs() < 0.001
 }
 
-fn unpaired_limit_allows_quote(
+fn unpaired_limit_allows_quote_after_replace(
     cfg: &Config,
     inv: &Inventory,
     market: &str,
     side: &str,
-    incremental_size: f64,
+    quote_size: f64,
+    replacing_size: f64,
 ) -> bool {
     let limit = cfg.max_unpaired_shares;
-    if limit <= 0.0 || incremental_size <= 0.0 {
+    if limit <= 0.0 || quote_size <= 0.0 {
         return true;
     }
-    let up = held_shares(inv, market, "Up") + pending_shares(inv, market, "Up");
-    let down = held_shares(inv, market, "Down") + pending_shares(inv, market, "Down");
-    let current = up - down;
-    let projected = match side {
-        "Up" => current + incremental_size,
-        "Down" => current - incremental_size,
-        _ => current,
+    let current_up = held_shares(inv, market, "Up") + pending_shares(inv, market, "Up");
+    let current_down = held_shares(inv, market, "Down") + pending_shares(inv, market, "Down");
+    let current = current_up - current_down;
+    let (projected_up, projected_down) = match side {
+        "Up" => (
+            (current_up - replacing_size).max(0.0) + quote_size,
+            current_down,
+        ),
+        "Down" => (
+            current_up,
+            (current_down - replacing_size).max(0.0) + quote_size,
+        ),
+        _ => (current_up, current_down),
     };
+    let projected = projected_up - projected_down;
     projected.abs() <= limit + 1e-9 || projected.abs() < current.abs()
+}
+
+fn asymmetric_balance_room_after_replace(
+    cfg: &Config,
+    inv: &Inventory,
+    market: &str,
+    side: &str,
+    replacing_size: f64,
+) -> f64 {
+    if !cfg.enable_asymmetric_balance || cfg.balance_secondary_ratio >= 1.0 {
+        return f64::INFINITY;
+    }
+    let current_up = held_shares(inv, market, "Up") + pending_shares(inv, market, "Up");
+    let current_down = held_shares(inv, market, "Down") + pending_shares(inv, market, "Down");
+    let (same, other) = match side {
+        "Up" => ((current_up - replacing_size).max(0.0), current_down),
+        "Down" => ((current_down - replacing_size).max(0.0), current_up),
+        _ => return f64::INFINITY,
+    };
+    if same >= other {
+        return f64::INFINITY;
+    }
+    (other * cfg.balance_secondary_ratio - same).max(0.0)
 }
 
 fn load_active_orders(cfg: &Config) -> AppResult<HashMap<String, RestingOrder>> {
@@ -2026,12 +2094,84 @@ mod tests {
         };
 
         assert!(
-            !unpaired_limit_allows_quote(&cfg, &inv, "btc-updown-5m-test", "Up", 5.0),
+            !unpaired_limit_allows_quote_after_replace(
+                &cfg,
+                &inv,
+                "btc-updown-5m-test",
+                "Up",
+                5.0,
+                0.0,
+            ),
             "adding to the already-ahead side must be blocked"
         );
         assert!(
-            unpaired_limit_allows_quote(&cfg, &inv, "btc-updown-5m-test", "Down", 5.0),
+            unpaired_limit_allows_quote_after_replace(
+                &cfg,
+                &inv,
+                "btc-updown-5m-test",
+                "Down",
+                5.0,
+                0.0,
+            ),
             "adding to the lagging side reduces imbalance and must be allowed"
+        );
+    }
+
+    #[test]
+    fn unpaired_cap_counts_replacement_quote_size() {
+        let mut cfg = test_cfg();
+        cfg.max_unpaired_shares = 40.0;
+        let inv = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            down_shares: 40.0,
+            pending_down: 20.0,
+            ..Default::default()
+        };
+
+        assert!(
+            !unpaired_limit_allows_quote_after_replace(
+                &cfg,
+                &inv,
+                "btc-updown-5m-test",
+                "Down",
+                20.0,
+                20.0,
+            ),
+            "replacing an existing Down quote still leaves 60 Down exposure and must be blocked"
+        );
+        assert!(
+            unpaired_limit_allows_quote_after_replace(
+                &cfg,
+                &inv,
+                "btc-updown-5m-test",
+                "Up",
+                20.0,
+                0.0,
+            ),
+            "opposite-side quote reduces the 60-share imbalance"
+        );
+    }
+
+    #[test]
+    fn asymmetric_balance_limits_lagging_side_to_ratio() {
+        let mut cfg = test_cfg();
+        cfg.enable_asymmetric_balance = true;
+        cfg.balance_secondary_ratio = 0.8;
+        let inv = Inventory {
+            market: "btc-updown-5m-test".to_string(),
+            up_shares: 20.0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            asymmetric_balance_room_after_replace(&cfg, &inv, "btc-updown-5m-test", "Down", 0.0),
+            16.0,
+            "with Up 20 as main side, Down can only fill up to 16"
+        );
+        assert!(
+            asymmetric_balance_room_after_replace(&cfg, &inv, "btc-updown-5m-test", "Up", 0.0)
+                .is_infinite(),
+            "the current main side is not limited by the 80% secondary cap"
         );
     }
 }

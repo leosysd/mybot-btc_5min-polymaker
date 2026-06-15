@@ -38,6 +38,8 @@ pub struct Config {
     pub inventory_skew: f64,
     pub inventory_mult: f64,
     pub max_unpaired_shares: f64,
+    pub enable_asymmetric_balance: bool,
+    pub balance_secondary_ratio: f64,
     pub min_bid: f64,
     pub max_bid: f64,
     pub dry_run: bool,
@@ -185,6 +187,8 @@ impl Config {
             inventory_skew: get_f64(&file_env, "INVENTORY_SKEW", 0.03),
             inventory_mult: get_f64(&file_env, "INVENTORY_MULT", 2.0),
             max_unpaired_shares: get_f64(&file_env, "MAX_UNPAIRED_SHARES", 19.0),
+            enable_asymmetric_balance: get_bool(&file_env, "ENABLE_ASYMMETRIC_BALANCE", false),
+            balance_secondary_ratio: get_f64(&file_env, "BALANCE_SECONDARY_RATIO", 0.8),
             min_bid: get_f64(&file_env, "MIN_BID", 0.05),
             max_bid: get_f64(&file_env, "MAX_BID", 0.62),
             dry_run: get_bool(&file_env, "DRY_RUN", true),
@@ -290,6 +294,12 @@ impl Config {
         }
         if self.max_unpaired_shares < 0.0 || !self.max_unpaired_shares.is_finite() {
             return Err("MAX_UNPAIRED_SHARES must be finite and non-negative".into());
+        }
+        if self.balance_secondary_ratio <= 0.0
+            || self.balance_secondary_ratio > 1.0
+            || !self.balance_secondary_ratio.is_finite()
+        {
+            return Err("BALANCE_SECONDARY_RATIO must be finite and in (0, 1]".into());
         }
         if self.tick_size <= 0.0 || self.tick_size > 0.1 {
             return Err("TICK_SIZE must be in (0, 0.1]".into());

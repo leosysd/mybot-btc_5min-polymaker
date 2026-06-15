@@ -477,6 +477,13 @@ MAX_UNPAIRED_SHARES=19
 最大未配平差额，按 `abs((Up已成交+pending) - (Down已成交+pending))` 计算。达到上限后，机器人不再给领先的一边加仓，只允许继续挂落后的一边来缩小差额。`0` 表示关闭该限制。
 
 ```text
+ENABLE_ASYMMETRIC_BALANCE=1
+BALANCE_SECONDARY_RATIO=0.8
+```
+
+非对称补仓。先成交/当前份额更多的一边视为主仓，另一边是补仓边；`0.8` 表示主仓 10 份时补仓边最多 8 份。它不使用 v2 判断谁是优势方，也不会放宽 `MAX_UNPAIRED_SHARES`、单边库存、总库存和锁利限制。默认关闭。
+
+```text
 ENABLE_DIRECTION_MODEL=0
 DIRECTION_LIVE_WEIGHT=0.25
 ```
@@ -555,10 +562,11 @@ LIVE_ORDER_NOTIONAL_CAP=5
 7. 开盘静默期 `QUOTE_WARMUP_SECS`（默认 25 秒）：窗口开始后的前 N 秒完全不报价。开盘时 fair≈0.5 是噪声、盘口宽、波动率估计未热，头几秒来吃单的几乎全是已经看到 BTC 在动的知情流。
 8. 新模式不做中途卖出；`MAX_UNPAIRED_SHARES` 会限制单边差额，超过后只允许挂落后的一边。
 9. `VALUE_MIN_FAIR` 用来过滤极低胜率的一边；默认 0.05，避免买几乎归零的深度劣势方。
-10. 单边库存仍受 `QUOTE_SIZE * INVENTORY_MULT` 限制，总库存仍受 `MAX_TOTAL_INVENTORY` 和 `MAX_LOSS` 限制。
-11. 如果同时持有 Up/Down，网关仍保留成本锁：补成一对时不会允许 `Up成本 + Down成本 > 1 - MIN_LOCK_EDGE`。
-12. 剩余 `ENDGAME_PULL_SECS` 秒进入 Pull，不再发新报价，等已有挂单过期/撤掉。
-13. 报价不能吃单，必须低于当前 ask 至少 `POST_ONLY_MARGIN_TICKS` 个 tick。
+10. 如果启用 `ENABLE_ASYMMETRIC_BALANCE=1`，补仓边最多做到主仓的 `BALANCE_SECONDARY_RATIO`；例如 `0.8` 就是 10:8。主仓由实际库存决定，不由 v2 方向判断决定。
+11. 单边库存仍受 `QUOTE_SIZE * INVENTORY_MULT` 限制，总库存仍受 `MAX_TOTAL_INVENTORY` 和 `MAX_LOSS` 限制。
+12. 如果同时持有 Up/Down，网关仍保留成本锁：补成一对时不会允许 `Up成本 + Down成本 > 1 - MIN_LOCK_EDGE`。
+13. 剩余 `ENDGAME_PULL_SECS` 秒进入 Pull，不再发新报价，等已有挂单过期/撤掉。
+14. 报价不能吃单，必须低于当前 ask 至少 `POST_ONLY_MARGIN_TICKS` 个 tick。
 
 ## 当前限制
 
