@@ -1358,6 +1358,34 @@ fn handle_user_trade(
         });
 
     if let Some(makers) = value.get("maker_orders").and_then(Value::as_array) {
+        // TEMP DIAGNOSTIC (remove after capture): learn the real maker/event field
+        // shape so we can credit own untracked fills correctly. Logs field NAMES
+        // and match booleans only — NOT order ids, wallets, or the api key value.
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static DIAG: AtomicU64 = AtomicU64::new(0);
+            if DIAG.fetch_add(1, Ordering::Relaxed) < 12 {
+                let top_keys: Vec<String> = value
+                    .as_object()
+                    .map(|o| o.keys().cloned().collect())
+                    .unwrap_or_default();
+                for m in makers {
+                    let mkeys: Vec<String> = m
+                        .as_object()
+                        .map(|o| o.keys().cloned().collect())
+                        .unwrap_or_default();
+                    let oid = first_str(m, &["order_id", "id"]).unwrap_or("");
+                    eprintln!(
+                        "[DIAG_MAKER] maker_keys={:?} outcome={:?} owner_matches={} in_map={} top_keys={:?}",
+                        mkeys,
+                        first_str(m, &["outcome"]),
+                        maker_order_belongs_to_us(cfg, m),
+                        order_map_contains(order_map, oid),
+                        top_keys,
+                    );
+                }
+            }
+        }
         // Condition ids of the orders we currently hold = the live window. Used
         // to window-guard a real-time credit of our own untracked fill.
         let current_conditions: HashSet<String> =
