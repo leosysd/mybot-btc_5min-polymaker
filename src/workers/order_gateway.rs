@@ -1358,40 +1358,47 @@ fn handle_user_trade(
         });
 
     if let Some(makers) = value.get("maker_orders").and_then(Value::as_array) {
-        // TEMP DIAGNOSTIC (remove after capture): learn the real maker/event field
-        // shape so we can credit own untracked fills correctly. Logs field NAMES
-        // and match booleans only — NOT order ids, wallets, or the api key value.
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static DIAG: AtomicU64 = AtomicU64::new(0);
-            if DIAG.fetch_add(1, Ordering::Relaxed) < 12 {
-                let top_keys: Vec<String> = value
-                    .as_object()
-                    .map(|o| o.keys().cloned().collect())
-                    .unwrap_or_default();
-                for m in makers {
-                    let mkeys: Vec<String> = m
-                        .as_object()
-                        .map(|o| o.keys().cloned().collect())
-                        .unwrap_or_default();
-                    let oid = first_str(m, &["order_id", "id"]).unwrap_or("");
-                    eprintln!(
-                        "[DIAG_MAKER] maker_keys={:?} outcome={:?} owner_matches={} in_map={} top_keys={:?}",
-                        mkeys,
-                        first_str(m, &["outcome"]),
-                        maker_order_belongs_to_us(cfg, m),
-                        order_map_contains(order_map, oid),
-                        top_keys,
-                    );
-                }
-            }
-        }
         // Condition ids of the orders we currently hold = the live window. Used
         // to window-guard a real-time credit of our own untracked fill.
         let current_conditions: HashSet<String> =
             known_condition_ids(order_map).into_iter().collect();
         let event_condition =
             first_str(value, &["market", "condition_id"]).map(ToString::to_string);
+        // TEMP DIAGNOSTIC (remove after capture): per-trade, count OUR makers and
+        // how many are tracked in order_map. Decides the under-count cause:
+        //  - ours_not_in_map > 0 in busy windows => placement race (handler fix).
+        //  - ours far below chain fills for the window => WS delivery gap (need a
+        //    placement-quantity cap instead). Logs counts only, no ids/wallets.
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static DIAG2: AtomicU64 = AtomicU64::new(0);
+            if DIAG2.fetch_add(1, Ordering::Relaxed) < 600 {
+                let mut ours = 0u32;
+                let mut ours_in_map = 0u32;
+                for m in makers {
+                    if maker_order_belongs_to_us(cfg, m) {
+                        ours += 1;
+                        let oid = first_str(m, &["order_id", "id"]).unwrap_or("");
+                        if order_map_contains(order_map, oid) {
+                            ours_in_map += 1;
+                        }
+                    }
+                }
+                eprintln!(
+                    "[DIAG2] evt_market={:?} makers={} ours={} ours_in_map={} ours_not_in_map={} cur_conds={} evt_cond_in_cur={}",
+                    event_condition,
+                    makers.len(),
+                    ours,
+                    ours_in_map,
+                    ours - ours_in_map,
+                    current_conditions.len(),
+                    event_condition
+                        .as_deref()
+                        .map(|c| current_conditions.contains(c))
+                        .unwrap_or(false),
+                );
+            }
+        }
         let mut handled_any = false;
         let mut unmatched_hint: Option<(String, f64, f64)> = None;
         for maker in makers {
