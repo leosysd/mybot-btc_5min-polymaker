@@ -1568,9 +1568,17 @@ enum FillMatch {
 }
 
 /// Look up + reduce an order_map entry for a user-WS fill, ATOMICALLY under one
-/// lock. Checking the `credited` flag and reducing the size in the same critical
-/// section closes the cross-thread race where cancel/reconcile handoff could
-/// flip `credited` between a separate check and a separate reduce, double-counting.
+/// lock. The guard is the REMAINING uncredited size, not the done/credited flags:
+/// an order that was cancelled (entry kept by the echo-guard change) still has
+/// size > 0, so a fill that lands AFTER the cancel is CREDITED against that
+/// remainder — this is what keeps `held` accurate in real time and stops the
+/// cap from re-opening (the 64-vs-40 over-accumulation). Double-counting is
+/// prevented two ways, both safe here: the remaining-size decrement happens in
+/// this same critical section (an order can never fill beyond its size), and the
+/// caller dedups whole trades via seen_trades(trade_id:order_id). A fully
+/// accounted order (filled, or handed to on-chain reconcile) has size 0 and is
+/// recognised as a benign echo. Reconcile SETS held to the chain value
+/// (idempotent), so real-time crediting never double-counts against it.
 fn match_and_reduce_order(
     order_map: &SharedOrderMap,
     order_id: &str,
@@ -1580,10 +1588,10 @@ fn match_and_reduce_order(
     let Some(meta0) = map.get(order_id) else {
         return FillMatch::Unknown;
     };
-    if meta0.credited || meta0.done {
-        // Fully accounted already — this is a trade-status echo or a WS-reconnect
-        // replay, NOT a missed fill. Benign: don't re-credit / reconcile / pause.
-        // Keep the entry as the echo guard (pruned per window on market change).
+    if meta0.size <= 0.001 {
+        // No uncredited size left — fully filled, or handed to reconcile
+        // (size zeroed). A later trade-status echo / WS replay is benign: don't
+        // re-credit / reconcile / pause. Entry kept (pruned per window).
         return FillMatch::AlreadyCredited;
     }
     let meta = meta0.clone();
@@ -1776,13 +1784,13 @@ mod tests {
     }
 
     #[test]
-    fn cancel_keeps_echo_guard_so_late_fill_is_benign_not_unknown() {
-        // 治本: a confirmed cancel must KEEP the order_map entry (marked done) as
-        // an echo guard instead of removing it. A fill that lands AFTER the cancel
-        // (fast requote churn) must then be recognised as already-accounted, NOT
-        // "unknown" — the unknown path is what spammed UnmatchedFill -> placement
-        // pause (the stutter). This simulates the keep-and-mark-done that the
-        // cancel paths now perform.
+    fn fill_after_cancel_is_credited_not_lost_and_not_unknown() {
+        // 彻底修复 over-accumulation: a confirmed cancel KEEPS the order_map entry
+        // (echo guard) with its size intact. A fill that lands AFTER the cancel
+        // (fast requote churn) must be CREDITED against the remaining size — this
+        // is what keeps `held` accurate so the cap cannot re-open and over-buy
+        // (the 64-vs-40 breach). It must also NOT be "unknown" (which would pause
+        // placement — the stutter).
         let order_map: SharedOrderMap = Arc::new(Mutex::new(HashMap::new()));
         order_map.lock().unwrap().insert(
             "ex-c".to_string(),
@@ -1797,14 +1805,25 @@ mod tests {
                 done: false,
             },
         );
-        // Cancel marks the entry done and keeps it (what send_cancel /
-        // handle_user_order now do).
+        // Cancel marks the entry done but KEEPS it with size intact (what
+        // send_cancel / handle_user_order now do).
         if let Some(meta) = order_map.lock().unwrap().get_mut("ex-c") {
             meta.done = true;
         }
-        assert!(order_map.lock().unwrap().contains_key("ex-c"));
-        // A late fill for the cancelled order is benign (already accounted), NOT
-        // Unknown — so no UnmatchedFill, no placement pause.
+        // A fill that lands after the cancel is CREDITED (Matched), not skipped
+        // and not "unknown": held stays accurate -> cap holds -> no over-buy.
+        assert!(matches!(
+            match_and_reduce_order(&order_map, "ex-c", 3.0),
+            FillMatch::Matched(_)
+        ));
+        // Remaining size shrank by the credited amount.
+        assert!((order_map.lock().unwrap().get("ex-c").unwrap().size - 2.0).abs() < 1e-9);
+        // Crediting the rest fully consumes it.
+        assert!(matches!(
+            match_and_reduce_order(&order_map, "ex-c", 2.0),
+            FillMatch::Matched(_)
+        ));
+        // Now fully accounted (size 0) -> a further echo is benign, not a re-credit.
         assert!(matches!(
             match_and_reduce_order(&order_map, "ex-c", 5.0),
             FillMatch::AlreadyCredited
