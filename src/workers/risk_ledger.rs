@@ -91,7 +91,18 @@ pub fn run(
                             reconcile_gate.store(false, Ordering::Relaxed);
                             let corrected = {
                                 let mut inv = inventory.lock().unwrap();
-                                reconcile_inventory_with_chain(&cfg, &mut inv, &snap)?
+                                // Re-check the market UNDER THE LOCK: the 5-min
+                                // window can roll during the (lockless, multi-second)
+                                // fetch() above. Applying an old window's snapshot to
+                                // the new window's freshly-reset inventory injects
+                                // phantom shares that the raise-only reconcile can
+                                // never undo until the next window — corrupting the
+                                // cost-basis lock, PnL and the kill switch.
+                                if inv.market == current_market {
+                                    reconcile_inventory_with_chain(&cfg, &mut inv, &snap)?
+                                } else {
+                                    false
+                                }
                             };
                             if corrected {
                                 let inv = inventory.lock().unwrap();

@@ -987,9 +987,14 @@ fn apply_fill_to_resting_map(
     resting: &mut HashMap<String, RestingOrder>,
     fill: &FillEvent,
 ) -> bool {
+    // A fill may only reduce a resting order in the SAME market. The quote_id
+    // branch previously skipped this check, so a late fill from the previous
+    // window could shrink the current window's resting order -> pending under-
+    // counts -> the side cap re-opens -> over-accumulation.
     let key = resting.iter().find_map(|(side, order)| {
-        ((!fill.quote_id.is_empty() && order.quote_id == fill.quote_id)
-            || (fill.quote_id.is_empty() && order.market == fill.market && order.side == fill.side))
+        (order.market == fill.market
+            && ((!fill.quote_id.is_empty() && order.quote_id == fill.quote_id)
+                || (fill.quote_id.is_empty() && order.side == fill.side)))
             .then(|| side.clone())
     });
     let Some(key) = key else {
@@ -1333,10 +1338,12 @@ fn handle_user_order(
     let Some(meta) = order_map.lock().unwrap().remove(order_id) else {
         return Ok(());
     };
+    // Report the ACTUAL matched size for the cancel log. The old
+    // `.max(meta.size)` inflated every partial cancel up to the full order
+    // size, overstating fills in the audit trail. Clamp to the order size.
     let size = parse_f64_value(value.get("size_matched"))
-        .or_else(|| parse_f64_value(value.get("size")))
-        .unwrap_or(meta.size)
-        .max(meta.size);
+        .unwrap_or(0.0)
+        .clamp(0.0, meta.size);
     let cancel = OrderCancelled {
         ts_ms: now_ms(),
         quote_id: meta.quote_id,
@@ -1856,6 +1863,41 @@ mod tests {
         ));
 
         assert!(resting_orders.is_empty());
+    }
+
+    #[test]
+    fn fill_from_other_market_does_not_shrink_current_resting_order() {
+        // A late fill from the PREVIOUS window (same quote_id reuse, or empty
+        // quote_id + same side) must NOT reduce the current window's resting
+        // order — that would under-count pending and re-open the side cap.
+        let mut resting_orders =
+            HashMap::from([("Up".to_string(), resting_order("Up", "q1", 5.0))]);
+
+        // Same quote_id but a different market: must be ignored.
+        let mut stale = fill("Up", "q1", 5.0);
+        stale.market = "btc-updown-5m-OLDWINDOW".to_string();
+        assert!(!apply_fill_to_resting_map(&mut resting_orders, &stale));
+        assert_eq!(
+            resting_orders.get("Up").unwrap().size,
+            5.0,
+            "stale-market fill must not shrink the live order"
+        );
+
+        // Empty quote_id + same side but a different market: also ignored.
+        let mut stale_empty = fill("Up", "", 5.0);
+        stale_empty.market = "btc-updown-5m-OLDWINDOW".to_string();
+        assert!(!apply_fill_to_resting_map(
+            &mut resting_orders,
+            &stale_empty
+        ));
+        assert_eq!(resting_orders.get("Up").unwrap().size, 5.0);
+
+        // Sanity: a same-market fill still applies.
+        assert!(apply_fill_to_resting_map(
+            &mut resting_orders,
+            &fill("Up", "q1", 2.0)
+        ));
+        assert_eq!(resting_orders.get("Up").unwrap().size, 3.0);
     }
 
     #[test]
