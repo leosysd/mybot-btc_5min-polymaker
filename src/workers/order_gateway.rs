@@ -25,7 +25,8 @@ use tungstenite::{connect, Message};
 
 use super::collector::parse_f64_value;
 use super::state::{
-    held_shares, is_ws_timeout, opposite_avg_cost, pending_shares, recompute_pending_from_resting,
+    committed_shares, held_shares, is_ws_timeout, opposite_avg_cost, pending_shares,
+    recompute_pending_from_resting,
     reset_inventory_for_market, sleep_ms, stopping, tune_ws_socket, GatewayEvent, GatewayRx,
     GatewayTx, LedgerEvent, LedgerTx, QuoteMeta, QuoteRx, ReconcileGate, RestingOrder,
     SharedInventory, SharedOrderMap, StopFlag,
@@ -268,17 +269,24 @@ pub fn run(
                             .filter(|order| order.market == quote.market)
                             .map(|order| order.size)
                             .unwrap_or(0.0);
-                        let (held, pending, opp_avg) = {
+                        let (held, pending, committed, opp_avg) = {
                             let inv = inventory.lock().unwrap();
                             (
                                 held_shares(&inv, &quote.market, &quote.side),
                                 pending_shares(&inv, &quote.market, &quote.side),
+                                committed_shares(&inv, &quote.market, &quote.side),
                                 opposite_avg_cost(&inv, &quote.market, &quote.side),
                             )
                         };
-                        // Counts OUTSTANDING orders, so churn/lag cannot exceed the cap.
+                        // Side cap on COMMITTED (POSTed minus cleanly-cancelled),
+                        // NOT held+pending. committed never under-counts on a missed
+                        // fill (a filled order's cancel is a noop, so its size stays
+                        // committed), so the cap holds even when fill tracking fails
+                        // — the repeated cause of the 4-5x over-accumulation.
+                        // `replacing_size` frees the order being requoted this cycle
+                        // (it will be cleanly cancelled just below before we place).
                         let side_cap_room =
-                            cfg.max_side_inventory() - held - (pending - replacing_size).max(0.0);
+                            cfg.max_side_inventory() - (committed - replacing_size).max(0.0);
                         let room = side_cap_room.floor();
                         // If only partial cap room remains, place the leftover
                         // as long as it satisfies the exchange minimum size.
@@ -751,11 +759,14 @@ fn accept_resting_order(
     resting.insert(quote.side.clone(), order);
     persist_active_orders_if_real(cfg, real_orders, resting)?;
     // The order is LIVE now: reflect it in the shared inventory's pending under
-    // the lock BEFORE making any further decision. This is the synchronous
-    // state update that makes the cap reliable.
+    // the lock BEFORE making any further decision. Also add it to `committed`
+    // (the fill-independent side-cap basis): once POSTed, its size occupies cap
+    // room until we CONFIRM a clean cancel — so a fill we fail to credit can no
+    // longer re-open room and over-accumulate.
     {
         let mut inv = inventory.lock().unwrap();
         recompute_pending_from_resting(&mut inv, resting);
+        inv.add_committed(&quote.market, &quote.side, quote.size);
     }
     // Tell risk for jsonl logging + kill switch + inventory.json persistence.
     let _ = ledger_tx.send(LedgerEvent::Accepted(accepted));
@@ -812,11 +823,15 @@ fn cancel_resting_side(
     // Returns false so a requote skips placing a second order on this side.
     match send_cancel(cfg, real_orders, order_map, &order, ledger_tx, reason) {
         Ok(CancelOutcome::Cancelled) => {
-            // It did not fill — just release pending.
+            // Confirmed clean cancel: the order was still on the book, so it did
+            // NOT fill. Release pending AND free its committed cap room (this is
+            // the ONLY place committed is decremented — a fill makes the cancel a
+            // noop -> GoneUnverified, so a filled order's size stays committed).
             resting.remove(side);
             persist_active_orders_if_real(cfg, real_orders, resting)?;
             let mut inv = inventory.lock().unwrap();
             recompute_pending_from_resting(&mut inv, resting);
+            inv.sub_committed(&order.market, &order.side, order.size);
             Ok(true)
         }
         Ok(CancelOutcome::GoneUnverified) => handle_gone_unverified_cancel(
@@ -2149,6 +2164,38 @@ mod tests {
             20.0,
             "replay must be deduped, no double credit"
         );
+    }
+
+    #[test]
+    fn committed_cap_holds_even_when_fill_is_never_credited() {
+        // The robust over-accumulation guard: the side cap is on `committed`
+        // (POSTed minus cleanly-cancelled), not held+pending. So even if a fill
+        // is NEVER credited to held (the repeated production failure), committed
+        // still occupies the cap room and blocks further buying.
+        let mut cfg = test_cfg();
+        cfg.quote_size = 20.0;
+        cfg.inventory_mult = 1.0; // cap = 20
+        let mut inv = Inventory {
+            market: "m".to_string(),
+            ..Default::default()
+        };
+        // POST a 20-share Up order -> committed += 20.
+        inv.add_committed("m", "Up", 20.0);
+        // The fill comes back but is NOT credited (held stays 0 — the bug).
+        assert_eq!(inv.up_shares, 0.0);
+        assert_eq!(committed_shares(&inv, "m", "Up"), 20.0);
+        // Side-cap room uses committed, so it is already full -> no more Up.
+        let room = cfg.max_side_inventory() - committed_shares(&inv, "m", "Up");
+        assert!(
+            room < 1.0,
+            "committed cap must block further Up even though held=0 (fill uncredited)"
+        );
+        // Only a CONFIRMED clean cancel frees the room.
+        inv.sub_committed("m", "Up", 20.0);
+        let room2 = cfg.max_side_inventory() - committed_shares(&inv, "m", "Up");
+        assert!(room2 >= 20.0 - 1e-9, "a clean cancel reopens the cap room");
+        // Market guard: committed for a different market reads 0.
+        assert_eq!(committed_shares(&inv, "other", "Up"), 0.0);
     }
 
     #[test]

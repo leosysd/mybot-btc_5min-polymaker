@@ -226,6 +226,19 @@ pub fn pending_shares(inv: &Inventory, market: &str, side: &str) -> f64 {
     }
 }
 
+/// Committed (POSTed minus cleanly-cancelled) shares on `side` for `market`.
+/// The side-cap basis — independent of whether fills get reported/credited.
+pub fn committed_shares(inv: &Inventory, market: &str, side: &str) -> f64 {
+    if inv.market != market {
+        return 0.0;
+    }
+    match side {
+        "Up" => inv.committed_up,
+        "Down" => inv.committed_down,
+        _ => 0.0,
+    }
+}
+
 /// Average filled price of the side OPPOSITE to `side`, or None if no opposite
 /// inventory. Used by the gateway's cost-basis lock.
 pub fn opposite_avg_cost(inv: &Inventory, market: &str, side: &str) -> Option<f64> {

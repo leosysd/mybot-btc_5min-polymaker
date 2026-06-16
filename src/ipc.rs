@@ -205,6 +205,17 @@ pub struct Inventory {
     pub pending_up: f64,
     #[serde(default)]
     pub pending_down: f64,
+    /// "Committed" shares per side = total POSTed this window MINUS what we
+    /// confirmed-cleanly-cancelled (cancel ack says it was still on the book, so
+    /// it did NOT fill). This is the SIDE-CAP basis. Unlike held+pending it does
+    /// NOT depend on fills being reported/credited: a fill makes the order's
+    /// cancel a noop (not a clean cancel) so its size is never subtracted and
+    /// stays committed. So the cap holds even when fill tracking misses — the
+    /// repeated cause of the over-accumulation. Reset per window.
+    #[serde(default)]
+    pub committed_up: f64,
+    #[serde(default)]
+    pub committed_down: f64,
 }
 
 impl Default for Inventory {
@@ -219,6 +230,8 @@ impl Default for Inventory {
             down_cost: 0.0,
             pending_up: 0.0,
             pending_down: 0.0,
+            committed_up: 0.0,
+            committed_down: 0.0,
         }
     }
 }
@@ -241,6 +254,34 @@ impl Inventory {
                 self.down_shares += size;
                 self.down_cost += price * size;
             }
+            _ => {}
+        }
+    }
+
+    /// Add to committed when an order is POSTed (side-cap basis). Market-guarded
+    /// so a stale-window call is a no-op.
+    pub fn add_committed(&mut self, market: &str, side: &str, size: f64) {
+        if self.market != market || size <= 0.0 {
+            return;
+        }
+        match side {
+            "Up" => self.committed_up += size,
+            "Down" => self.committed_down += size,
+            _ => {}
+        }
+    }
+
+    /// Subtract from committed ONLY on a confirmed clean cancel (the order did
+    /// not fill). A filled order's cancel is a noop, so this is never called for
+    /// it and its size stays committed — which is what keeps the cap correct
+    /// without depending on fill reporting.
+    pub fn sub_committed(&mut self, market: &str, side: &str, size: f64) {
+        if self.market != market || size <= 0.0 {
+            return;
+        }
+        match side {
+            "Up" => self.committed_up = (self.committed_up - size).max(0.0),
+            "Down" => self.committed_down = (self.committed_down - size).max(0.0),
             _ => {}
         }
     }
